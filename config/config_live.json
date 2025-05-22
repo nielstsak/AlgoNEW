@@ -1,0 +1,46 @@
+{
+  "global_live_settings": {
+    "run_live_trading": true,
+    "account_type": "MARGIN",
+    "max_concurrent_strategies": 5,
+    "default_position_sizing_pct_capital": 0.01,
+    "global_risk_limit_pct_capital": 0.1,
+    "is_testnet": false,
+    "session_cycle_interval_seconds": 30
+  },
+  "strategy_deployments": [
+    {
+      "active": true,
+      "strategy_id": "EmaMacdAtrStrategy_BTCUSDT_5m_context_20250101_120000",
+      "results_config_path": "results/20250101_120000/EmaMacdAtrStrategy/BTCUSDT/5m_context/live_config.json",
+      "account_alias_to_use": "binance_margin_main_live",
+      "override_risk_settings": {
+        "position_sizing_pct_capital": 0.02,
+        "max_loss_per_trade_pct": 0.005
+      }
+    },
+    {
+      "active": false,
+      "strategy_id": "PsarReversalOtoco_ETHUSDT_1h_context_20250115_100000",
+      "results_config_path": "results/20250115_100000/PsarReversalOtoco/ETHUSDT/1h_context/live_config.json",
+      "account_alias_to_use": "binance_isolated_testnet1",
+      "override_risk_settings": null
+    }
+  ],
+  "live_fetch": {
+    "crypto_pairs": ["BTCUSDT", "ETHUSDT"],
+    "intervals": ["1m", "5m"],
+    "limit_init_history": 2000,
+    "limit_per_fetch": 100,
+    "max_retries": 3,
+    "retry_backoff": 1.5
+  },
+  "live_logging": {
+    "level": "INFO",
+    "log_to_file": true,
+    "log_filename_live": "live_trading_activity.log",
+    "log_levels_by_module": {
+      "src.live.manager": "DEBUG"
+    }
+  }
+}

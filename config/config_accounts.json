@@ -1,0 +1,26 @@
+[
+  {
+    "account_alias": "binance_margin_main_live",
+    "exchange": "binance",
+    "account_type": "MARGIN",
+    "is_testnet": false,
+    "api_key_env_var": "BINANCE_API_KEY_MAIN_LIVE",
+    "api_secret_env_var": "BINANCE_SECRET_KEY_MAIN_LIVE"
+  },
+  {
+    "account_alias": "binance_isolated_testnet1",
+    "exchange": "binance",
+    "account_type": "ISOLATED_MARGIN",
+    "is_testnet": true,
+    "api_key_env_var": "BINANCE_API_KEY_ISO_TEST1",
+    "api_secret_env_var": "BINANCE_SECRET_KEY_ISO_TEST1"
+  },
+  {
+    "account_alias": "binance_spot_testnet",
+    "exchange": "binance",
+    "account_type": "SPOT",
+    "is_testnet": true,
+    "api_key_env_var": "BINANCE_API_KEY_SPOT_TEST",
+    "api_secret_env_var": "BINANCE_SECRET_KEY_SPOT_TEST"
+  }
+]

@@ -1,0 +1,53 @@
+{
+  "project_name": "AlgoTradingProject",
+  "paths": {
+    "data_historical_raw": "data/historical/raw",
+    "data_historical_processed_cleaned": "data/historical/processed/cleaned",
+    "data_historical_processed_enriched": "data/historical/processed/enriched",
+    "logs_backtest_optimization": "logs/backtest_optimization",
+    "logs_live": "logs/live_trading",
+    "results": "results",
+    "data_live_raw": "data/live/raw",
+    "data_live_processed": "data/live/processed",
+    "live_state": "data/live_state"
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s",
+    "log_to_file": true,
+    "log_filename_global": "global_run.log",
+    "log_filename_live": "live_trading_main.log",
+    "log_levels_by_module": {
+      "src.live": "DEBUG",
+      "src.data": "INFO",
+      "src.live.manager": "DEBUG"
+    }
+  },
+  "simulation_defaults": {
+    "initial_capital": 10000.0,
+    "margin_leverage": 3,
+    "transaction_fee_pct": 0.00075,
+    "slippage_pct": 0.0005
+  },
+  "wfo_settings": {
+    "n_splits": 5,
+    "oos_percent": 30,
+    "metric_to_optimize": "Total Net PnL USDC",
+    "optimization_direction": "maximize"
+  },
+  "optuna_settings": {
+    "n_trials": 100,
+    "sampler_name": "TPESampler",
+    "sampler_params": {"seed": 42, "n_startup_trials": 10},
+    "pruner_name": "MedianPruner",
+    "pruner_params": {"n_startup_trials": 5, "n_warmup_steps": 0},
+    "storage": null,
+    "n_jobs": 1,
+    "objectives_names": ["Total Net PnL USDC", "Sharpe Ratio", "Max Drawdown Pct"],
+    "objectives_directions": ["maximize", "maximize", "minimize"],
+    "pareto_selection_strategy": "SCORE_COMPOSITE",
+    "pareto_selection_weights": {"Total Net PnL USDC": 0.6, "Sharpe Ratio": 0.4, "Max Drawdown Pct": 0.1},
+    "pareto_selection_pnl_threshold": 0.0,
+    "n_best_for_oos": 5
+  }
+}
