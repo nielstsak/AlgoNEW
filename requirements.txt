@@ -1,0 +1,31 @@
+# Core Data Science and Utilities
+pandas>=1.5.0
+numpy>=1.20.0
+pandas-ta>=0.3.14b0
+python-dotenv>=1.0.0
+requests>=2.25.0 # For direct API calls if needed, and often a dependency of other libs
+
+# Binance API Interaction
+python-binance>=1.0.19 # Ensure this version or newer for modern API features
+
+# Optimization
+optuna>=3.0.0
+
+# Configuration & Dataclasses (implicitly handled by Python >=3.7)
+# dataclasses; python_version>="3.7"
+
+# Data Serialization/Storage
+pyarrow>=7.0.0 # For Parquet file support with pandas
+
+# Logging (Optional, if using advanced JSON logging)
+# python-json-logger>=2.0.0
+
+# Plotting (Optional, for Optuna visualizations in reports)
+plotly>=5.0.0
+
+# Add other specific dependencies if your strategies use them:
+# مثلاً:
+# scikit-learn
+# statsmodels
+# tensorflow
+# torch

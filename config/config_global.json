@@ -37,10 +37,6 @@
   },
   "optuna_settings": {
     "n_trials": 100,
-    "sampler_name": "TPESampler",
-    "sampler_params": {"seed": 42, "n_startup_trials": 10},
-    "pruner_name": "MedianPruner",
-    "pruner_params": {"n_startup_trials": 5, "n_warmup_steps": 0},
     "storage": null,
     "n_jobs": 1,
     "objectives_names": ["Total Net PnL USDC", "Sharpe Ratio", "Max Drawdown Pct"],
@@ -48,6 +44,52 @@
     "pareto_selection_strategy": "SCORE_COMPOSITE",
     "pareto_selection_weights": {"Total Net PnL USDC": 0.6, "Sharpe Ratio": 0.4, "Max Drawdown Pct": 0.1},
     "pareto_selection_pnl_threshold": 0.0,
-    "n_best_for_oos": 5
+    "n_best_for_oos": 5,
+
+    "default_profile_to_activate": "TPE_Median",
+
+    "active_sampler_name": "TPESampler",
+    "active_sampler_params": {"seed": 42, "n_startup_trials": 10, "multivariate": true},
+    "active_pruner_name": "MedianPruner",
+    "active_pruner_params": {"n_startup_trials": 5, "n_warmup_steps": 0, "interval_steps": 1},
+
+    "sampler_pruner_profiles": {
+      "TPE_Median": {
+        "description": "Tree-structured Parzen Estimator with Median Pruner. Good general purpose.",
+        "sampler_name": "TPESampler",
+        "sampler_params": {"seed": 42, "n_startup_trials": 10, "multivariate": true, "constant_liar": false},
+        "pruner_name": "MedianPruner",
+        "pruner_params": {"n_startup_trials": 5, "n_warmup_steps": 0, "interval_steps": 1}
+      },
+      "NSGAII_Hyperband": {
+        "description": "NSGA-II multi-objective sampler with Hyperband Pruner. Good for multi-objective.",
+        "sampler_name": "NSGAIISampler",
+        "sampler_params": {"population_size": 50, "mutation_prob": null, "crossover_prob": 0.9, "swapping_prob": 0.5, "seed": 42},
+        "pruner_name": "HyperbandPruner",
+        "pruner_params": {"min_resource": 1, "max_resource": "auto", "reduction_factor": 3}
+      },
+      "CMAES_Nop": {
+        "description": "CMA-ES sampler (good for continuous spaces) with no pruning.",
+        "sampler_name": "CmaEsSampler",
+        "sampler_params": {"sigma0": null, "seed": 42, "restart_strategy": "ipop", "inc_popsize": 2, "n_startup_trials": 5},
+        "pruner_name": "NopPruner",
+        "pruner_params": {}
+      },
+      "Random_Nop": {
+        "description": "Random Sampler with no pruning (good for baseline/comparison).",
+        "sampler_name": "RandomSampler",
+        "sampler_params": {"seed": 42},
+        "pruner_name": "NopPruner",
+        "pruner_params": {}
+      },
+      "PartialFixed_TPE": {
+        "description": "Example for partial fixed parameters with TPE.",
+        "sampler_name": "TPESampler",
+         "sampler_params": {"multivariate": true, "group":true, "constant_liar":true,
+                           "fixed_params": {"some_fixed_param_name": 0.5} },
+        "pruner_name": "MedianPruner",
+        "pruner_params": {}
+      }
+    }
   }
 }

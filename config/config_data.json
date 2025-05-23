@@ -1,0 +1,33 @@
+{
+  "source_details": {
+    "exchange": "binance",
+    "asset_type": "MARGIN" 
+  },
+  "assets_and_timeframes": {
+    "pairs": [
+      "BNBUSDC",
+      "SOLUSDC",
+      "XRPUSDC",
+      "WIFUSDC",
+      "PEPEUSDC",
+      "AIXBTUSDC" 
+    ],
+    "timeframes": [
+      "1min", 
+      "3min",
+      "5min",
+      "15min",
+      "30min",
+      "1h",
+      "4h"
+    ]
+  },
+  "historical_period": {
+    "start_date": "2024-09-01 00:00:00", 
+    "end_date": null 
+  },
+  "fetching_options": {
+    "max_workers": 5,
+    "batch_size": 1000
+  }
+}
