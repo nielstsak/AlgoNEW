@@ -27,7 +27,7 @@ class MaCrossoverStrategy(BaseStrategy):
     def __init__(self, params: dict):
         super().__init__(params)
         # self._validate_strategy_params() # Appelée par super().__init__
-
+        self.log_prefix = f"[{self.__class__.__name__}]"
         # Noms des colonnes d'indicateurs attendues (calculées en amont)
         self.fast_ma_col_strat = "MA_FAST_strat"
         self.slow_ma_col_strat = "MA_SLOW_strat"
