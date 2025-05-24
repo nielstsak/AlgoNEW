@@ -73,7 +73,7 @@ def _get_expanding_folds(
     if not isinstance(df_enriched.index, pd.DatetimeIndex):
         logger.error(f"{log_prefix} df_enriched must have a DatetimeIndex.")
         return
-    if df_enriched.index.tzis None or df_enriched.index.tz.utcoffset(df_enriched.index[0]) != timezone.utc.utcoffset(df_enriched.index[0]): # type: ignore
+    if df_enriched.index.tz is None or df_enriched.index.tz.utcoffset(df_enriched.index[0]) != timezone.utc.utcoffset(df_enriched.index[0]): # type: ignore
         logger.error(f"{log_prefix} df_enriched index must be timezone-aware and UTC.")
         # Attempt to convert, but this should ideally be handled upstream
         try:

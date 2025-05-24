@@ -1,10 +1,11 @@
 import logging
 import os # Peut être remplacé par pathlib pour la plupart des usages
-import sys
+import sys # <<< IMPORT AJOUTÉ ICI
 import time
 from argparse import ArgumentParser
 from pathlib import Path
 import re # Pour convertir les minutes en label de fréquence
+from typing import Optional, List # Assurez-vous que List est aussi importé si utilisé ailleurs
 
 import pandas as pd
 import numpy as np # Pour la gestion des NaN si besoin
@@ -298,4 +299,19 @@ def main():
 
 if __name__ == "__main__":
     # Le logging est configuré par load_all_configs appelé dans main()
+    # Cette configuration de secours est pour les erreurs très précoces ou si le script est exécuté d'une manière
+    # où load_all_configs n'est pas appelé comme prévu (ce qui ne devrait pas être le cas ici).
+    # La configuration principale du logging se fait via load_all_configs.
+    # Si load_all_configs échoue, le logging de base configuré dans ce bloc if __name__ == '__main__'
+    # ne sera pas utilisé car sys.exit() sera appelé avant.
+    # Il est donc principalement là pour le cas où le script serait exécuté d'une manière
+    # qui ne passe pas par la logique de chargement de config principale.
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        handlers=[logging.StreamHandler(sys.stdout)]) # Utilisation de sys.stdout ici
+
+    logger.info("Running src/data/acquisition.py directly for testing...") # Ce message ne devrait pas apparaître normalement
+    logger.warning("This script is intended to be called by run_fetch_data.py, which provides AppConfig.")
+    logger.warning("Direct execution of acquisition.py for testing requires manual AppConfig setup or mocking.")
     main()
+

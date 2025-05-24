@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, Any, List, Union, TYPE_CHECKING
+from pathlib import Path # <<< IMPORT AJOUTÉ/ASSURÉ ICI
 
 import pandas as pd
 import numpy as np
@@ -171,13 +172,6 @@ def _fetch_single_pair_1min_history_and_clean(
     max_retries = 5 # Increased retries for robustness
     base_retry_delay_seconds = 5 # Base delay, will be increased with exponential backoff
 
-    # Determine API endpoint based on asset_type
-    # Note: python-binance client handles endpoint selection for get_historical_klines
-    # based on whether it's a Client or FapiClient/DapiClient instance.
-    # Here, we assume a generic Client instance is passed, which defaults to SPOT/MARGIN.
-    # If FUTURES data is needed, a FapiClient instance should be passed.
-    # The `asset_type` param here is more for logging and future-proofing if we add manual endpoint selection.
-
     while True:
         klines_batch: List[List[Any]] = []
         fetch_successful = False
@@ -185,43 +179,41 @@ def _fetch_single_pair_1min_history_and_clean(
             try:
                 logger.debug(f"{log_prefix} Requesting klines (limit: {limit}) starting from: {current_start_str}, attempt {attempt + 1}/{max_retries}")
                 
-                # client.get_historical_klines handles SPOT/MARGIN.
-                # For FUTURES, a different client instance (FapiClient) or method would be needed if not handled by the passed client.
                 klines_batch = client.get_historical_klines( # type: ignore
                     pair, KLINE_INTERVAL_1MINUTE, current_start_str, end_str=end_str, limit=limit
                 )
                 logger.debug(f"{log_prefix} Received {len(klines_batch)} klines in batch starting {current_start_str}.")
                 fetch_successful = True
-                break  # Exit retry loop on success
+                break
             except BinanceAPIException as e:
                 logger.error(f"{log_prefix} Binance API Exception (attempt {attempt + 1}/{max_retries}) for start_str {current_start_str}: {e}")
-                if e.code == -1121 and "Invalid symbol" in e.message: # Specific error for invalid symbol
+                if e.code == -1121 and "Invalid symbol" in e.message:
                     logger.error(f"{log_prefix} Symbol '{pair}' seems invalid for the connected exchange endpoint. Aborting fetch for this pair.")
-                    return pd.DataFrame(columns=FINAL_OUTPUT_COLS) # Return empty DF to signify failure for this pair
+                    return pd.DataFrame(columns=FINAL_OUTPUT_COLS)
 
-                if e.status_code in [429, 418] or e.code == -1003:  # Rate limit or IP ban
+                if e.status_code in [429, 418] or e.code == -1003:
                     if attempt < max_retries - 1:
-                        sleep_time = base_retry_delay_seconds * (2**attempt) # Exponential backoff
+                        sleep_time = base_retry_delay_seconds * (2**attempt)
                         logger.warning(f"{log_prefix} Rate limit hit (HTTP {e.status_code}, Code {e.code}). Retrying in {sleep_time}s...")
                         time.sleep(sleep_time)
                     else:
                         logger.error(f"{log_prefix} Max retries reached after rate limit for start_str {current_start_str}.")
-                        break # Break retry loop, will lead to all_klines_raw being potentially incomplete
-                elif attempt < max_retries - 1: # Other API errors, retry with normal delay
+                        break
+                elif attempt < max_retries - 1:
                     time.sleep(base_retry_delay_seconds)
-                else: # Max retries for other API errors
+                else:
                     logger.error(f"{log_prefix} Max retries reached for API error for start_str {current_start_str}.")
                     break
             except BinanceRequestException as e:
                 logger.error(f"{log_prefix} Binance Request Exception for start_str {current_start_str}: {e}. Aborting for this pair.")
-                return pd.DataFrame(columns=FINAL_OUTPUT_COLS) # Non-recoverable request error
-            except Exception as e: # Other exceptions (network, etc.)
+                return pd.DataFrame(columns=FINAL_OUTPUT_COLS)
+            except Exception as e:
                 logger.error(f"{log_prefix} Unexpected error (attempt {attempt + 1}/{max_retries}) for start_str {current_start_str}: {e}", exc_info=True)
                 if attempt < max_retries - 1:
                     time.sleep(base_retry_delay_seconds * (2**attempt))
                 else:
                     logger.error(f"{log_prefix} Max retries reached after unexpected error for start_str {current_start_str}.")
-                    break # Break retry loop
+                    break
 
         if not fetch_successful or not klines_batch:
             logger.info(f"{log_prefix} No more klines fetched or fetch failed for start_str {current_start_str}. Ending pagination.")
@@ -230,30 +222,24 @@ def _fetch_single_pair_1min_history_and_clean(
         all_klines_raw.extend(klines_batch)
         
         try:
-            # Update current_start_str for the next iteration: timestamp of the last kline + 1 minute
             last_kline_open_time_ms = int(klines_batch[-1][0])
-            next_start_time_ms = last_kline_open_time_ms + 60000  # Add 1 minute in milliseconds
+            next_start_time_ms = last_kline_open_time_ms + 60000
             current_start_str = str(next_start_time_ms)
         except (IndexError, TypeError, ValueError) as e_time:
             logger.error(f"{log_prefix} Error processing timestamp for next batch: {e_time}. Batch: {klines_batch[-1] if klines_batch else 'empty'}. Ending pagination.")
             break
 
-        # Check if the end_date is reached (if provided)
         if end_str:
             try:
-                # Convert end_str to a comparable timestamp (milliseconds UTC)
-                # Ensure end_str is parsed correctly. If it's just a date, it might default to midnight.
                 end_dt_ms = int(pd.to_datetime(end_str, utc=True).timestamp() * 1000)
                 if last_kline_open_time_ms >= end_dt_ms:
                     logger.info(f"{log_prefix} End date {end_str} reached or passed. Last kline time: {pd.to_datetime(last_kline_open_time_ms, unit='ms', utc=True)}.")
                     break
-            except Exception as e_parse_end: # Catch broader errors during end_str parsing or comparison
+            except Exception as e_parse_end:
                  logger.error(f"{log_prefix} Could not parse end_str '{end_str}' or compare timestamps: {e_parse_end}. Pagination might continue if not handled.")
-                 # Depending on strictness, one might break here or log and continue.
-                 # For safety, if end_str is critical and unparsable, better to stop.
                  break
 
-        time.sleep(0.25) # Brief pause to respect API rate limits between successful batches
+        time.sleep(0.25)
 
     if not all_klines_raw:
         logger.warning(f"{log_prefix} No historical 1-minute klines were retrieved in total.")
@@ -262,17 +248,14 @@ def _fetch_single_pair_1min_history_and_clean(
     logger.info(f"{log_prefix} Successfully fetched {len(all_klines_raw)} raw 1-minute klines. Parsing and cleaning...")
     df_cleaned = _parse_and_clean_binance_klines(all_klines_raw, pair)
 
-    # Final explicit filtering by end_str to ensure no data beyond it is included,
-    # especially if pagination logic or API behavior results in slight overfetch.
     if end_str and not df_cleaned.empty:
         try:
             end_dt_filter = pd.to_datetime(end_str, utc=True)
-            # Ensure 'timestamp' is datetime before comparison
             if not pd.api.types.is_datetime64_any_dtype(df_cleaned['timestamp']):
                  df_cleaned['timestamp'] = pd.to_datetime(df_cleaned['timestamp'], utc=True, errors='coerce')
             
             original_rows = len(df_cleaned)
-            df_cleaned = df_cleaned[df_cleaned['timestamp'] < end_dt_filter] # Use < to exclude klines starting exactly at end_dt
+            df_cleaned = df_cleaned[df_cleaned['timestamp'] < end_dt_filter]
             if len(df_cleaned) < original_rows:
                 logger.debug(f"{log_prefix} Filtered out {original_rows - len(df_cleaned)} rows after end_date {end_str}.")
         except Exception as e_filter_end:
@@ -299,19 +282,17 @@ def fetch_all_historical_data(config: 'AppConfig') -> str:
         logger.critical("Binance client library is not available. Cannot fetch historical data.")
         raise ImportError("Binance client library not found. Please install python-binance.")
 
-    # Retrieve necessary configurations
-    api_key = config.api_keys.credentials.get(config.accounts_config[0].account_alias, (None,None))[0] if config.accounts_config and config.api_keys.credentials else os.getenv("BINANCE_API_KEY") # Fallback
+    api_key = config.api_keys.credentials.get(config.accounts_config[0].account_alias, (None,None))[0] if config.accounts_config and config.api_keys.credentials else os.getenv("BINANCE_API_KEY")
     api_secret = config.api_keys.credentials.get(config.accounts_config[0].account_alias, (None,None))[1] if config.accounts_config and config.api_keys.credentials else os.getenv("BINANCE_SECRET_KEY")
 
-    if not api_key or not api_secret: # Check after trying to load from specific account
+    if not api_key or not api_secret:
         logger.error("Binance API key or secret missing. Ensure they are in .env and AccountConfig is set up.")
         raise ValueError("Binance API credentials not found.")
 
     try:
-        # Consider if testnet should be configurable for historical data fetching
         client = Client(api_key, api_secret)
         logger.info("Binance API client initialized.")
-        client.ping() # Test connection
+        client.ping()
         logger.info("Binance API connection successful (ping).")
     except Exception as client_err:
         logger.error(f"Failed to initialize or connect Binance client: {client_err}", exc_info=True)
@@ -329,18 +310,15 @@ def fetch_all_historical_data(config: 'AppConfig') -> str:
     else:
         end_date_to_use_str = end_date_config_str
 
-    asset_type = config.data_config.source_details.asset_type # e.g., "MARGIN", "SPOT"
+    asset_type = config.data_config.source_details.asset_type
     max_workers = config.data_config.fetching_options.max_workers
     api_batch_limit = config.data_config.fetching_options.batch_size
 
-    # Create output directories
     run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     
-    # Raw (but cleaned) CSV data, versioned by run
     raw_data_base_path = Path(config.global_config.paths.data_historical_raw)
     raw_run_output_dir = raw_data_base_path / run_timestamp
     
-    # Cleaned Parquet data (usually overwrites for latest version)
     cleaned_data_output_path = Path(config.global_config.paths.data_historical_processed_cleaned)
 
     try:
@@ -352,7 +330,7 @@ def fetch_all_historical_data(config: 'AppConfig') -> str:
         logger.error(f"Failed to create output directories: {e}")
         raise
 
-    tasks: List[str] = [pair for pair in pairs_to_fetch if pair] # Filter out empty/None pairs
+    tasks: List[str] = [pair for pair in pairs_to_fetch if pair]
     results_dfs: Dict[str, Optional[pd.DataFrame]] = {}
 
     logger.info(f"Starting parallel download and cleaning for {len(tasks)} pairs using {max_workers} workers.")
@@ -369,15 +347,12 @@ def fetch_all_historical_data(config: 'AppConfig') -> str:
             pair_symbol = future_to_pair[future]
             try:
                 result_df = future.result()
-                results_dfs[pair_symbol] = result_df # Store result even if None or empty for summary
+                results_dfs[pair_symbol] = result_df
 
                 if result_df is not None and not result_df.empty:
-                    # Save cleaned data as CSV (for audit/backup, into run-specific dir)
-                    # This CSV contains the already cleaned data with taker info.
                     raw_csv_file_name = f"{pair_symbol}_1min_raw_with_taker.csv"
                     raw_csv_file_path = raw_run_output_dir / raw_csv_file_name
                     
-                    # Save final cleaned data as Parquet (into general cleaned dir)
                     cleaned_parquet_file_name = f"{pair_symbol}_1min_cleaned_with_taker.parquet"
                     cleaned_parquet_file_path = cleaned_data_output_path / cleaned_parquet_file_name
                     
@@ -389,16 +364,16 @@ def fetch_all_historical_data(config: 'AppConfig') -> str:
                         logger.info(f"[{pair_symbol}] Cleaned 1-min data (with taker) saved as Parquet to: {cleaned_parquet_file_path}")
                     except IOError as e_io:
                         logger.error(f"[{pair_symbol}] Failed to save data file(s): {e_io}")
-                    except Exception as e_save: # Catch other potential errors during save (e.g. pyarrow issues)
+                    except Exception as e_save:
                         logger.error(f"[{pair_symbol}] Unexpected error saving data file(s): {e_save}", exc_info=True)
 
                 elif result_df is not None and result_df.empty:
                     logger.warning(f"[{pair_symbol}] No 1-minute data returned/processed. Files not saved.")
-                else: # result_df is None
+                else:
                     logger.error(f"[{pair_symbol}] Fetching and cleaning task failed. Files not saved.")
-            except Exception as exc: # Catch errors from future.result() itself
+            except Exception as exc:
                 logger.error(f"Task for {pair_symbol} generated an exception: {exc}", exc_info=True)
-                results_dfs[pair_symbol] = None # Mark as failed
+                results_dfs[pair_symbol] = None
 
     successful_fetches = sum(1 for df in results_dfs.values() if df is not None and not df.empty)
     failed_fetches = len(tasks) - successful_fetches
@@ -407,9 +382,6 @@ def fetch_all_historical_data(config: 'AppConfig') -> str:
 
     if successful_fetches == 0 and tasks:
         logger.error("CRITICAL: No historical 1-minute data could be successfully fetched and cleaned for any configured pair.")
-        # Depending on requirements, this could raise a RuntimeError.
-        # For now, it just logs an error and returns the (likely empty) raw_run_output_dir.
-        # raise RuntimeError("Historical 1-minute data fetching and cleaning completely failed.")
 
     return str(raw_run_output_dir)
 
@@ -417,22 +389,28 @@ def fetch_all_historical_data(config: 'AppConfig') -> str:
 if __name__ == '__main__':
     # This basic setup is for direct script execution.
     # In a full app, logging is configured by load_all_configs.
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                        handlers=[logging.StreamHandler(sys.stdout)])
-
-    logger.info("Running src/data/acquisition.py directly for testing...")
-    # For direct testing, you'd need a mock or minimal AppConfig.
-    # This part is complex to set up without the full config loading mechanism.
-    # The `run_fetch_data.py` script is the intended entry point for this functionality.
-    logger.warning("This script is intended to be called by run_fetch_data.py, which provides AppConfig.")
-    logger.warning("Direct execution of acquisition.py for testing requires manual AppConfig setup or mocking.")
-
-    # Example of how it might be called (requires a valid AppConfig instance):
+    # This part is for testing this specific file (acquisition.py) in isolation.
+    # When run_fetch_data.py calls fetch_all_historical_data, the logging
+    # will have already been set up by load_all_configs in run_fetch_data.py.
+    
+    # The logger messages "Running src/data/acquisition.py directly for testing..." etc.
+    # that you saw in the console output are from the `if __name__ == "__main__":` block
+    # of `run_fetch_data.py` (artifact id: `run_fetch_data_py_fix_sys`), not from this file.
+    # This `if __name__ == "__main__":` block in `acquisition.py` would only run
+    # if you executed `python src/data/acquisition.py` directly.
+    
+    # For clarity, if this file (acquisition.py) were run directly, it would need its own
+    # logging setup and a way to get an AppConfig instance.
+    
+    # Example of how it might be called for testing (requires a valid AppConfig instance):
+    # logging.basicConfig(level=logging.INFO,
+    #                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    #                     handlers=[logging.StreamHandler(sys.stdout)]) # Need sys import here too for direct run
+    # logger.info("Running src/data/acquisition.py directly for testing (if __name__ == '__main__')...")
     # try:
-    #     # Assuming PROJECT_ROOT is correctly defined at the top of this file
-    #     # config_instance = load_all_configs(project_root=PROJECT_ROOT)
-    #     # fetch_all_historical_data(config_instance)
-    #     logger.info("Test execution finished (if AppConfig was provided and valid).")
+    #     # mock_config = ... create or load a minimal AppConfig for testing ...
+    #     # fetch_all_historical_data(mock_config)
+    #     logger.info("Test execution of acquisition.py finished (if AppConfig was provided).")
     # except Exception as e:
-    #     logger.error(f"Error during test execution: {e}", exc_info=True)
+    #     logger.error(f"Error during direct test execution of acquisition.py: {e}", exc_info=True)
+    pass

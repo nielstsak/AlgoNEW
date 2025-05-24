@@ -7,7 +7,7 @@ spécifiques aux exchanges (ex: Binance).
 import logging
 import math
 import numpy as np
-from typing import Dict, Optional, Any, Union, List
+from typing import Dict, Optional, Any, Union, List, Callable
 from decimal import Decimal, InvalidOperation
 
 logger = logging.getLogger(__name__)

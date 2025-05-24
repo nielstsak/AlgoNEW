@@ -5,7 +5,7 @@
     "account_type": "MARGIN",
     "is_testnet": false,
     "api_key_env_var": "BINANCE_API_KEY_MAIN_LIVE",
-    "api_secret_Niels": "BINANCE_SECRET_KEY_MAIN_LIVE_Niels"
+    "api_secret_env_var": "BINANCE_SECRET_KEY_MAIN_LIVE_Niels"
   },
   {
     "account_alias": "binance_margin_main_live_thib",
@@ -13,6 +13,6 @@
     "account_type": "ISOLATED_MARGIN",
     "is_testnet": false,
     "api_key_env_var": "BINANCE_API_KEY_MAIN_LIVE",
-    "api_secret_Thib": "BINANCE_SECRET_KEY_MAIN_LIVE_Thib"
+    "api_secret_env_var": "BINANCE_SECRET_KEY_MAIN_LIVE_Thib"
   }
 ]

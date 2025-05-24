@@ -1,7 +1,7 @@
 # Core Data Science and Utilities
 pandas>=1.5.0
-numpy>=1.20.0
-pandas-ta>=0.3.14b0
+numpy==1.23.5
+pandas-ta >=0.3.14b0
 python-dotenv>=1.0.0
 requests>=2.25.0 # For direct API calls if needed, and often a dependency of other libs
 

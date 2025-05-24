@@ -1,0 +1,111 @@
+{
+
+  
+  "ma_crossover_strategy": {
+    "active_for_optimization": true,
+    "script_reference": "src/strategies/ma_crossover_strategy.py",
+    "class_name": "MaCrossoverStrategy",
+    "params_space": {
+      "fast_ma_period": { "type": "int", "low": 5, "high": 25, "step": 1 },
+      "slow_ma_period": { "type": "int", "low": 20, "high": 80, "step": 5 },
+      "ma_type": { "type": "categorical", "choices": ["sma", "ema", "wma", "hma"] },
+      "indicateur_frequence_ma_rapide": { "type": "categorical", "choices": [  "3min", "5min", "15min"] },
+      "indicateur_frequence_ma_lente": { "type": "categorical", "choices": ["5min", "15min", "30min", "1h"] },
+      "atr_period_sl_tp": { "type": "int", "low": 10, "high": 21, "step": 1 },
+      "atr_base_frequency_sl_tp": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "sl_atr_multiplier": { "type": "float", "low": 1.0, "high": 3.0, "step": 0.25 },
+      "tp_atr_multiplier": { "type": "float", "low": 1.5, "high": 3.5, "step": 0.25 },
+      "capital_allocation_pct": { "type": "float", "low": 0.8, "high": 0.8, "step": 0.05 },
+      "margin_leverage": { "type": "float", "low": 3.0, "high": 3.0, "step": 0.5 }
+    }
+  },
+  "psar_reversal_otoco": {
+    "active_for_optimization": true,
+    "script_reference": "src/strategies/psar_reversal_otoco.py",
+    "class_name": "PsarReversalOtocoStrategy",
+    "params_space": {
+      "psar_step": { "type": "float", "low": 0.01, "high": 0.05, "step": 0.005 },
+      "psar_max_step": { "type": "float", "low": 0.1, "high": 0.3, "step": 0.02 },
+      "indicateur_frequence_psar": { "type": "categorical", "choices": [  "3min", "5min", "15min", "30min", "1h"] },
+      "atr_period_sl_tp": { "type": "int", "low": 10, "high": 21, "step": 1 },
+      "atr_base_frequency_sl_tp": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "sl_atr_mult": { "type": "float", "low": 1.0, "high": 3.0, "step": 0.25 },
+      "tp_atr_mult": { "type": "float", "low": 1.5, "high": 3.5, "step": 0.25 },
+      "capital_allocation_pct": { "type": "float", "low": 0.8, "high": 0.8, "step": 0.05 },
+      "margin_leverage": { "type": "float", "low": 3.0, "high": 3.0, "step": 0.5 }
+    }
+  },
+  "EmaMacdAtrStrategy": {
+    "active_for_optimization": false,
+    "script_reference": "src/strategies/ema_macd_atr_strategy.py",
+    "class_name": "EmaMacdAtrStrategy",
+    "params_space": {
+      "ema_short_period": { "type": "int", "low": 5, "high": 50, "step": 1 },
+      "ema_long_period": { "type": "int", "low": 20, "high": 80, "step": 5 },
+      "indicateur_frequence_ema": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "macd_fast_period": { "type": "int", "low": 5, "high": 20, "step": 1 },
+      "macd_slow_period": { "type": "int", "low": 15, "high": 30, "step": 1 },
+      "macd_signal_period": { "type": "int", "low": 5, "high": 15, "step": 1 },
+      "indicateur_frequence_macd": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "atr_period_sl_tp": { "type": "int", "low": 7, "high": 28, "step": 1 },
+      "atr_base_frequency_sl_tp": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "sl_atr_mult": { "type": "float", "low": 1.0, "high": 3.0, "step": 0.25 },
+      "tp_atr_mult": { "type": "float", "low": 2, "high": 2, "step": 0.25 },
+      "atr_volatility_filter_period": { "type": "int", "low": 10, "high": 21, "step": 1 },
+      "indicateur_frequence_atr_volatility": { "type": "categorical", "choices": ["5min", "15min", "30min", "1h"] },
+      "atr_volatility_threshold_mult": { "type": "float", "low": 0.5, "high": 2.0, "step": 0.1 },
+      "taker_pressure_indicator_period": { "type": "int", "low": 5, "high": 30, "step": 1 },
+      "indicateur_frequence_taker_pressure": { "type": "categorical", "choices": [ "3min", "5min"] },
+      "capital_allocation_pct": { "type": "float", "low": 0.8, "high": 0.8, "step": 0.05 },
+      "margin_leverage": { "type": "float", "low": 3.0, "high": 3.0, "step": 0.5 }
+    }
+  },
+  "BbandsVolumeRsiStrategy": {
+    "active_for_optimization": true,
+    "script_reference": "src/strategies/bbands_volume_rsi_strategy.py",
+    "class_name": "BbandsVolumeRsiStrategy",
+    "params_space": {
+      "bbands_period": { "type": "int", "low": 15, "high": 35, "step": 1 },
+      "bbands_std_dev": { "type": "float", "low": 1.5, "high": 3.0, "step": 0.25 },
+      "indicateur_frequence_bbands": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "volume_ma_period": { "type": "int", "low": 10, "high": 50, "step": 1 },
+      "indicateur_frequence_volume": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "rsi_period": { "type": "int", "low": 10, "high": 21, "step": 1 },
+      "indicateur_frequence_rsi": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "rsi_buy_breakout_threshold": { "type": "float", "low": 70.0, "high": 85.0, "step": 1.0 },
+      "rsi_sell_breakout_threshold": { "type": "float", "low": 15.0, "high": 30.0, "step": 1.0 },
+      "atr_period_sl_tp": { "type": "int", "low": 7, "high": 28, "step": 1 },
+      "atr_base_frequency_sl_tp": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+      "sl_atr_mult": { "type": "float", "low": 2, "high": 2, "step": 0.25 },
+      "tp_atr_mult": { "type": "float", "low": 1.5, "high": 3.5, "step": 0.25 },
+      "taker_pressure_indicator_period": { "type": "int", "low": 5, "high": 30, "step": 1 },
+      "indicateur_frequence_taker_pressure": { "type": "categorical", "choices": [ "3min", "5min"] },
+      "capital_allocation_pct": { "type": "float", "low": 0.8, "high": 0.8, "step": 0.05 },
+      "margin_leverage": { "type": "float", "low": 3.0, "high": 3.0, "step": 0.5 }
+    }
+  },
+  "TripleMAAnticipationStrategy": {
+    "active_for_optimization": true,
+    "script_reference": "src/strategies/triple_ma_anticipation_strategy.py",
+    "class_name": "TripleMAAnticipationStrategy",
+    "params_space": {
+        "ma_short_period": { "type": "int", "low": 5, "high": 20, "step": 1 },
+        "ma_medium_period": { "type": "int", "low": 20, "high": 60, "step": 1 },
+        "ma_long_period": { "type": "int", "low": 70, "high": 150, "step": 1 },
+        "indicateur_frequence_mms": { "type": "categorical", "choices": ["5min", "15min", "30min", "1h"] },
+        "indicateur_frequence_mmm": { "type": "categorical", "choices": ["5min", "15min", "30min", "1h", "4h"] },
+        "indicateur_frequence_mml": { "type": "categorical", "choices": ["15min", "30min", "1h", "4h"] },
+        "atr_period_sl_tp": { "type": "int", "low": 7, "high": 28, "step": 1 },
+        "atr_base_frequency_sl_tp": { "type": "categorical", "choices": [ "3min", "5min", "15min", "30min", "1h"] },
+        "sl_atr_mult": { "type": "float", "low": 0.5, "high": 3.0, "step": 0.25 },
+        "tp_atr_mult": { "type": "float", "low": 1.0, "high": 5.0, "step": 0.25 },
+        "allow_shorting": { "type": "categorical", "choices": [true, false] },
+        "order_type_preference": { "type": "categorical", "choices": ["MARKET", "LIMIT"] },
+        "capital_allocation_pct": { "type": "float", "low": 0.8, "high": 0.8, "step": 0.05 },
+        "margin_leverage": { "type": "float", "low": 3.0, "high": 3.0, "step": 0.5 },
+        "anticipate_crossovers": { "type": "categorical", "choices": [true, false] },
+        "anticipation_slope_period": { "type": "int", "low": 2, "high": 10, "step": 1 },
+        "anticipation_convergence_threshold_pct": { "type": "float", "low": 0.001, "high": 0.02, "step": 0.0005 }
+    }
+  }
+}
