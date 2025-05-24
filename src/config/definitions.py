@@ -35,9 +35,18 @@ class SimulationDefaults:
     Default settings for backtesting simulations.
     """
     initial_capital: float
-    margin_leverage: int
+    margin_leverage: int # Changed from float to int as leverage is typically whole numbers
     transaction_fee_pct: float
     slippage_pct: float
+
+    def __post_init__(self):
+        if not isinstance(self.margin_leverage, int) or self.margin_leverage < 1:
+            # Allow float if it's a whole number, then cast to int
+            if isinstance(self.margin_leverage, float) and self.margin_leverage.is_integer() and self.margin_leverage >= 1:
+                self.margin_leverage = int(self.margin_leverage)
+            else:
+                raise ValueError("SimulationDefaults: margin_leverage must be an integer >= 1.")
+
 
 @dataclass
 class WfoSettings:
@@ -56,7 +65,7 @@ class OptunaSettings:
     """
     n_trials: int
     sampler_name: str
-    pruner_name: str  # Déplacé ici pour respecter l'ordre des champs (non-default avant default)
+    pruner_name: str
     sampler_params: Optional[Dict[str, Any]] = None
     pruner_params: Optional[Dict[str, Any]] = None
     storage: Optional[str] = None
@@ -67,6 +76,11 @@ class OptunaSettings:
     pareto_selection_weights: Optional[Dict[str, float]] = None
     pareto_selection_pnl_threshold: Optional[float] = None
     n_best_for_oos: int = 10
+    # >>> CHAMPS AJOUTÉS POUR LA GESTION DES PROFILS <<<
+    default_profile_to_activate: Optional[str] = None
+    sampler_pruner_profiles: Optional[Dict[str, Dict[str, Any]]] = field(default_factory=dict)
+    # >>> FIN DES CHAMPS AJOUTÉS <<<
+
 
     def __post_init__(self):
         if len(self.objectives_names) != len(self.objectives_directions):
@@ -77,7 +91,7 @@ class OptunaSettings:
         if self.pareto_selection_strategy == "SCORE_COMPOSITE":
             if not self.pareto_selection_weights:
                 raise ValueError("OptunaSettings: pareto_selection_weights must be provided if pareto_selection_strategy is 'SCORE_COMPOSITE'.")
-            if not all(name in self.objectives_names for name in self.pareto_selection_weights.keys()):
+            if not all(name in self.objectives_names for name in self.pareto_selection_weights.keys()): # type: ignore
                 raise ValueError("OptunaSettings: All keys in pareto_selection_weights must correspond to an objective name in objectives_names.")
         if self.n_best_for_oos <= 0:
             raise ValueError("OptunaSettings: n_best_for_oos must be a positive integer.")
@@ -123,10 +137,12 @@ class HistoricalPeriod:
     def __post_init__(self):
         try:
             if self.end_date:
-                if self.start_date > self.end_date:
+                # Basic check, more robust date parsing would be better if formats vary
+                if pd.to_datetime(self.start_date) > pd.to_datetime(self.end_date): # type: ignore
                     raise ValueError(f"HistoricalPeriod: start_date ({self.start_date}) cannot be after end_date ({self.end_date}).")
-        except TypeError:
-             raise ValueError("HistoricalPeriod: start_date and end_date must be strings.")
+        except Exception: # Catches parsing errors from pd.to_datetime or other issues
+             raise ValueError("HistoricalPeriod: start_date and/or end_date are not valid date strings.")
+
 
 @dataclass
 class FetchingOptions:
@@ -181,13 +197,12 @@ class ParamDetail:
                      raise ValueError(f"ParamDetail: 'step' must be numeric if provided for {self.type} parameters.")
                 if self.step <= 0:
                     raise ValueError(f"ParamDetail: 'step' ({self.step}) must be positive if provided.")
-                # MODIFICATION ICI pour être plus flexible avec step pour type "int"
                 if self.type == "int":
                     if isinstance(self.step, float):
                         if self.step.is_integer():
-                            self.step = int(self.step) # Convertir 1.0 en 1
+                            self.step = int(self.step) 
                         else:
-                            raise ValueError(f"ParamDetail: 'step' ({self.step}) must be a whole number (e.g., 1.0 or 1) for 'int' type parameters if specified as float.")
+                            raise ValueError(f"ParamDetail: 'step' ({self.step}) must be a whole number for 'int' type parameters if specified as float.")
                     elif not isinstance(self.step, int):
                          raise ValueError(f"ParamDetail: 'step' ({self.step}, type: {type(self.step)}) must be an integer for 'int' type parameters.")
 
@@ -219,7 +234,7 @@ class AccountConfig:
     account_type: str
     is_testnet: bool
     api_key_env_var: str
-    api_secret_env_var: str # Corrigé le nom du champ ici (était api_secret_Niels/Thib dans le JSON fourni)
+    api_secret_env_var: str 
 
     def __post_init__(self):
         if not self.account_alias.strip():
@@ -230,7 +245,7 @@ class AccountConfig:
             raise ValueError(f"AccountConfig (alias: {self.account_alias}): account_type cannot be empty.")
         if not self.api_key_env_var.strip():
             raise ValueError(f"AccountConfig (alias: {self.account_alias}): api_key_env_var cannot be empty.")
-        if not self.api_secret_env_var.strip(): # Corrigé ici aussi
+        if not self.api_secret_env_var.strip(): 
             raise ValueError(f"AccountConfig (alias: {self.account_alias}): api_secret_env_var cannot be empty.")
 
 @dataclass
@@ -348,11 +363,10 @@ class AppConfig:
     live_config: LiveConfig
     accounts_config: List[AccountConfig]
     api_keys: ApiKeys
-    project_root: str = field(init=False)
+    project_root: str = field(init=False) # type: ignore
 
     def __post_init__(self):
         if self.accounts_config:
             aliases = [acc.account_alias for acc in self.accounts_config]
             if len(aliases) != len(set(aliases)):
                 raise ValueError("AppConfig: account_alias in accounts_config must be unique.")
-
