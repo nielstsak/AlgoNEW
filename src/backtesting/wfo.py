@@ -1,3 +1,4 @@
+# src/backtesting/wfo.py
 import json
 import logging
 import importlib # Not strictly needed here if classes are imported directly
@@ -6,7 +7,7 @@ import traceback # For more detailed error logging if needed
 import sys
 import argparse # Not used in this module directly, but good for context
 import math
-import re # <<< IMPORT AJOUTÉ ICI
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple, Type, TYPE_CHECKING
@@ -16,7 +17,7 @@ import pandas as pd
 
 # Conditional imports for type hinting
 if TYPE_CHECKING:
-    from src.config.definitions import AppConfig, WfoSettings, GlobalConfig
+    from src.config.definitions import AppConfig, WfoSettings, GlobalConfig # Corrected case for WfoSettings
     # Function import for run_optimization_for_fold
     from src.backtesting.optimizer.optimization_orchestrator import run_optimization_for_fold
     # Class imports for type hints
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 
 
 # Actual imports needed at runtime
+from src.config.definitions import WfoSettings # CORRECTED IMPORT CASE
 from src.backtesting.optimizer.optimization_orchestrator import run_optimization_for_fold
 from src.backtesting.optimizer.objective_evaluator import ObjectiveEvaluator
 from src.backtesting.optimizer.study_manager import StudyManager
@@ -44,255 +46,321 @@ def _sanitize_filename_component(name: str) -> str:
     """
     if not name:
         return "default_component"
-    # Replace common invalid characters with an underscore
-    # Windows invalid chars: < > : " / \ | ? *
-    # Linux/macOS invalid chars: / (and null byte)
-    # Keep it simple: replace non-alphanumeric (excluding underscore and hyphen) with underscore
     sanitized_name = re.sub(r'[^\w\-.]', '_', name)
-    # Remove leading/trailing underscores that might result from replacement
     sanitized_name = sanitized_name.strip('_')
-    # Ensure it's not empty after sanitization
     return sanitized_name if sanitized_name else "sanitized_default"
 
 
-def _get_expanding_folds(
-    df_enriched: pd.DataFrame,
-    n_splits: int,
-    oos_percent: float
-) -> Generator[Tuple[pd.DataFrame, pd.DataFrame, int, pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp], None, None]:
+class WFOGenerator:
     """
-    Generates expanding In-Sample (IS) folds and a fixed Out-of-Sample (OOS) period.
-
-    The OOS period is fixed at the end of the dataset.
-    IS periods start at the beginning of the dataset and expand towards the start of the OOS period.
-
-    Args:
-        df_enriched: DataFrame with DatetimeIndex (UTC, sorted, unique), containing all historical data.
-        n_splits: Number of segments to divide the total In-Sample period into.
-                  The WFO will run `n_splits` times, with IS periods of 1/n, 2/n, ..., n/n of the total IS data.
-        oos_percent: Percentage of the total data to be used as the fixed OOS period (e.g., 30 for 30%).
-
-    Yields:
-        Tuple containing:
-            - df_is_fold: DataFrame for the current In-Sample fold.
-            - df_oos_fixed: DataFrame for the fixed Out-of-Sample period.
-            - fold_index: Index of the current fold (0 to n_splits-1).
-            - is_start_ts: Start timestamp of the current IS fold.
-            - is_end_ts: End timestamp of the current IS fold (this is fixed for all IS folds).
-            - oos_start_ts: Start timestamp of the fixed OOS period.
-            - oos_end_ts: End timestamp of the fixed OOS period.
+    Generates In-Sample (IS) and Out-of-Sample (OOS) data folds for Walk-Forward Optimization.
     """
-    log_prefix = "[_get_expanding_folds]"
-    logger.info(f"{log_prefix} Generating expanding folds. n_splits={n_splits}, oos_percent={oos_percent}%.")
+    def __init__(self, wfo_settings: WfoSettings): # Corrected type hint case
+        """
+        Initializes the WFOGenerator.
 
-    # --- 1. Validations Initiales ---
-    if df_enriched.empty:
-        logger.error(f"{log_prefix} Input DataFrame df_enriched is empty. Cannot generate folds.")
-        return
-    if not isinstance(df_enriched.index, pd.DatetimeIndex):
-        logger.error(f"{log_prefix} df_enriched must have a DatetimeIndex.")
-        return
-    if df_enriched.index.tz is None or df_enriched.index.tz.utcoffset(df_enriched.index[0]) != timezone.utc.utcoffset(df_enriched.index[0]): # type: ignore
-        logger.error(f"{log_prefix} df_enriched index must be timezone-aware and UTC.")
-        # Attempt to convert, but this should ideally be handled upstream
-        try:
-            if df_enriched.index.tz is None:
-                df_enriched.index = df_enriched.index.tz_localize('UTC')
-            else:
-                df_enriched.index = df_enriched.index.tz_convert('UTC')
-            logger.warning(f"{log_prefix} Attempted to convert df_enriched index to UTC.")
-        except Exception as e_tz:
-            logger.error(f"{log_prefix} Failed to convert df_enriched index to UTC: {e_tz}")
-            return
+        Args:
+            wfo_settings (WfoSettings): Configuration for Walk-Forward Optimization.
+        """
+        self.wfo_settings = wfo_settings
+
+    def _validate_data_and_settings(self,
+                                    df_enriched_data: pd.DataFrame,
+                                    is_total_start_ts: pd.Timestamp,
+                                    oos_total_end_ts: pd.Timestamp):
+        """Validates input data and WFO settings."""
+        if not isinstance(df_enriched_data.index, pd.DatetimeIndex):
+            raise ValueError("DataFrame index must be a DatetimeIndex.")
+        
+        if is_total_start_ts >= oos_total_end_ts:
+            raise ValueError(f"Total start timestamp {is_total_start_ts} must be before total end timestamp {oos_total_end_ts}.")
+
+        if is_total_start_ts > df_enriched_data.index.max() or oos_total_end_ts < df_enriched_data.index.min():
+             logger.warning(f"Specified WFO range {is_total_start_ts} to {oos_total_end_ts} might be outside data range {df_enriched_data.index.min()} to {df_enriched_data.index.max()}.")
+
+        # Check for oos_period_days and min_is_period_days in wfo_settings
+        if not hasattr(self.wfo_settings, 'oos_period_days') or not hasattr(self.wfo_settings, 'min_is_period_days'):
+            raise AttributeError("WfoSettings object is missing 'oos_period_days' or 'min_is_period_days'. Check config/definitions.py.")
+
+        oos_duration_td = pd.Timedelta(self.wfo_settings.oos_period_days, unit='D')
+        min_is_duration_td = pd.Timedelta(self.wfo_settings.min_is_period_days, unit='D')
+
+        if (oos_total_end_ts - is_total_start_ts) < (oos_duration_td + min_is_duration_td):
+            raise ValueError(f"Total data duration from {is_total_start_ts} to {oos_total_end_ts} is too short for the specified OOS ({self.wfo_settings.oos_period_days} days) and minimum IS ({self.wfo_settings.min_is_period_days} days) periods.")
+        
+        if self.wfo_settings.n_splits <= 0:
+            raise ValueError("Number of splits (n_splits) must be positive.")
+
+
+    def _get_expanding_folds(self,
+                             df_enriched_data: pd.DataFrame,
+                             is_total_start_ts: pd.Timestamp, 
+                             oos_total_end_ts: pd.Timestamp,  
+                             n_splits: int
+                            ) -> List[Tuple[pd.DataFrame, pd.DataFrame, int, pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+        """
+        Generates expanding In-Sample folds with a fixed Out-of-Sample period at the end.
+        The IS window grows by adding earlier data, keeping its end date fixed before the OOS period.
+        """
+        folds = []
+        oos_duration_td = pd.Timedelta(self.wfo_settings.oos_period_days, unit='D')
+
+        approx_oos_start_ts = oos_total_end_ts - oos_duration_td
+        
+        oos_start_pos = df_enriched_data.index.searchsorted(approx_oos_start_ts, side='left')
+        if oos_start_pos == len(df_enriched_data.index) or df_enriched_data.index[oos_start_pos] > oos_total_end_ts:
+            logger.error(f"Cannot determine a valid OOS start. Approx OOS start: {approx_oos_start_ts}, Data End: {oos_total_end_ts}, Data last ts: {df_enriched_data.index[-1] if not df_enriched_data.empty else 'N/A'}")
+            return []
+        actual_oos_start_ts = df_enriched_data.index[oos_start_pos]
+        
+        if oos_start_pos == 0:
+            logger.error(f"OOS period starts at the beginning of the dataset ({actual_oos_start_ts}). No space for IS data.")
+            return []
+        
+        d_timestamp_is_actual_end = df_enriched_data.index[oos_start_pos - 1]
+
+        if d_timestamp_is_actual_end < is_total_start_ts:
+            logger.error(f"Calculated IS end {d_timestamp_is_actual_end} is before WFO total start {is_total_start_ts}.")
+            return []
+
+        df_oos_fixed_enriched = df_enriched_data.loc[actual_oos_start_ts : oos_total_end_ts]
+        if df_oos_fixed_enriched.empty:
+            logger.error(f"Fixed OOS dataframe is empty. OOS Start: {actual_oos_start_ts}, OOS End: {oos_total_end_ts}")
+            return []
+        actual_oos_end_ts_from_df = df_oos_fixed_enriched.index[-1]
+
+        df_is_total_enriched = df_enriched_data.loc[is_total_start_ts : d_timestamp_is_actual_end]
+        if df_is_total_enriched.empty:
+            logger.error(f"Total IS dataframe is empty. WFO IS Total Start: {is_total_start_ts}, Actual IS End (Tf'): {d_timestamp_is_actual_end}")
+            return []
+        
+        actual_is_total_start_ts_from_df = df_is_total_enriched.index[0] 
+        is_total_duration_td = d_timestamp_is_actual_end - actual_is_total_start_ts_from_df
+        
+        min_is_duration_from_settings_td = pd.Timedelta(self.wfo_settings.min_is_period_days, unit='D')
+
+        if is_total_duration_td < min_is_duration_from_settings_td:
+            logger.error(f"Total available IS duration ({is_total_duration_td}) from {actual_is_total_start_ts_from_df} to {d_timestamp_is_actual_end} is less than min_is_period_days ({self.wfo_settings.min_is_period_days} days).")
+            return []
+        if is_total_duration_td.total_seconds() <= 0:
+             logger.error(f"Total available IS duration ({is_total_duration_td}) is zero or negative.")
+             return []
+
+        segment_duration_td = is_total_duration_td / n_splits if n_splits > 0 else is_total_duration_td
+
+        for i in range(n_splits):
+            fold_idx = i 
+            num_segments_current_fold = i + 1
+            current_fold_is_end_ts_actual = d_timestamp_is_actual_end 
+
+            current_fold_duration_td = num_segments_current_fold * segment_duration_td
+            if current_fold_duration_td > is_total_duration_td: 
+                current_fold_duration_td = is_total_duration_td
             
-    if not df_enriched.index.is_monotonic_increasing:
-        logger.warning(f"{log_prefix} df_enriched index is not monotonic increasing. Sorting...")
-        df_enriched = df_enriched.sort_index()
-    if not df_enriched.index.is_unique:
-        logger.warning(f"{log_prefix} df_enriched index has duplicate timestamps. Keeping first occurrence...")
-        df_enriched = df_enriched[~df_enriched.index.duplicated(keep='first')]
+            current_fold_is_start_ts_approx = d_timestamp_is_actual_end - current_fold_duration_td
+            
+            start_pos = df_is_total_enriched.index.searchsorted(current_fold_is_start_ts_approx, side='right')
+            if start_pos == 0: 
+                current_fold_is_start_ts_actual = actual_is_total_start_ts_from_df
+            else:
+                current_fold_is_start_ts_actual = df_is_total_enriched.index[start_pos -1]
 
-    if not (0 < oos_percent < 100):
-        logger.error(f"{log_prefix} oos_percent ({oos_percent}) must be between 0 and 100 (exclusive).")
-        return
-    if n_splits < 1:
-        logger.error(f"{log_prefix} n_splits ({n_splits}) must be at least 1.")
-        return
+            if current_fold_is_start_ts_actual < actual_is_total_start_ts_from_df:
+                 current_fold_is_start_ts_actual = actual_is_total_start_ts_from_df
+            
+            if current_fold_is_start_ts_actual > current_fold_is_end_ts_actual:
+                logger.warning(f"Fold {fold_idx}: Calculated IS start {current_fold_is_start_ts_actual} is after IS end {current_fold_is_end_ts_actual}. Adjusting start to end.")
+                current_fold_is_start_ts_actual = current_fold_is_end_ts_actual
 
-    n_total_points = len(df_enriched)
-    min_points_for_split = n_splits + 1 # Need at least one point per segment + OOS
-    if n_total_points < min_points_for_split :
-        logger.error(f"{log_prefix} Not enough data ({n_total_points} points) for {n_splits} splits and OOS period. Need at least {min_points_for_split}.")
-        return
+            df_is_enriched_fold = df_is_total_enriched.loc[current_fold_is_start_ts_actual : current_fold_is_end_ts_actual]
 
-    # --- 2. Définition de la Période OOS Fixe ---
-    a_timestamp = df_enriched.index.min()
-    e_timestamp = df_enriched.index.max()
-    total_duration_seconds = (e_timestamp - a_timestamp).total_seconds()
+            if df_is_enriched_fold.empty:
+                logger.warning(f"Fold {fold_idx}: In-Sample data is empty. Start: {current_fold_is_start_ts_actual}, End: {current_fold_is_end_ts_actual}. Skipping this fold.")
+                continue
+            
+            current_is_fold_duration_actual = df_is_enriched_fold.index[-1] - df_is_enriched_fold.index[0]
+            if current_is_fold_duration_actual < min_is_duration_from_settings_td and n_splits > 1 :
+                 logger.warning(f"Fold {fold_idx}: Actual IS duration {current_is_fold_duration_actual} is less than min_is_period_days ({self.wfo_settings.min_is_period_days} days). This fold might be too short.")
 
-    if total_duration_seconds <= 0:
-        logger.error(f"{log_prefix} Total duration of the dataset is not positive ({total_duration_seconds}s). Cannot split.")
-        return
+            folds.append((
+                df_is_enriched_fold.copy(),
+                df_oos_fixed_enriched.copy(),
+                fold_idx,
+                df_is_enriched_fold.index[0], 
+                df_is_enriched_fold.index[-1],
+                df_oos_fixed_enriched.index[0],
+                actual_oos_end_ts_from_df 
+            ))
+            logger.debug(f"Fold {fold_idx}: IS [{folds[-1][3]} to {folds[-1][4]}], OOS [{folds[-1][5]} to {folds[-1][6]}]")
 
-    oos_duration_seconds = total_duration_seconds * (oos_percent / 100.0)
-    
-    approx_is_total_end_ts = e_timestamp - timedelta(seconds=oos_duration_seconds)
-    
-    possible_is_end_timestamps = df_enriched.index[df_enriched.index <= approx_is_total_end_ts]
-    if possible_is_end_timestamps.empty:
-        logger.error(f"{log_prefix} OOS percentage ({oos_percent}%) is too high or dataset too short. "
-                     f"No data points available for the In-Sample period before OOS cutoff ({approx_is_total_end_ts}).")
-        return
-    d_timestamp_is_actual_end = possible_is_end_timestamps.max()
-    logger.debug(f"{log_prefix} Total IS period ends at: {d_timestamp_is_actual_end}")
+        if not folds and n_splits > 0:
+            logger.error("No valid folds were generated. Check data range, n_splits, and period settings.")
+        return folds
 
-    oos_start_candidates = df_enriched.index[df_enriched.index > d_timestamp_is_actual_end]
-    if oos_start_candidates.empty:
-        logger.warning(f"{log_prefix} No data available for OOS period after {d_timestamp_is_actual_end}. OOS period will be empty.")
-        df_oos_fixed_enriched = pd.DataFrame(columns=df_enriched.columns, index=pd.DatetimeIndex([], tz='UTC', name='timestamp'))
-    else:
-        actual_start_oos_ts = oos_start_candidates.min()
-        df_oos_fixed_enriched = df_enriched.loc[actual_start_oos_ts:].copy() 
-    
-    start_oos_fixed_ts = df_oos_fixed_enriched.index.min() if not df_oos_fixed_enriched.empty else pd.NaT
-    end_oos_fixed_ts = df_oos_fixed_enriched.index.max() if not df_oos_fixed_enriched.empty else pd.NaT
-    logger.info(f"{log_prefix} Fixed OOS period defined from {start_oos_fixed_ts} to {end_oos_fixed_ts} ({len(df_oos_fixed_enriched)} rows).")
-
-    # --- 3. Définition de la Période IS Totale ---
-    df_is_total_enriched = df_enriched.loc[:d_timestamp_is_actual_end]
-    if df_is_total_enriched.empty:
-        logger.error(f"{log_prefix} Total In-Sample period is empty after OOS split (IS end: {d_timestamp_is_actual_end}). Cannot generate IS folds.")
-        return
-    
-    is_total_start_ts = df_is_total_enriched.index.min()
-    is_total_duration_td = d_timestamp_is_actual_end - is_total_start_ts
-    logger.debug(f"{log_prefix} Total IS period from {is_total_start_ts} to {d_timestamp_is_actual_end} (Duration: {is_total_duration_td}).")
-
-    if is_total_duration_td.total_seconds() <= 0 and n_splits > 0:
-        logger.error(f"{log_prefix} Total IS duration is not positive ({is_total_duration_td}). Cannot create {n_splits} IS segments.")
-        return
-    
-    segment_duration_td = is_total_duration_td / n_splits if n_splits > 0 else is_total_duration_td
-    if n_splits == 0: 
-        logger.error(f"{log_prefix} n_splits is 0, which is invalid for fold generation.")
-        return
-
-    for k_segments_in_fold in range(1, n_splits + 1):
-        fold_idx_wfo_convention = k_segments_in_fold - 1 
-        actual_current_is_fold_start_ts = is_total_start_ts 
-        approx_current_is_fold_end_ts = is_total_start_ts + (k_segments_in_fold * segment_duration_td)
+    def generate_folds(self,
+                       df_enriched_data: pd.DataFrame,
+                       is_total_start_ts_config: Optional[pd.Timestamp] = None, 
+                       oos_total_end_ts_config: Optional[pd.Timestamp] = None    
+                      ) -> List[Tuple[pd.DataFrame, pd.DataFrame, int, pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+        if df_enriched_data.empty:
+            logger.error("Input DataFrame df_enriched_data is empty. Cannot generate folds.")
+            return []
+        if not isinstance(df_enriched_data.index, pd.DatetimeIndex):
+            logger.error("df_enriched_data must have a DatetimeIndex.")
+            return []
         
-        if approx_current_is_fold_end_ts > d_timestamp_is_actual_end:
-            approx_current_is_fold_end_ts = d_timestamp_is_actual_end
-        
-        idx_pos_end = df_is_total_enriched.index.searchsorted(approx_current_is_fold_end_ts, side='right') -1
-        if idx_pos_end < 0 : 
-            logger.warning(f"{log_prefix} Fold {fold_idx_wfo_convention}: Approx IS end {approx_current_is_fold_end_ts} is before any IS data. Skipping.")
-            continue
-        actual_current_is_fold_end_ts = df_is_total_enriched.index[idx_pos_end]
+        data_min_ts = df_enriched_data.index.min()
+        data_max_ts = df_enriched_data.index.max()
 
-        if actual_current_is_fold_start_ts > actual_current_is_fold_end_ts:
-            logger.warning(f"{log_prefix} Fold {fold_idx_wfo_convention}: Calculated IS start {actual_current_is_fold_start_ts} is after IS end {actual_current_is_fold_end_ts}. Skipping fold.")
-            continue
-
-        df_is_enriched_fold = df_is_total_enriched.loc[actual_current_is_fold_start_ts : actual_current_is_fold_end_ts]
-
-        if df_is_enriched_fold.empty:
-            logger.warning(f"{log_prefix} Fold {fold_idx_wfo_convention}: IS data slice is empty for period {actual_current_is_fold_start_ts} to {actual_current_is_fold_end_ts}. Skipping.")
-            continue
+        _is_total_start_ts = is_total_start_ts_config if is_total_start_ts_config else data_min_ts
+        _oos_total_end_ts = oos_total_end_ts_config if oos_total_end_ts_config else data_max_ts
         
-        logger.info(f"{log_prefix} Yielding Fold {fold_idx_wfo_convention}: "
-                    f"IS [{actual_current_is_fold_start_ts} to {actual_current_is_fold_end_ts}] ({len(df_is_enriched_fold)} rows), "
-                    f"OOS [{start_oos_fixed_ts} to {end_oos_fixed_ts}] ({len(df_oos_fixed_enriched)} rows).")
+        data_tz = df_enriched_data.index.tz
+        if data_tz: 
+            if _is_total_start_ts.tzinfo is None:
+                _is_total_start_ts = _is_total_start_ts.tz_localize(data_tz)
+            elif _is_total_start_ts.tzinfo != data_tz:
+                _is_total_start_ts = _is_total_start_ts.tz_convert(data_tz)
+
+            if _oos_total_end_ts.tzinfo is None:
+                _oos_total_end_ts = _oos_total_end_ts.tz_localize(data_tz)
+            elif _oos_total_end_ts.tzinfo != data_tz:
+                _oos_total_end_ts = _oos_total_end_ts.tz_convert(data_tz)
+        else: 
+            if _is_total_start_ts.tzinfo is not None:
+                _is_total_start_ts = _is_total_start_ts.tz_localize(None)
+            if _oos_total_end_ts.tzinfo is not None:
+                _oos_total_end_ts = _oos_total_end_ts.tz_localize(None)
         
-        yield (df_is_enriched_fold.copy(), 
-               df_oos_fixed_enriched.copy(), 
-               fold_idx_wfo_convention, 
-               actual_current_is_fold_start_ts, 
-               actual_current_is_fold_end_ts, 
-               start_oos_fixed_ts, 
-               end_oos_fixed_ts)
+        effective_wfo_start_ts = max(_is_total_start_ts, data_min_ts)
+        effective_wfo_end_ts = min(_oos_total_end_ts, data_max_ts)
+
+        if effective_wfo_start_ts >= effective_wfo_end_ts:
+            logger.error(f"Effective WFO period is invalid after clipping to data range. Effective Start: {effective_wfo_start_ts}, Effective End: {effective_wfo_end_ts}")
+            return []
+            
+        df_for_wfo = df_enriched_data.loc[effective_wfo_start_ts:effective_wfo_end_ts]
+        if df_for_wfo.empty:
+            logger.error(f"DataFrame for WFO is empty after slicing from {effective_wfo_start_ts} to {effective_wfo_end_ts}.")
+            return []
+
+        self._validate_data_and_settings(df_for_wfo, df_for_wfo.index.min(), df_for_wfo.index.max())
+
+        n_splits = self.wfo_settings.n_splits
+        fold_type = self.wfo_settings.fold_type if hasattr(self.wfo_settings, 'fold_type') else "expanding" # Default to expanding
+
+        logger.info(f"Generating {n_splits} {fold_type} WFO folds using data from {df_for_wfo.index.min()} to {df_for_wfo.index.max()}.")
+        logger.info(f"OOS period: {self.wfo_settings.oos_period_days} days. Min IS period: {self.wfo_settings.min_is_period_days} days.")
+
+        if fold_type == "expanding": 
+            return self._get_expanding_folds(df_for_wfo, df_for_wfo.index.min(), df_for_wfo.index.max(), n_splits)
+        else:
+            raise ValueError(f"Unsupported fold_type: {fold_type}. Currently, only 'expanding' (with fixed OOS end) is implemented with the new logic.")
 
 
 class WalkForwardOptimizer:
     def __init__(self, app_config: 'AppConfig'):
         self.app_config: 'AppConfig' = app_config
         self.global_config_obj: 'GlobalConfig' = self.app_config.global_config
-        self.wfo_settings: 'WfoSettings' = self.global_config_obj.wfo_settings
+        self.wfo_settings: 'WfoSettings' = self.global_config_obj.wfo_settings # Corrected case
         
         self.strategies_config_dict: Dict[str, Dict[str, Any]] = {}
         if hasattr(self.app_config.strategies_config, 'strategies') and \
            isinstance(self.app_config.strategies_config.strategies, dict):
             for name, strategy_params_obj in self.app_config.strategies_config.strategies.items():
-                if hasattr(strategy_params_obj, '__dict__'):
-                     self.strategies_config_dict[name] = strategy_params_obj.__dict__
-                elif isinstance(strategy_params_obj, dict): 
-                     self.strategies_config_dict[name] = strategy_params_obj
+                # Assuming StrategyParams is used here
+                if hasattr(strategy_params_obj, '__dict__'): # If it's a Pydantic model instance
+                    self.strategies_config_dict[name] = strategy_params_obj.__dict__
+                elif isinstance(strategy_params_obj, dict): # If it's already a dict
+                    self.strategies_config_dict[name] = strategy_params_obj
         else:
             logger.error("AppConfig.strategies_config.strategies is not a dictionary or is missing.")
 
         self.paths_config: Dict[str, Any] = self.global_config_obj.paths.__dict__
-        self.simulation_defaults: Dict[str, Any] = self.global_config_obj.simulation_defaults.__dict__
-
-        if not (0 < self.wfo_settings.oos_percent < 100):
-            logger.error(f"'oos_percent' ({self.wfo_settings.oos_percent}) is invalid. Correcting to 30%.")
-            self.wfo_settings.oos_percent = 30
+        # self.simulation_defaults: Dict[str, Any] = self.global_config_obj.simulation_defaults.__dict__ # Not directly used here now
 
         run_timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
         logs_opt_path_str = self.paths_config.get('logs_backtest_optimization', 'logs/backtest_optimization')
-        self.run_output_dir = Path(logs_opt_path_str) / run_timestamp_str 
+        
+        run_name_prefix = self.global_config_obj.simulation_defaults.run_name_prefix \
+            if hasattr(self.global_config_obj.simulation_defaults, 'run_name_prefix') else "opt"
+            
+        self.run_id = f"{run_name_prefix}_{run_timestamp_str}"
+        self.run_output_dir = Path(logs_opt_path_str) / self.run_id
         self.run_output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"WFO run output directory created: {self.run_output_dir}")
+        logger.info(f"WFO run output directory created: {self.run_output_dir} (Run ID: {self.run_id})")
 
         selected_account_for_client: Optional[Any] = None
-        if self.app_config.accounts_config:
-            selected_account_for_client = next((acc for acc in self.app_config.accounts_config if acc.exchange.lower() == 'binance' and not acc.is_testnet), None)
-            if not selected_account_for_client:
-                selected_account_for_client = next((acc for acc in self.app_config.accounts_config if acc.exchange.lower() == 'binance'), None)
-
+        if self.app_config.accounts_config and self.app_config.api_keys:
+            try:
+                selected_account_for_client = next(
+                    acc for acc in self.app_config.accounts_config 
+                    if acc.exchange.lower() == 'binance' and not acc.is_testnet
+                )
+            except StopIteration:
+                try: 
+                    selected_account_for_client = next(
+                        acc for acc in self.app_config.accounts_config if acc.exchange.lower() == 'binance'
+                    )
+                except StopIteration:
+                    selected_account_for_client = None
+        
+        self.execution_client: Optional[OrderExecutionClient] = None
         if selected_account_for_client:
-            api_key_val = self.app_config.api_keys.credentials.get(selected_account_for_client.account_alias, (None, None))[0]
-            api_secret_val = self.app_config.api_keys.credentials.get(selected_account_for_client.account_alias, (None, None))[1]
-            self.execution_client: Optional[OrderExecutionClient] = OrderExecutionClient(
-                api_key=api_key_val,
-                api_secret=api_secret_val,
-                account_type=selected_account_for_client.account_type,
-                is_testnet=selected_account_for_client.is_testnet
-            )
-            if not self.execution_client.test_connection():
-                logger.warning("Failed Binance REST API connection during WFO init. Symbol info might fail.")
+            credentials = self.app_config.api_keys.credentials.get(selected_account_for_client.account_alias)
+            if credentials and len(credentials) == 2:
+                api_key_val, api_secret_val = credentials
+                self.execution_client = OrderExecutionClient(
+                    api_key=api_key_val,
+                    api_secret=api_secret_val,
+                    account_type=selected_account_for_client.account_type,
+                    is_testnet=selected_account_for_client.is_testnet
+                )
+                if not self.execution_client.test_connection():
+                    logger.warning("Failed Binance REST API connection during WFO init. Symbol info might fail.")
+            else:
+                logger.warning(f"Credentials not found or incomplete for account alias {selected_account_for_client.account_alias}.")
         else:
-            logger.warning("No suitable 'binance' account found in accounts_config for OrderExecutionClient initialization. Symbol info might fail.")
-            self.execution_client = None
+            logger.warning("No suitable 'binance' account found or configured for OrderExecutionClient initialization. Symbol info might fail.")
 
 
     def run(self, pairs: List[str], context_labels: List[str]) -> Dict[str, Any]:
         all_wfo_run_results: Dict[str, Any] = {}
-        main_run_log_prefix = f"[WFO Run: {self.run_output_dir.name}]"
+        main_run_log_prefix = f"[WFO Run ID: {self.run_id}]"
         logger.info(f"{main_run_log_prefix} Starting WFO for pairs: {pairs}, context_labels: {context_labels}")
+
+        wfo_generator = WFOGenerator(self.wfo_settings) 
 
         for pair_symbol in pairs:
             current_context_label_raw = context_labels[0] if context_labels else "default_wfo_context"
-            # Sanitize the context label for use in directory paths
             current_context_label_sanitized = _sanitize_filename_component(current_context_label_raw)
             
-            pair_log_prefix = f"{main_run_log_prefix}[Pair: {pair_symbol}][Ctx: {current_context_label_sanitized}]" # Use sanitized here
-            
+            pair_log_prefix = f"{main_run_log_prefix}[Pair: {pair_symbol}][Ctx: {current_context_label_sanitized}]"
             logger.info(f"{pair_log_prefix} Processing pair. Raw context: '{current_context_label_raw}', Sanitized: '{current_context_label_sanitized}'")
 
             symbol_info_data: Optional[Dict[str, Any]] = None
+            # Try to get symbol_info_data (pair_config)
             if self.execution_client:
                 try:
                     symbol_info_data = self.execution_client.get_symbol_info(pair_symbol)
-                    if not symbol_info_data:
-                        logger.error(f"{pair_log_prefix} Failed to get symbol_info. Skipping this pair.")
-                        continue
                 except Exception as e_sym_info:
-                    logger.error(f"{pair_log_prefix} Error getting symbol_info: {e_sym_info}. Skipping this pair.")
+                    logger.error(f"{pair_log_prefix} Error getting symbol_info via API: {e_sym_info}.")
+            
+            if not symbol_info_data: # Fallback to local config if API fails or not available
+                logger.warning(f"{pair_log_prefix} ExecutionClient failed or not initialized for symbol_info. Attempting local config.")
+                from src.config.loader import load_exchange_config # Ensure this can load your exchange config structure
+                from src.utils.exchange_utils import get_pair_config_for_symbol as get_pair_cfg
+                try:
+                    # Assuming exchange_settings are part of app_config
+                    exchange_settings = self.app_config.exchange_settings
+                    if exchange_settings and hasattr(exchange_settings, 'exchange_info_file_path'):
+                         symbol_info_data = get_pair_cfg(pair_symbol, exchange_settings.exchange_info_file_path) 
+                    if not symbol_info_data:
+                         logger.error(f"{pair_log_prefix} Could not get symbol_info from local config for {pair_symbol}. Skipping.")
+                         continue
+                except Exception as e_local_sym:
+                    logger.error(f"{pair_log_prefix} Error getting symbol_info from local config: {e_local_sym}. Skipping.")
                     continue
-            else:
-                logger.error(f"{pair_log_prefix} ExecutionClient not initialized. Cannot get symbol_info. Skipping this pair.")
-                continue
             
             enriched_data_dir_path_str = self.app_config.global_config.paths.data_historical_processed_enriched
             if not enriched_data_dir_path_str:
@@ -300,7 +368,7 @@ class WalkForwardOptimizer:
                 continue
             
             enriched_data_dir_path = Path(enriched_data_dir_path_str)
-            enriched_filename = f"{pair_symbol}_enriched.parquet"
+            enriched_filename = f"{pair_symbol}_enriched.parquet" 
             enriched_filepath = enriched_data_dir_path / enriched_filename
 
             if not enriched_filepath.exists():
@@ -310,24 +378,24 @@ class WalkForwardOptimizer:
             try:
                 logger.debug(f"{pair_log_prefix} Loading enriched data from: {enriched_filepath}")
                 data_enriched_full = pd.read_parquet(enriched_filepath)
-                if 'timestamp' not in data_enriched_full.columns:
-                    logger.error(f"{pair_log_prefix} Loaded enriched data from {enriched_filepath} is missing 'timestamp' column.")
+                if 'timestamp' not in data_enriched_full.columns and not isinstance(data_enriched_full.index, pd.DatetimeIndex):
+                    logger.error(f"{pair_log_prefix} Loaded data from {enriched_filepath} needs a 'timestamp' column or DatetimeIndex.")
                     continue
-                
-                data_enriched_full['timestamp'] = pd.to_datetime(data_enriched_full['timestamp'], utc=True, errors='coerce')
-                data_enriched_full.dropna(subset=['timestamp'], inplace=True)
-                data_enriched_full = data_enriched_full.set_index('timestamp')
+                if 'timestamp' in data_enriched_full.columns:
+                    data_enriched_full['timestamp'] = pd.to_datetime(data_enriched_full['timestamp'], utc=True, errors='coerce')
+                    data_enriched_full.dropna(subset=['timestamp'], inplace=True)
+                    data_enriched_full = data_enriched_full.set_index('timestamp')
                 
                 if data_enriched_full.index.tz is None: 
                     data_enriched_full.index = data_enriched_full.index.tz_localize('UTC')
                 elif data_enriched_full.index.tz.utcoffset(data_enriched_full.index[0]) != timezone.utc.utcoffset(data_enriched_full.index[0]): # type: ignore
-                     data_enriched_full.index = data_enriched_full.index.tz_convert('UTC')
+                       data_enriched_full.index = data_enriched_full.index.tz_convert('UTC')
                 
                 data_enriched_full.sort_index(inplace=True)
                 if not data_enriched_full.index.is_unique:
                     logger.warning(f"{pair_log_prefix} Duplicate timestamps found in {enriched_filepath}. Keeping first.")
                     data_enriched_full = data_enriched_full[~data_enriched_full.index.duplicated(keep='first')]
-                logger.info(f"{pair_log_prefix} Loaded and preprocessed enriched data. Shape: {data_enriched_full.shape}")
+                logger.info(f"{pair_log_prefix} Loaded and preprocessed enriched data. Shape: {data_enriched_full.shape}, Range: {data_enriched_full.index.min()} to {data_enriched_full.index.max()}")
 
             except Exception as e_load:
                 logger.error(f"{pair_log_prefix} Failed to load or process enriched file {enriched_filepath}: {e_load}", exc_info=True)
@@ -346,7 +414,6 @@ class WalkForwardOptimizer:
                 strat_log_prefix = f"{pair_log_prefix}[Strategy: {strat_name}]"
                 logger.info(f"{strat_log_prefix} Processing strategy.")
 
-                # Use sanitized context label for directory creation
                 strategy_pair_context_output_dir = self.run_output_dir / strat_name / pair_symbol / current_context_label_sanitized
                 strategy_pair_context_output_dir.mkdir(parents=True, exist_ok=True)
                 logger.debug(f"{strat_log_prefix} Output directory for this combo: {strategy_pair_context_output_dir}")
@@ -354,10 +421,10 @@ class WalkForwardOptimizer:
                 fold_summaries: List[Dict[str, Any]] = []
                 
                 try:
-                    folds_generator = _get_expanding_folds(
-                        df_enriched=data_enriched_full,
-                        n_splits=self.wfo_settings.n_splits,
-                        oos_percent=self.wfo_settings.oos_percent
+                    folds_generator = wfo_generator.generate_folds(
+                        df_enriched_data=data_enriched_full
+                        # Pass is_total_start_ts_config and oos_total_end_ts_config if defined in WFO settings
+                        # e.g., is_total_start_ts_config=pd.Timestamp(self.wfo_settings.global_is_start_date, tz='UTC') if hasattr(self.wfo_settings, 'global_is_start_date') else None
                     )
                     
                     for df_is_enriched_fold, df_oos_fixed_enriched_fold, fold_idx, start_is, end_is, start_oos, end_oos in folds_generator:
@@ -372,18 +439,25 @@ class WalkForwardOptimizer:
                         fold_status = "OPTIMIZATION_ATTEMPTED"
                         
                         try:
+                            # Ensure strategy_config_dict_for_opt contains necessary fields like 'script_reference', 'class_name', 'params_space'
+                            if not all(k in strat_config_dict_for_opt for k in ['script_reference', 'class_name']):
+                                logger.error(f"{fold_specific_log_prefix} strategy_config_dict for {strat_name} is missing 'script_reference' or 'class_name'. Skipping fold.")
+                                fold_status = "CONFIG_ERROR_MISSING_REF_CLASS"
+                                continue # Skip to next fold
+
                             final_params_for_fold, representative_oos_metrics_fold = run_optimization_for_fold(
-                                strategy_name=strat_name,
-                                strategy_config_dict=strat_config_dict_for_opt,
+                                strategy_name=strat_name, # This is the key from strategies_config
+                                strategy_config_dict=strat_config_dict_for_opt, 
                                 data_1min_cleaned_is_slice=df_is_enriched_fold,
                                 data_1min_cleaned_oos_slice=df_oos_fixed_enriched_fold,
-                                app_config=self.app_config,
+                                app_config=self.app_config, 
                                 output_dir_fold=fold_artifacts_path, 
                                 pair_symbol=pair_symbol,
-                                symbol_info_data=symbol_info_data, # type: ignore
+                                symbol_info_data=symbol_info_data, # This is the pair_config
                                 objective_evaluator_class=ObjectiveEvaluator,
                                 study_manager_class=StudyManager,
-                                results_analyzer_class=ResultsAnalyzer
+                                results_analyzer_class=ResultsAnalyzer,
+                                run_id=self.run_id 
                             )
                             if final_params_for_fold:
                                 fold_status = "COMPLETED_WITH_PARAMS"
@@ -412,9 +486,9 @@ class WalkForwardOptimizer:
                 wfo_summary_for_strategy_pair_context = {
                     "strategy_name": strat_name,
                     "pair_symbol": pair_symbol,
-                    "context_label": current_context_label_sanitized, # Save sanitized version
-                    "raw_context_label_input": current_context_label_raw, # Also save raw input for reference
-                    "wfo_run_timestamp": self.run_output_dir.name,
+                    "context_label": current_context_label_sanitized,
+                    "raw_context_label_input": current_context_label_raw,
+                    "wfo_run_id": self.run_id, 
                     "folds_data": fold_summaries
                 }
                 
@@ -430,3 +504,4 @@ class WalkForwardOptimizer:
         
         logger.info(f"{main_run_log_prefix} WFO processing finished for all configured pairs and strategies.")
         return all_wfo_run_results
+

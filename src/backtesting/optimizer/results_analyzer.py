@@ -1,367 +1,345 @@
-import logging
-import json
-from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple, Type, TYPE_CHECKING
-import optuna # type: ignore
+# src/backtesting/optimizer/results_analyzer.py
 import pandas as pd
-import numpy as np
-import math
+import logging
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+import optuna
 
-if TYPE_CHECKING: 
-    from src.config.definitions import AppConfig, OptunaSettings
-    from src.backtesting.optimizer.objective_evaluator import ObjectiveEvaluator
+# CORRECTED IMPORTS: Config definitions should come from .definitions
+from src.config.definitions import GlobalConfig, StrategyParamsConfig, ExchangeSettings, WfoSettings 
+from src.config.loader import load_exchange_config # Functions for loading instances are fine from loader
+from src.utils import file_utils
+from src.strategies.base import BaseStrategy
+from src.backtesting.simulator import BacktestSimulator
+from src.backtesting.performance import PerformanceCalculator
+# from src.data.data_utils import load_processed_data_for_symbol_or_pair # Not used directly here
+from src.utils.exchange_utils import get_pair_config_for_symbol
+
 
 logger = logging.getLogger(__name__)
 
 class ResultsAnalyzer:
+    """
+    Analyzes the results of Optuna optimization studies, performs Out-of-Sample (OOS) validation,
+    and saves relevant summaries and artifacts.
+    """
     def __init__(self,
-                 app_config: 'AppConfig',
-                 study: optuna.Study,
+                 run_id: str,
                  strategy_name: str,
-                 output_dir_fold: Path, 
                  pair_symbol: str,
-                 symbol_info_data: Dict[str, Any], 
-                 fold_name_for_log: Optional[str] = None
-                 ):
-        self.app_config = app_config 
-        self.optuna_settings: 'OptunaSettings' = self.app_config.global_config.optuna_settings
-        self.study = study
+                 context_label: str,
+                 study: optuna.Study,
+                 global_settings: GlobalConfig, # CORRECTED TYPE HINT
+                 strategy_config: StrategyParamsConfig, # CORRECTED TYPE HINT
+                 exchange_settings: ExchangeSettings, 
+                 wfo_settings: WfoSettings, # CORRECTED TYPE HINT
+                 fold_data_map: Dict[int, Tuple[pd.DataFrame, pd.DataFrame]],
+                 fold_dirs_map: Dict[int, Path]):
+        """
+        Initializes the ResultsAnalyzer.
+
+        Args:
+            run_id (str): Unique identifier for the optimization run.
+            strategy_name (str): Name of the strategy being optimized.
+            pair_symbol (str): Trading pair symbol (e.g., "BTCUSDT").
+            context_label (str): Context label for the optimization (e.g., timeframe).
+            study (optuna.Study): The completed Optuna study object.
+            global_settings (GlobalConfig): Global configuration settings instance.
+            strategy_config (StrategyParamsConfig): Strategy-specific configuration instance.
+            exchange_settings (ExchangeSettings): Exchange-specific configuration instance.
+            wfo_settings (WfoSettings): Walk-Forward Optimization settings instance.
+            fold_data_map (Dict[int, Tuple[pd.DataFrame, pd.DataFrame]]):
+                Map of fold_id to (df_is_fold, df_oos_fold).
+            fold_dirs_map (Dict[int, Path]): Map of fold_id to its specific output directory.
+        """
+        self.run_id = run_id
         self.strategy_name = strategy_name
-        self.output_dir_fold = output_dir_fold 
         self.pair_symbol = pair_symbol
-        self.symbol_info_data = symbol_info_data 
-        self.fold_name_for_log = fold_name_for_log if fold_name_for_log else self.output_dir_fold.name
-        
-        self.log_prefix = f"[{self.strategy_name}][{self.pair_symbol}][Fold: {self.fold_name_for_log}]"
-        logger.info(f"{self.log_prefix} ResultsAnalyzer initialized for study '{study.study_name}'.")
+        self.context_label = context_label
+        self.study = study
+        self.global_settings = global_settings
+        self.strategy_config = strategy_config 
+        self.exchange_settings = exchange_settings
+        self.wfo_settings = wfo_settings
+        self.fold_data_map = fold_data_map
+        self.fold_dirs_map = fold_dirs_map
 
-    def get_pareto_front_trials(self) -> List[optuna.trial.FrozenTrial]:
-        log_ctx = f"{self.log_prefix}[GetPareto]"
-        if not self.study.best_trials: 
-            logger.warning(f"{log_ctx} No best_trials (Pareto front) available in the study '{self.study.study_name}'.")
-            return []
-
-        pareto_trials = self.study.best_trials
-        valid_pareto_trials: List[optuna.trial.FrozenTrial] = []
-        for trial in pareto_trials:
-            if trial.state == optuna.trial.TrialState.COMPLETE and \
-               trial.values is not None and \
-               all(isinstance(v, (float, int)) and np.isfinite(v) for v in trial.values):
-                valid_pareto_trials.append(trial)
-            else:
-                logger.debug(f"{log_ctx} Trial {trial.number} (State: {trial.state}) from Pareto front excluded due to invalid/incomplete objective values: {trial.values}")
-        
-        logger.info(f"{log_ctx} Found {len(valid_pareto_trials)} valid trials in Pareto front.")
-        return valid_pareto_trials
-
-    def _select_n_best_trials_from_list(self,
-                                        trials_list: List[optuna.trial.FrozenTrial],
-                                        n: Optional[int] = None
-                                        ) -> List[optuna.trial.FrozenTrial]:
-        num_to_select = n if n is not None else self.optuna_settings.n_best_for_oos
-        log_ctx_select = f"{self.log_prefix}[SelectNBest]"
-        logger.info(f"{log_ctx_select} Selecting top {num_to_select} trials from a list of {len(trials_list)} trials.")
-
-        if not trials_list:
-            logger.warning(f"{log_ctx_select} Input trials_list is empty.")
-            return []
-
-        objectives_names = self.optuna_settings.objectives_names
-        objectives_directions = self.optuna_settings.objectives_directions
-        selection_strategy = self.optuna_settings.pareto_selection_strategy
-        selection_weights = self.optuna_settings.pareto_selection_weights
-        pnl_threshold = self.optuna_settings.pareto_selection_pnl_threshold
-        
-        valid_trials = trials_list 
-
-        if pnl_threshold is not None:
-            pnl_metric_name = "Total Net PnL USDC" 
-            try:
-                pnl_metric_index = objectives_names.index(pnl_metric_name)
-                trials_above_threshold = [
-                    t for t in valid_trials
-                    if t.values and len(t.values) > pnl_metric_index and t.values[pnl_metric_index] >= pnl_threshold # type: ignore
-                ]
-                if not trials_above_threshold and valid_trials:
-                    logger.warning(f"{log_ctx_select} No trials met PNL threshold of {pnl_threshold}. Proceeding with all {len(valid_trials)} previously valid trials for sorting.")
-                elif trials_above_threshold:
-                    logger.info(f"{log_ctx_select} Applied PNL threshold. {len(trials_above_threshold)} trials remaining from {len(valid_trials)}.")
-                    valid_trials = trials_above_threshold
-            except (ValueError, IndexError):
-                logger.warning(f"{log_ctx_select} PNL metric '{pnl_metric_name}' not found. PNL threshold not applied.")
-        
-        if not valid_trials: 
-            logger.warning(f"{log_ctx_select} No valid trials remaining after PNL threshold filter.")
-            return []
-
-        if selection_strategy == "SCORE_COMPOSITE" and selection_weights and objectives_names:
-            logger.info(f"{log_ctx_select} Sorting trials by SCORE_COMPOSITE.")
-            scored_trials = []
-            for trial in valid_trials:
-                score = 0.0; is_valid_for_scoring = True
-                for i, obj_name in enumerate(objectives_names):
-                    weight = selection_weights.get(obj_name, 0.0)
-                    if weight != 0.0:
-                        if trial.values and i < len(trial.values) and isinstance(trial.values[i], (float, int)) and np.isfinite(trial.values[i]): # type: ignore
-                            score += trial.values[i] * weight # type: ignore
-                        else: is_valid_for_scoring = False; break
-                if is_valid_for_scoring: scored_trials.append({'trial': trial, 'score': score})
-            
-            if scored_trials:
-                scored_trials.sort(key=lambda x: x['score'], reverse=True) 
-                valid_trials = [st['trial'] for st in scored_trials]
-            else:
-                logger.warning(f"{log_ctx_select} No trials scorable. Falling back to primary objective sort."); selection_strategy = "PNL_MAX"
-
-        if selection_strategy != "SCORE_COMPOSITE": 
-            sort_metric_name = "Total Net PnL USDC" 
-            if selection_strategy and selection_strategy != "PNL_MAX":
-                if selection_strategy in objectives_names: sort_metric_name = selection_strategy
-                else: logger.warning(f"{log_ctx_select} pareto_selection_strategy '{selection_strategy}' invalid. Defaulting to PNL_MAX.")
-            
-            try:
-                metric_index_for_sort = objectives_names.index(sort_metric_name)
-                direction_for_sort = objectives_directions[metric_index_for_sort]
-            except (ValueError, IndexError): 
-                metric_index_for_sort = 0
-                direction_for_sort = objectives_directions[0] if objectives_directions else "maximize"
-            
-            sort_descending = direction_for_sort == "maximize"
-            valid_trials.sort(key=lambda t: t.values[metric_index_for_sort] if (t.values and len(t.values) > metric_index_for_sort and np.isfinite(t.values[metric_index_for_sort])) else (-float('inf') if sort_descending else float('inf')), # type: ignore
-                              reverse=sort_descending)
-            logger.info(f"{log_ctx_select} Sorted {len(valid_trials)} trials by objective '{objectives_names[metric_index_for_sort]}' ({direction_for_sort}).")
-
-        selected_trials = valid_trials[:num_to_select]
-        logger.info(f"{log_ctx_select} Selected {len(selected_trials)} best trials.")
-        return selected_trials
-
-    def get_best_trials_for_oos_validation(self) -> List[optuna.trial.FrozenTrial]:
-        pareto_trials = self.get_pareto_front_trials()
-        if not pareto_trials:
-            return []
-        return self._select_n_best_trials_from_list(pareto_trials)
-
-    def run_oos_validation_for_best_is_trials(self,
-                                      best_is_trials_from_study: List[optuna.trial.FrozenTrial],
-                                      data_1min_cleaned_oos_slice: pd.DataFrame,
-                                      objective_evaluator_class: Type['ObjectiveEvaluator']
-                                      ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        
-        log_prefix_oos_val = f"{self.log_prefix}[OOS_Validation]"
-        logger.info(f"{log_prefix_oos_val} Starting OOS validation for {len(best_is_trials_from_study)} best IS trials.")
-
-        if data_1min_cleaned_oos_slice.empty:
-            logger.warning(f"{log_prefix_oos_val} OOS data slice is empty. Skipping OOS validation.")
-            empty_oos_results = []
-            for rank_idx, is_trial in enumerate(best_is_trials_from_study):
-                 empty_oos_results.append({
-                    "is_trial_number_optuna": is_trial.number,
-                    "is_trial_rank_in_selection": rank_idx + 1, 
-                    "params": is_trial.params,
-                    "is_metrics": {name: val for name, val in zip(self.optuna_settings.objectives_names, is_trial.values)} if is_trial.values else {},
-                    "oos_metrics": {name: np.nan for name in self.optuna_settings.objectives_names},
-                    "oos_trades_df": None, 
-                    "oos_error": "OOS_DATA_EMPTY"
-                })
-            return empty_oos_results, None, None
-
-        oos_validation_results: List[Dict[str, Any]] = []
-        
-        optuna_objectives_config = {
-            'objectives_names': self.optuna_settings.objectives_names,
-            'objectives_directions': self.optuna_settings.objectives_directions
-        }
-        
-        strategy_config_for_evaluator_obj = self.app_config.strategies_config.strategies.get(self.strategy_name)
-        if not strategy_config_for_evaluator_obj:
-            logger.error(f"{log_prefix_oos_val} Strategy config for '{self.strategy_name}' not found in AppConfig. Cannot proceed.")
-            return [], None, None
-        strategy_config_dict_for_evaluator = strategy_config_for_evaluator_obj.__dict__
-
-        for rank_idx, current_is_trial_obj in enumerate(best_is_trials_from_study):
-            is_trial_number_optuna = current_is_trial_obj.number
-            trial_params = current_is_trial_obj.params
-            
-            is_metrics_values = current_is_trial_obj.values
-            is_metrics_dict_from_values = {}
-            if is_metrics_values:
-                 for i, obj_name in enumerate(optuna_objectives_config['objectives_names']):
-                    if i < len(is_metrics_values):
-                        is_metrics_dict_from_values[obj_name] = is_metrics_values[i]
-            
-            full_is_metrics_from_attrs = current_is_trial_obj.user_attrs.get('full_is_metrics', {})
-            final_is_metrics_dict = {**is_metrics_dict_from_values, **full_is_metrics_from_attrs}
-
-            logger.info(f"{log_prefix_oos_val} Running OOS for IS Trial Optuna #{is_trial_number_optuna} (Rank {rank_idx+1}). Params: {trial_params}")
-
-            oos_evaluator = objective_evaluator_class(
-                strategy_name=self.strategy_name, 
-                strategy_config_dict=strategy_config_dict_for_evaluator,
-                df_enriched_slice=data_1min_cleaned_oos_slice.copy(),
-                simulation_settings=self.app_config.global_config.simulation_defaults.__dict__,
-                optuna_objectives_config=optuna_objectives_config,
-                pair_symbol=self.pair_symbol,
-                symbol_info_data=self.symbol_info_data, # Utiliser le symbol_info_data stocké
-                app_config=self.app_config,
-                is_oos_eval=True,
-                is_trial_number_for_oos_log=is_trial_number_optuna
-            )
-            
-            class FixedParamsTrialWrapper:
-                def __init__(self, params: Dict[str, Any], number: int, distributions: Dict[str, Any]):
-                    self.params = params
-                    self.number = number
-                    self.distributions = distributions 
-                    self.user_attrs: Dict[str, Any] = {} 
-                def suggest_float(self, name, low, high, step=None, log=False): return self.params[name]
-                def suggest_int(self, name, low, high, step=1, log=False): return self.params[name]
-                def suggest_categorical(self, name, choices): return self.params[name]
-                def report(self, value: float, step: int) -> None: pass
-                def should_prune(self) -> bool: return False
-                def set_user_attr(self, key: str, value: Any) -> None: self.user_attrs[key] = value
-
-            trial_wrapper_for_oos = FixedParamsTrialWrapper(trial_params, is_trial_number_optuna, current_is_trial_obj.distributions)
-
-            oos_trades_df_for_trial: Optional[pd.DataFrame] = None
-            oos_metrics_for_trial: Dict[str, Any] = {} 
-            try:
-                oos_objectives_values_tuple = oos_evaluator(trial_wrapper_for_oos) 
-                
-                for i, obj_name in enumerate(optuna_objectives_config['objectives_names']):
-                    if i < len(oos_objectives_values_tuple):
-                        oos_metrics_for_trial[obj_name] = oos_objectives_values_tuple[i]
-                
-                current_oos_backtest_results = oos_evaluator.last_backtest_results
-                if current_oos_backtest_results:
-                    full_oos_metrics = current_oos_backtest_results.get("metrics", {})
-                    oos_metrics_for_trial.update(full_oos_metrics)
-
-                    # Récupérer 'trades' qui est un DataFrame simple des trades
-                    oos_trades_df_from_results_raw = current_oos_backtest_results.get("trades") 
-                    if isinstance(oos_trades_df_from_results_raw, pd.DataFrame) and not oos_trades_df_from_results_raw.empty:
-                        oos_trades_df_for_trial = oos_trades_df_from_results_raw.copy()
-                        oos_trades_df_for_trial['is_trial_number_optuna'] = is_trial_number_optuna
-                        oos_trades_df_for_trial['is_trial_rank_in_selection'] = rank_idx + 1
-                        logger.debug(f"{log_prefix_oos_val} Récupéré {len(oos_trades_df_for_trial)} trades OOS pour IS trial Optuna #{is_trial_number_optuna}.")
-                    else:
-                        logger.info(f"{log_prefix_oos_val} Aucun trade OOS pour IS trial Optuna #{is_trial_number_optuna}.")
-                else:
-                    logger.warning(f"{log_prefix_oos_val} last_backtest_results non trouvé pour IS trial Optuna #{is_trial_number_optuna}.")
-
-            except optuna.exceptions.TrialPruned as e_pruned_oos:
-                 logger.warning(f"{log_prefix_oos_val} OOS eval pour IS Trial Optuna #{is_trial_number_optuna} pruné: {e_pruned_oos}")
-                 for i, obj_name in enumerate(optuna_objectives_config['objectives_names']):
-                    direction = optuna_objectives_config['objectives_directions'][i]
-                    oos_metrics_for_trial[obj_name] = -float('inf') if direction == "maximize" else float('inf')
-            except Exception as e_oos:
-                logger.error(f"{log_prefix_oos_val} Erreur OOS eval pour IS Trial Optuna #{is_trial_number_optuna}: {e_oos}", exc_info=True)
-                for i, obj_name in enumerate(optuna_objectives_config['objectives_names']):
-                    direction = optuna_objectives_config['objectives_directions'][i]
-                    oos_metrics_for_trial[obj_name] = -float('inf') if direction == "maximize" else float('inf')
-
-            oos_validation_results.append({
-                'is_trial_number_optuna': is_trial_number_optuna,
-                'is_trial_rank_in_selection': rank_idx + 1,
-                'params': trial_params,
-                'is_metrics': final_is_metrics_dict, 
-                'oos_metrics': oos_metrics_for_trial,
-                'oos_trades_df': oos_trades_df_for_trial 
-            })
-        
-        selected_best_overall_params: Optional[Dict[str, Any]] = None
-        best_overall_oos_metrics: Optional[Dict[str, Any]] = None
-
-        if oos_validation_results:
-            selection_metric_name = self.app_config.global_config.wfo_settings.metric_to_optimize
-            selection_direction = self.app_config.global_config.wfo_settings.optimization_direction
-            
-            best_oos_run_for_final_selection = None
-            current_best_value = -float('inf') if selection_direction == "maximize" else float('inf')
-
-            for oos_run in oos_validation_results:
-                metric_val = oos_run.get('oos_metrics', {}).get(selection_metric_name)
-                if metric_val is not None and np.isfinite(metric_val): # type: ignore
-                    if (selection_direction == "maximize" and metric_val > current_best_value) or \
-                       (selection_direction == "minimize" and metric_val < current_best_value): # type: ignore
-                        current_best_value = metric_val # type: ignore
-                        best_oos_run_for_final_selection = oos_run
-            
-            if best_oos_run_for_final_selection:
-                selected_best_overall_params = best_oos_run_for_final_selection['params']
-                best_overall_oos_metrics = best_oos_run_for_final_selection['oos_metrics']
-                logger.info(f"{log_prefix_oos_val} Meilleur run OOS global (basé sur '{selection_metric_name}'): "
-                            f"IS Trial Optuna #{best_oos_run_for_final_selection['is_trial_number_optuna']}, Métriques OOS: {best_overall_oos_metrics}")
-            else:
-                logger.warning(f"{log_prefix_oos_val} Aucun résultat OOS valide trouvé pour sélectionner le meilleur run overall selon '{selection_metric_name}'.")
+        # Assuming LOGS_DIR is globally available or defined in src.config.definitions
+        # If not, it needs to be passed or loaded from global_settings.paths
+        # Check if global_settings.paths.logs_backtest_optimization exists
+        if hasattr(self.global_settings, 'paths') and hasattr(self.global_settings.paths, 'logs_backtest_optimization'):
+            base_logs_path = Path(self.global_settings.paths.logs_backtest_optimization)
         else:
-            logger.warning(f"{log_prefix_oos_val} Aucune validation OOS n'a pu être effectuée.")
+            # Fallback if paths not in global_settings, though it should be based on GlobalConfig definition
+            from src.config.definitions import LOGS_DIR # Make sure LOGS_DIR is defined or handle error
+            base_logs_path = Path(LOGS_DIR) / "backtest_optimization"
+            logger.warning(f"Could not find 'logs_backtest_optimization' in global_settings.paths. Using default: {base_logs_path}")
 
-        return oos_validation_results, selected_best_overall_params, best_overall_oos_metrics
+        self.base_log_dir = base_logs_path / self.run_id / \
+                            self.strategy_name / self.pair_symbol / self.context_label
+        
+        self.pair_config = get_pair_config_for_symbol(
+            self.pair_symbol, 
+            self.exchange_settings.exchange_info_file_path 
+        )
+        if not self.pair_config:
+            try:
+                # Attempt to load exchange_info directly if path is available and pair_config failed
+                # Assuming load_exchange_config returns the full exchange info dict
+                full_exchange_info = load_exchange_config(Path(self.exchange_settings.exchange_info_file_path))
+                if isinstance(full_exchange_info, dict) and 'symbols' in full_exchange_info: # Check structure
+                    self.pair_config = next((s for s in full_exchange_info['symbols'] if s['symbol'] == self.pair_symbol), None)
+                else: # If load_exchange_config returns something else, adapt or use get_pair_config_for_symbol
+                    self.pair_config = get_pair_config_for_symbol(self.pair_symbol, full_exchange_info) # type: ignore
+            except Exception as e_load_exc:
+                logger.error(f"Error trying to load exchange info for pair_config fallback: {e_load_exc}")
 
-    def save_oos_validation_summary(self, oos_results: List[Dict[str, Any]]):
-        if not oos_results:
-            logger.info(f"{self.log_prefix} No OOS results to save in summary JSON.")
+
+            if not self.pair_config: # Final check
+                raise ValueError(f"Pair configuration not found for {self.pair_symbol} using path {self.exchange_settings.exchange_info_file_path}")
+
+
+    def analyze_and_save_results(self, fold_id: int):
+        logger.info(f"Analyzing results for fold {fold_id}...")
+        fold_dir = self.fold_dirs_map[fold_id]
+        fold_dir.mkdir(parents=True, exist_ok=True)
+
+        self._save_optuna_study_summary(fold_id, fold_dir)
+
+        best_is_trials_for_oos = self._get_best_is_trials_for_oos(fold_id)
+        if not best_is_trials_for_oos:
+            logger.warning(f"No best IS trials found for OOS validation for fold {fold_id}. Skipping OOS.")
             return
 
-        serializable_results = []
-        for res_entry in oos_results:
-            entry_copy = {k: v for k, v in res_entry.items() if k != 'oos_trades_df'} 
+        # strategy_config (StrategyParamsConfig) should have script_reference and class_name
+        if not hasattr(self.strategy_config, 'script_reference') or not self.strategy_config.script_reference or \
+           not hasattr(self.strategy_config, 'class_name') or not self.strategy_config.class_name:
+             logger.error(f"StrategyParamsConfig for {self.strategy_name} is missing 'script_reference' or 'class_name'. Cannot run OOS validation.")
+             return
 
-            if 'is_metrics' in entry_copy and isinstance(entry_copy['is_metrics'], dict):
-                entry_copy['is_metrics'] = {
-                    k_met: (v_met if isinstance(v_met, (int, float, str, bool)) and (not isinstance(v_met, float) or np.isfinite(v_met)) else str(v_met) if v_met is not None else None)
-                    for k_met, v_met in entry_copy['is_metrics'].items()
-                }
-            if 'oos_metrics' in entry_copy and isinstance(entry_copy['oos_metrics'], dict):
-                 entry_copy['oos_metrics'] = {
-                    k_met: (v_met if isinstance(v_met, (int, float, str, bool)) and (not isinstance(v_met, float) or np.isfinite(v_met)) else str(v_met) if v_met is not None else None)
-                    for k_met, v_met in entry_copy['oos_metrics'].items()
-                }
-            serializable_results.append(entry_copy)
+        oos_validation_results = self.run_oos_validation_for_best_is_trials(
+            fold_id,
+            best_is_trials_for_oos,
+            self.strategy_config.script_reference, 
+            self.strategy_config.class_name      
+        )
 
-        file_path = self.output_dir_fold / "oos_validation_summary_TOP_N_TRIALS.json"
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(serializable_results, f, indent=4, allow_nan=False) 
-            logger.info(f"{self.log_prefix} OOS validation summary (sans trades DF) saved to: {file_path}")
-        except Exception as e:
-            logger.error(f"{self.log_prefix} Failed to save OOS validation summary JSON to {file_path}: {e}", exc_info=True)
+        if oos_validation_results:
+            top_n_to_report = self.wfo_settings.top_n_trials_to_report_oos
+            
+            summary_filename = f"oos_validation_summary_TOP_{top_n_to_report}_TRIALS.json"
+            summary_filepath = fold_dir / summary_filename
+            file_utils.save_json(summary_filepath, oos_validation_results) 
+            logger.info(f"Saved OOS validation summary to {summary_filepath}")
 
-    def select_final_parameters_for_live(self, oos_validation_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not oos_validation_results:
-            logger.warning(f"{self.log_prefix} No OOS results provided to select final parameters.")
-            return None
-
-        selection_metric_name = self.app_config.global_config.wfo_settings.metric_to_optimize
-        selection_direction = self.app_config.global_config.wfo_settings.optimization_direction
-        
-        logger.info(f"{self.log_prefix} Selecting final parameters based on OOS metric: '{selection_metric_name}' (Direction: {selection_direction})")
-
-        best_oos_trial_info = None
-        best_oos_metric_value = -float('inf') if selection_direction == "maximize" else float('inf')
-
-        for result_entry in oos_validation_results:
-            oos_metrics = result_entry.get("oos_metrics", {})
-            current_metric_value = oos_metrics.get(selection_metric_name)
-
-            if current_metric_value is None or not isinstance(current_metric_value, (int, float)) or not np.isfinite(current_metric_value):
-                logger.debug(f"{self.log_prefix} Skipping OOS result for IS trial {result_entry.get('is_trial_number_optuna')} due to invalid OOS selection metric value: {current_metric_value}")
-                continue
-
-            if selection_direction == "maximize":
-                if current_metric_value > best_oos_metric_value:
-                    best_oos_metric_value = current_metric_value
-                    best_oos_trial_info = result_entry
-            else: 
-                if current_metric_value < best_oos_metric_value:
-                    best_oos_metric_value = current_metric_value
-                    best_oos_trial_info = result_entry
-        
-        if best_oos_trial_info:
-            final_params = best_oos_trial_info.get("params") 
-            logger.info(f"{self.log_prefix} Final parameters selected from IS Trial {best_oos_trial_info.get('is_trial_number_optuna')} "
-                        f"with OOS '{selection_metric_name}': {best_oos_metric_value:.4f}. Parameters: {final_params}")
-            return final_params
+            for oos_run_summary in oos_validation_results: 
+                is_trial_no = oos_run_summary.get("is_trial_number")
+                detailed_log_data = oos_run_summary.get("oos_detailed_trades_log")
+                
+                if detailed_log_data is not None and is_trial_no is not None:
+                    detailed_log_filename = f"oos_best_trial_trades_is_trial_{is_trial_no}_fold_{fold_id}.json"
+                    detailed_log_filepath = fold_dir / detailed_log_filename
+                    file_utils.save_json(detailed_log_filepath, detailed_log_data)
+                    logger.info(f"Saved detailed OOS trades for IS trial {is_trial_no} to {detailed_log_filepath}")
+                elif is_trial_no is None:
+                    logger.warning(f"Missing 'is_trial_number' in OOS run summary for fold {fold_id}, cannot save detailed log.")
         else:
-            logger.warning(f"{self.log_prefix} Could not select final parameters. No OOS trial had a valid value for metric '{selection_metric_name}'.")
-            return None
+            logger.warning(f"OOS validation did not yield any results for fold {fold_id}.")
+
+
+    def _save_optuna_study_summary(self, fold_id: int, fold_dir: Path):
+        study_summary = {
+            "study_name": self.study.study_name,
+            "direction": str(self.study.direction), 
+            "best_trial_number_is": self.study.best_trial.number if self.study.best_trial else None,
+            "best_value_is": self.study.best_value if self.study.best_trial else None,
+            "best_params_is": self.study.best_params if self.study.best_trial else None,
+            "n_trials_completed": len([t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
+        }
+        filepath = fold_dir / f"optuna_study_summary_fold_{fold_id}.json"
+        file_utils.save_json(filepath, study_summary)
+        logger.info(f"Saved Optuna study summary for fold {fold_id} to {filepath}")
+
+        try:
+            trials_df = self.study.trials_dataframe()
+            trials_filepath = fold_dir / f"optuna_trials_dataframe_fold_{fold_id}.csv"
+            trials_df.to_csv(trials_filepath, index=False)
+            logger.info(f"Saved Optuna trials dataframe for fold {fold_id} to {trials_filepath}")
+        except Exception as e_df:
+            logger.error(f"Could not save Optuna trials dataframe for fold {fold_id}: {e_df}")
+
+
+    def _get_best_is_trials_for_oos(self, fold_id: int) -> List[Dict[str, Any]]:
+        if not self.study.trials:
+            logger.warning(f"No trials found in the study for fold {fold_id}.")
+            return []
+
+        completed_trials = [t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None and pd.notna(t.value)]
+        if not completed_trials:
+            logger.warning(f"No completed trials with valid (non-NaN) values found for fold {fold_id}.")
+            return []
+        
+        is_maximize = True # Default
+        # Optuna direction can be a single StudyDirection or a list for multi-objective
+        if isinstance(self.study.direction, optuna.study.StudyDirection): # Single objective
+            is_maximize = self.study.direction == optuna.study.StudyDirection.MAXIMIZE
+        elif isinstance(self.study.directions, list) and self.study.directions: # Multi-objective
+            is_maximize = self.study.directions[0] == optuna.study.StudyDirection.MAXIMIZE
+            logger.warning(f"Multi-objective study detected for fold {fold_id}. Using direction of the first objective for sorting IS trials.")
+        else: # Fallback or unknown direction type
+            logger.warning(f"Could not determine optimization direction for study of fold {fold_id}. Defaulting to 'maximize'. Study direction: {self.study.direction}")
+
+
+        sorted_trials = sorted(completed_trials, key=lambda t: t.value, reverse=is_maximize)
+        
+        top_n = self.wfo_settings.top_n_trials_for_oos_validation
+        best_trials_for_oos = []
+        for trial in sorted_trials[:top_n]:
+            best_trials_for_oos.append({
+                "trial_number": trial.number,
+                "params": trial.params,
+                "is_value": trial.value 
+            })
+        
+        logger.info(f"Selected Top {len(best_trials_for_oos)} IS trials for OOS validation for fold {fold_id}.")
+        return best_trials_for_oos
+
+
+    def run_oos_validation_for_best_is_trials(self,
+                                              fold_id: int,
+                                              best_is_trials_for_oos: List[Dict[str, Any]],
+                                              strategy_script_reference: str, 
+                                              strategy_class_name: str      
+                                             ) -> List[Dict[str, Any]]:
+        _, df_oos_fold = self.fold_data_map[fold_id]
+        if df_oos_fold.empty:
+            logger.warning(f"OOS data for fold {fold_id} is empty. Skipping OOS validation.")
+            return []
+
+        oos_results_list = []
+
+        try:
+            module_path = strategy_script_reference
+            if module_path.endswith(".py"): # Convert file path to module path if needed
+                 module_path = module_path.replace('.py', '').replace('/', '.') 
+            
+            strategy_module = file_utils.import_module_from_path(module_path) 
+            StrategyClass = getattr(strategy_module, strategy_class_name)
+        except Exception as e:
+            logger.error(f"Failed to load strategy class {strategy_class_name} from {strategy_script_reference} for OOS: {e}", exc_info=True)
+            return []
+
+        sim_defaults = self.global_settings.simulation_defaults
+
+        for is_trial_info in best_is_trials_for_oos:
+            is_trial_number = is_trial_info["trial_number"]
+            is_trial_params = is_trial_info["params"]
+            is_value = is_trial_info["is_value"]
+
+            logger.info(f"Running OOS validation for IS trial {is_trial_number} (params: {is_trial_params}) on fold {fold_id}...")
+
+            strategy_instance = StrategyClass(
+                strategy_name=self.strategy_name, 
+                symbol=self.pair_symbol,
+                params=is_trial_params
+            )
+            strategy_instance.set_backtest_context(
+                pair_config=self.pair_config,
+                is_futures=sim_defaults.is_futures_trading,
+                leverage=is_trial_params.get('margin_leverage', sim_defaults.margin_leverage), # Allow override from trial params
+                initial_equity=sim_defaults.initial_capital
+            )
+
+            simulator = BacktestSimulator(
+                df_ohlcv=df_oos_fold.copy(), 
+                strategy_instance=strategy_instance,
+                initial_equity=sim_defaults.initial_capital,
+                leverage=is_trial_params.get('margin_leverage', sim_defaults.margin_leverage), 
+                symbol=self.pair_symbol,
+                trading_fee_bps=sim_defaults.trading_fee_bps,
+                slippage_config=sim_defaults.slippage_config,
+                is_futures=sim_defaults.is_futures_trading,
+                run_id=self.run_id, 
+                is_oos_simulation=True, 
+                verbosity=sim_defaults.backtest_verbosity 
+            )
+
+            try:
+                oos_trades, oos_equity_curve, oos_daily_equity, oos_detailed_log = simulator.run_simulation()
+                
+                performance_calculator = PerformanceCalculator(
+                    trades=oos_trades,
+                    equity_curve=oos_equity_curve,
+                    daily_equity_values=list(oos_daily_equity.values()), 
+                    initial_capital=sim_defaults.initial_capital,
+                    risk_free_rate=self.global_settings.risk_free_rate,
+                    benchmark_returns=None 
+                )
+                oos_metrics_dict = performance_calculator.calculate_all_metrics()
+                oos_metrics_dict['final_equity'] = oos_equity_curve['equity'].iloc[-1] if not oos_equity_curve.empty else sim_defaults.initial_capital
+                oos_metrics_dict['total_trades'] = len(oos_trades)
+
+                oos_trial_summary = {
+                    "is_trial_number": is_trial_number,
+                    "is_trial_params": is_trial_params,
+                    "is_value_from_study": is_value, 
+                    "oos_performance": oos_metrics_dict,
+                    "oos_detailed_trades_log": oos_detailed_log 
+                }
+                oos_results_list.append(oos_trial_summary)
+                logger.info(f"OOS validation for IS trial {is_trial_number} completed. Metric '{self.wfo_settings.metric_to_optimize}': {oos_metrics_dict.get(self.wfo_settings.metric_to_optimize)}")
+
+            except Exception as e:
+                logger.error(f"Error during OOS simulation for IS trial {is_trial_number} on fold {fold_id}: {e}", exc_info=True)
+                oos_results_list.append({
+                    "is_trial_number": is_trial_number,
+                    "is_trial_params": is_trial_params,
+                    "is_value_from_study": is_value,
+                    "oos_performance": {"error": str(e)},
+                    "oos_detailed_trades_log": [] 
+                })
+        
+        metric_key = self.wfo_settings.metric_to_optimize
+        
+        is_maximize_oos = True # Default
+        if isinstance(self.study.direction, optuna.study.StudyDirection):
+            is_maximize_oos = self.study.direction == optuna.study.StudyDirection.MAXIMIZE
+        elif isinstance(self.study.directions, list) and self.study.directions:
+            is_maximize_oos = self.study.directions[0] == optuna.study.StudyDirection.MAXIMIZE
+
+
+        def get_metric_for_sorting(res):
+            val = res.get("oos_performance", {}).get(metric_key)
+            if val is None or not isinstance(val, (int, float)) or not pd.notna(val):
+                return -float('inf') if is_maximize_oos else float('inf')
+            return val
+
+        sorted_oos_results = sorted(
+            oos_results_list,
+            key=get_metric_for_sorting,
+            reverse=is_maximize_oos 
+        )
+        
+        top_n_oos_to_report = self.wfo_settings.top_n_trials_to_report_oos
+        return sorted_oos_results[:top_n_oos_to_report]
+
+
+    def aggregate_fold_results(self, all_fold_oos_summaries: Dict[int, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        # Ensure LOGS_DIR is defined or accessible
+        if hasattr(self.global_settings, 'paths') and hasattr(self.global_settings.paths, 'logs_backtest_optimization'):
+            base_logs_path = Path(self.global_settings.paths.logs_backtest_optimization)
+        else:
+            from src.config.definitions import LOGS_DIR # Fallback
+            base_logs_path = Path(LOGS_DIR) / "backtest_optimization"
+        
+        # Use self.base_log_dir which is already defined relative to LOGS_DIR and run_id
+        # However, self.base_log_dir is strategy/pair/context specific. Aggregation should be at run_id level.
+        aggregated_results_dir = base_logs_path / self.run_id / "_AGGREGATED_RESULTS"
+        aggregated_results_dir.mkdir(parents=True, exist_ok=True)
+        
+        filepath = aggregated_results_dir / f"all_folds_oos_summaries_{self.strategy_name}_{self.pair_symbol}_{self.context_label}.json"
+        file_utils.save_json(filepath, all_fold_oos_summaries)
+        logger.info(f"Saved aggregated OOS summaries for {self.strategy_name}/{self.pair_symbol}/{self.context_label} to {filepath}")
+        
+        return {"message": "Aggregated fold results saved.", "path": str(filepath)}
+
