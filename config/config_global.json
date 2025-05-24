@@ -42,8 +42,8 @@
   },
   "wfo_settings": {
     "n_splits": 3,
-    "oos_period_days": 90,
-    "min_is_period_days": 180,
+    "oos_period_days": 20,
+    "min_is_period_days": 100,
     "fold_type": "expanding",
     "metric_to_optimize": "Total Net PnL USDC",
     "optimization_direction": "maximize",

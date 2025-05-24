@@ -4,9 +4,12 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from src.strategies.base import BaseStrategy
+from src.strategies.base import BaseStrategy # Assurez-vous que BaseStrategy a get_param et _build_entry_params_formatted
 from src.utils.exchange_utils import (adjust_precision,
-                                      get_precision_from_filter)
+                                      get_precision_from_filter,
+                                      get_filter_value, # Ajouté pour _calculate_quantity
+                                      validate_order_parameters) # Ajouté pour validation optionnelle
+# Il est préférable que _calculate_quantity et _build_entry_params_formatted soient dans BaseStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -15,160 +18,206 @@ class MaCrossoverStrategy(BaseStrategy):
         'fast_ma_period', 'slow_ma_period', 'ma_type',
         'atr_period_sl_tp', 'sl_atr_multiplier', 'tp_atr_multiplier',
         'indicateur_frequence_ma_rapide', 'indicateur_frequence_ma_lente',
-        'atr_base_frequency_sl_tp'
+        'atr_base_frequency_sl_tp',
+        'capital_allocation_pct', # Ajouté pour _calculate_quantity
+        'order_type_preference' # Ajouté pour _build_entry_params_formatted
     ]
 
-    def __init__(self, params: dict):
-        super().__init__(params)
-        # Définir log_prefix explicitement ici, après l'appel à super()
-        # Cela peut surcharger celui de BaseStrategy si BaseStrategy en définit un moins spécifique,
-        # ou le créer si BaseStrategy ne le fait pas.
-        self.log_prefix = f"[{self.__class__.__name__}]"
-        
+    def __init__(self, strategy_name: str, symbol: str, params: Dict[str, Any]):
+        super().__init__(strategy_name, symbol, params) # strategy_name et symbol sont maintenant passés
+        self.log_prefix = f"[{self.strategy_name}][{self.symbol}]"
+
         self.fast_ma_col_strat = "MA_FAST_strat"
         self.slow_ma_col_strat = "MA_SLOW_strat"
         self.atr_col_strat = "ATR_strat"
-
-        self._signals: Optional[pd.DataFrame] = None
         logger.info(f"{self.log_prefix} Stratégie initialisée. Paramètres: {self.params}")
 
+    def _validate_params(self):
+        missing_params = [p for p in self.REQUIRED_PARAMS if self.get_param(p) is None]
+        if missing_params:
+            raise ValueError(f"{self.log_prefix} Missing required parameters: {', '.join(missing_params)}")
+        
+        if self.get_param('fast_ma_period') >= self.get_param('slow_ma_period'):
+            logger.warning(f"{self.log_prefix} fast_ma_period ({self.get_param('fast_ma_period')}) "
+                           f"should ideally be less than slow_ma_period ({self.get_param('slow_ma_period')}).")
+        
+        if not (0 < self.get_param('capital_allocation_pct') <= 1):
+            raise ValueError(f"{self.log_prefix} capital_allocation_pct must be > 0 and <= 1.")
+        logger.debug(f"{self.log_prefix} Parameters validated successfully.")
+
     def _calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        # Cette méthode est appelée par BaseStrategy.get_signal et par generate_order_request.
+        # Elle doit s'assurer que les colonnes _strat sont présentes.
+        # En mode backtest, ObjectiveEvaluator les prépare.
+        # En mode live, LiveTradingManager doit s'assurer que le DataFrame passé à generate_order_request
+        # contient ces colonnes (via preprocessing_live.py).
         df = data.copy()
         expected_strat_cols = [self.fast_ma_col_strat, self.slow_ma_col_strat, self.atr_col_strat]
         for col_name in expected_strat_cols:
             if col_name not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante. Ajoutée avec NaN.")
-                df[col_name] = np.nan
+                logger.error(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante dans les données d'entrée.")
+                # En mode live, cela pourrait être critique. En backtest, c'est un bug dans la préparation.
+                df[col_name] = np.nan 
 
-        required_ohlc = ['open', 'high', 'low', 'close']
+        required_ohlc = ['open', 'high', 'low', 'close', 'volume']
         for col in required_ohlc:
             if col not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne OHLC de base '{col}' manquante. Ajoutée avec NaN.")
+                logger.error(f"{self.log_prefix} Colonne OHLCV de base '{col}' manquante.")
                 df[col] = np.nan
         return df
 
-    def generate_signals(self, data: pd.DataFrame) -> None:
-        df_with_indicators = self._calculate_indicators(data)
-        required_cols_for_signal = [self.fast_ma_col_strat, self.slow_ma_col_strat, self.atr_col_strat, 'close']
-        if df_with_indicators.empty or \
-           any(col not in df_with_indicators.columns for col in required_cols_for_signal) or \
-           df_with_indicators[required_cols_for_signal].isnull().all().all() or \
-           len(df_with_indicators) < 2:
-            logger.warning(f"{self.log_prefix} Données/colonnes insuffisantes pour générer les signaux. Signaux vides générés.")
-            self._signals = pd.DataFrame(index=data.index, columns=['entry_long', 'exit_long', 'entry_short', 'exit_short', 'sl', 'tp'])
-            self._signals[['sl', 'tp']] = np.nan
-            self._signals[self._signals.select_dtypes(include=['object', 'bool']).columns] = False
-            return
+    def _generate_signals(self,
+                          data_with_indicators: pd.DataFrame,
+                          current_position_open: bool,
+                          current_position_direction: int,
+                          current_entry_price: float
+                         ) -> Tuple[int, Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
+        
+        if len(data_with_indicators) < 2:
+            logger.debug(f"{self.log_prefix} Pas assez de données ({len(data_with_indicators)}) pour générer des signaux.")
+            return 0, self.get_param("order_type_preference", "MARKET"), None, None, None, self.get_param('capital_allocation_pct', 1.0)
+
+        latest_row = data_with_indicators.iloc[-1]
+        previous_row = data_with_indicators.iloc[-2]
+
+        ma_fast_curr = latest_row.get(self.fast_ma_col_strat)
+        ma_slow_curr = latest_row.get(self.slow_ma_col_strat)
+        ma_fast_prev = previous_row.get(self.fast_ma_col_strat)
+        ma_slow_prev = previous_row.get(self.slow_ma_col_strat)
+        
+        close_curr = latest_row.get('close')
+        atr_curr = latest_row.get(self.atr_col_strat)
+
+        signal = 0
+        sl_price = None
+        tp_price = None
+        
+        essential_values = [ma_fast_curr, ma_slow_curr, ma_fast_prev, ma_slow_prev, atr_curr, close_curr]
+        if any(pd.isna(val) for val in essential_values):
+            logger.debug(f"{self.log_prefix} Valeurs NaN dans les indicateurs/prix à {data_with_indicators.index[-1]}. Signal Hold.")
+            return 0, self.get_param("order_type_preference", "MARKET"), None, None, None, self.get_param('capital_allocation_pct', 1.0)
 
         sl_mult = float(self.get_param('sl_atr_multiplier'))
         tp_mult = float(self.get_param('tp_atr_multiplier'))
 
-        ma_fast_curr = df_with_indicators[self.fast_ma_col_strat]
-        ma_slow_curr = df_with_indicators[self.slow_ma_col_strat]
-        ma_fast_prev = df_with_indicators[self.fast_ma_col_strat].shift(1)
-        ma_slow_prev = df_with_indicators[self.slow_ma_col_strat].shift(1)
-        close_curr = df_with_indicators['close']
-        atr_curr = df_with_indicators[self.atr_col_strat]
+        bullish_crossover = (ma_fast_curr > ma_slow_curr) and (ma_fast_prev <= ma_slow_prev)
+        bearish_crossover = (ma_fast_curr < ma_slow_curr) and (ma_fast_prev >= ma_slow_prev)
 
-        bullish_crossover = (ma_fast_curr > ma_slow_curr) & (ma_fast_prev <= ma_slow_prev)
-        bearish_crossover = (ma_fast_curr < ma_slow_curr) & (ma_fast_prev >= ma_slow_prev)
-
-        valid_data_for_signal = ma_fast_curr.notna() & ma_slow_curr.notna() & \
-                                ma_fast_prev.notna() & ma_slow_prev.notna() & \
-                                atr_curr.notna() & close_curr.notna()
-
-        signals_df = pd.DataFrame(index=df_with_indicators.index)
-        signals_df['entry_long'] = bullish_crossover & valid_data_for_signal
-        signals_df['entry_short'] = bearish_crossover & valid_data_for_signal
-        signals_df['exit_long'] = bearish_crossover & valid_data_for_signal
-        signals_df['exit_short'] = bullish_crossover & valid_data_for_signal
-
-        signals_df['sl'] = np.nan
-        signals_df['tp'] = np.nan
-
-        signals_df.loc[signals_df['entry_long'], 'sl'] = close_curr - sl_mult * atr_curr
-        signals_df.loc[signals_df['entry_long'], 'tp'] = close_curr + tp_mult * atr_curr
-        signals_df.loc[signals_df['entry_short'], 'sl'] = close_curr + sl_mult * atr_curr
-        signals_df.loc[signals_df['entry_short'], 'tp'] = close_curr - tp_mult * atr_curr
+        if not current_position_open:
+            if bullish_crossover:
+                signal = 1
+                if pd.notna(atr_curr) and atr_curr > 0:
+                    sl_price = close_curr - sl_mult * atr_curr
+                    tp_price = close_curr + tp_mult * atr_curr
+            elif bearish_crossover:
+                signal = -1
+                if pd.notna(atr_curr) and atr_curr > 0:
+                    sl_price = close_curr + sl_mult * atr_curr
+                    tp_price = close_curr - tp_mult * atr_curr
+        else:
+            if current_position_direction == 1 and bearish_crossover:
+                signal = 2 # Exit long
+            elif current_position_direction == -1 and bullish_crossover:
+                signal = 2 # Exit short
         
-        self._signals = signals_df[['entry_long', 'exit_long', 'entry_short', 'exit_short', 'sl', 'tp']].reindex(data.index)
+        order_type = self.get_param('order_type_preference', "MARKET")
+        limit_price = None
+        if signal != 0 and order_type == "LIMIT" and pd.notna(close_curr):
+            limit_price = close_curr 
+
+        position_size_pct = self.get_param('capital_allocation_pct', 1.0)
+
+        return signal, order_type, limit_price, sl_price, tp_price, position_size_pct
 
     def generate_order_request(self,
-                               data: pd.DataFrame,
-                               symbol: str,
-                               current_position: int,
-                               available_capital: float,
-                               symbol_info: dict
+                               data: pd.DataFrame, # Doit contenir les indicateurs _strat
+                               current_position: int, # 0: no pos, 1: long, -1: short
+                               available_capital: float, # En actif de cotation (ex: USDC)
+                               symbol_info: dict # Infos de l'exchange pour la paire
                                ) -> Optional[Tuple[Dict[str, Any], Dict[str, float]]]:
-        if current_position != 0:
-            return None
-        if data.empty or len(data) < 2:
-            logger.warning(f"{self.log_prefix} Données d'entrée vides ou insuffisantes pour generate_order_request.")
-            return None
-
-        df_verified_indicators = self._calculate_indicators(data.copy())
-        latest_data = df_verified_indicators.iloc[-1]
-        previous_data = df_verified_indicators.iloc[-2]
-
-        required_cols = ['close', 'open', self.fast_ma_col_strat, self.slow_ma_col_strat, self.atr_col_strat]
-        if latest_data[required_cols].isnull().any() or \
-           previous_data[[self.fast_ma_col_strat, self.slow_ma_col_strat]].isnull().any():
+        
+        # 1. S'assurer que les indicateurs sont présents (appel _calculate_indicators)
+        data_with_indicators = self._calculate_indicators(data)
+        if data_with_indicators.empty or len(data_with_indicators) < 2:
+            logger.warning(f"{self.log_prefix} [Live] Pas assez de données pour generate_order_request.")
             return None
 
-        ma_fast_curr = latest_data[self.fast_ma_col_strat]
-        ma_slow_curr = latest_data[self.slow_ma_col_strat]
-        ma_fast_prev = previous_data[self.fast_ma_col_strat]
-        ma_slow_prev = previous_data[self.slow_ma_col_strat]
-        entry_price_theoretical = latest_data['open']
-        atr_value = latest_data[self.atr_col_strat]
+        # 2. Utiliser la logique de _generate_signals pour obtenir le signal de base et SL/TP
+        # Convertir current_position en bool et direction pour _generate_signals
+        is_pos_open = current_position != 0
+        pos_direction = current_position # 1 pour long, -1 pour short, 0 pour none
+        
+        # current_entry_price n'est pas directement pertinent pour décider d'une *nouvelle* entrée,
+        # mais _generate_signals le prend. Pour une nouvelle entrée, on peut passer 0.0
+        # Si on est déjà en position, cette méthode ne devrait pas générer un nouvel ordre d'ENTRÉE.
+        if is_pos_open:
+             logger.debug(f"{self.log_prefix} [Live] Position déjà ouverte. generate_order_request ne génère pas de nouvel ordre d'entrée.")
+             return None # Ne génère pas de NOUVEL ordre d'entrée si déjà en position.
 
-        if pd.isna(atr_value) or atr_value <= 1e-9:
+        # Pour une nouvelle entrée, current_entry_price n'est pas encore défini.
+        # _generate_signals est conçu pour le backtest où on a cette info.
+        # On adapte : on ne s'attend qu'à des signaux d'entrée (1 ou -1) ici.
+        
+        signal, order_type, limit_price, sl_price_raw, tp_price_raw, pos_size_pct = \
+            self._generate_signals(data_with_indicators, False, 0, 0.0)
+
+        if signal not in [1, -1]: # Pas de signal d'entrée
+            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée généré.")
             return None
 
-        sl_atr_mult = float(self.get_param('sl_atr_multiplier'))
-        tp_atr_mult = float(self.get_param('tp_atr_multiplier'))
+        # 3. Déterminer le prix d'entrée théorique
+        latest_row = data_with_indicators.iloc[-1]
+        entry_price_theoretical = latest_row.get('close') # Utiliser le close pour le calcul de quantité
+        if order_type == "LIMIT" and limit_price is not None:
+            entry_price_theoretical = limit_price # Si ordre limite, utiliser ce prix pour calcul de quantité
+        
+        if pd.isna(entry_price_theoretical):
+            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique (close ou limit) est NaN.")
+            return None
 
-        side: Optional[str] = None
-        sl_price_raw: Optional[float] = None
-        tp_price_raw: Optional[float] = None
+        # 4. Calculer la quantité
+        # _calculate_quantity est une méthode de BaseStrategy
+        quantity_base = self._calculate_quantity(
+            entry_price=entry_price_theoretical,
+            available_capital=available_capital,
+            # qty_precision est dans symbol_info ou self.pair_config
+            # symbol_info est le pair_config
+            qty_precision=get_precision_from_filter(symbol_info, 'LOT_SIZE', 'stepSize'),
+            symbol_info=symbol_info,
+            symbol=self.symbol,
+            position_size_pct=pos_size_pct
+        )
 
-        if ma_fast_prev <= ma_slow_prev and ma_fast_curr > ma_slow_curr:
-            side = 'BUY'
-            sl_price_raw = entry_price_theoretical - sl_atr_mult * atr_value
-            tp_price_raw = entry_price_theoretical + tp_atr_mult * atr_value
-        elif ma_fast_prev >= ma_slow_prev and ma_fast_curr < ma_slow_curr:
-            side = 'SELL'
-            sl_price_raw = entry_price_theoretical + sl_atr_mult * atr_value
-            tp_price_raw = entry_price_theoretical - tp_atr_mult * atr_value
+        if quantity_base is None or quantity_base <= 0:
+            logger.warning(f"{self.log_prefix} [Live] Quantité calculée est None ou <= 0 ({quantity_base}).")
+            return None
 
-        if side and sl_price_raw is not None and tp_price_raw is not None:
-            if (side == 'BUY' and (sl_price_raw >= entry_price_theoretical or tp_price_raw <= entry_price_theoretical)) or \
-               (side == 'SELL' and (sl_price_raw <= entry_price_theoretical or tp_price_raw >= entry_price_theoretical)):
-                return None
+        # 5. Formater les paramètres de l'ordre
+        price_precision = get_precision_from_filter(symbol_info, 'PRICE_FILTER', 'tickSize')
+        if price_precision is None:
+            logger.error(f"{self.log_prefix} [Live] Impossible d'obtenir price_precision.")
+            return None
+        
+        entry_price_for_order_str: Optional[str] = None
+        if order_type == "LIMIT" and limit_price is not None:
+            adjusted_limit_price = adjust_precision(limit_price, price_precision)
+            if adjusted_limit_price is None: return None
+            entry_price_for_order_str = f"{adjusted_limit_price:.{price_precision}f}"
+        
+        # _build_entry_params_formatted est une méthode de BaseStrategy
+        entry_order_params = self._build_entry_params_formatted(
+            side="BUY" if signal == 1 else "SELL",
+            quantity_str=f"{quantity_base:.{get_precision_from_filter(symbol_info, 'LOT_SIZE', 'stepSize') or 8}f}", # Utiliser la précision de quantité
+            order_type=order_type, # type: ignore
+            entry_price_str=entry_price_for_order_str
+        )
+        if not entry_order_params:
+            logger.error(f"{self.log_prefix} [Live] Échec de la construction des paramètres d'ordre.")
+            return None
 
-            price_precision = get_precision_from_filter(symbol_info, 'PRICE_FILTER', 'tickSize')
-            qty_precision = get_precision_from_filter(symbol_info, 'LOT_SIZE', 'stepSize')
-            if price_precision is None or qty_precision is None: return None
-
-            quantity = self._calculate_quantity(
-                entry_price=entry_price_theoretical, available_capital=available_capital,
-                qty_precision=qty_precision, symbol_info=symbol_info, symbol=symbol
-            )
-            if quantity is None or quantity <= 1e-9: return None
-
-            entry_price_for_order_request = adjust_precision(entry_price_theoretical, price_precision, round)
-            if entry_price_for_order_request is None: return None
-
-            entry_price_str = f"{entry_price_for_order_request:.{price_precision}f}"
-            quantity_str = f"{quantity:.{qty_precision}f}"
-            
-            order_type_pref = self.get_param('order_type_preference', "LIMIT")
-            entry_order_params = self._build_entry_params_formatted(
-                symbol=symbol, side=side, quantity_str=quantity_str,
-                entry_price_str=entry_price_str if order_type_pref == "LIMIT" else None,
-                order_type=order_type_pref
-            )
-            if not entry_order_params: return None
-            sl_tp_raw_prices = {'sl_price': sl_price_raw, 'tp_price': tp_price_raw}
-            return entry_order_params, sl_tp_raw_prices
-        return None
+        sl_tp_prices_for_live = {}
+        if sl_price_raw is not None: sl_tp_prices_for_live['sl_price'] = sl_price_raw
+        if tp_price_raw is not None: sl_tp_prices_for_live['tp_price'] = tp_price_raw
+        
+        logger.info(f"{self.log_prefix} [Live] Requête d'ordre générée: {entry_order_params}, SL/TP bruts: {sl_tp_prices_for_live}")
+        return entry_order_params, sl_tp_prices_for_live

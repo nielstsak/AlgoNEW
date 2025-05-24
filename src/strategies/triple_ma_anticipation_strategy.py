@@ -6,8 +6,9 @@ from typing import Dict, Any, Optional, Tuple
 
 from src.strategies.base import BaseStrategy
 from src.utils.exchange_utils import (adjust_precision,
-                                      get_precision_from_filter)
-from src.data import data_utils # Pour get_kline_prefix_effective
+                                      get_precision_from_filter,
+                                      get_filter_value) # Ajouté
+# from src.data import data_utils # Importé localement si besoin
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,15 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         'atr_period_sl_tp', 'atr_base_frequency_sl_tp',
         'sl_atr_mult', 'tp_atr_mult',
         'allow_shorting', 'order_type_preference',
-        'anticipate_crossovers', 
+        'anticipate_crossovers',
+        'capital_allocation_pct' # Ajouté
+        # 'anticipation_slope_period', # Conditionnellement requis
+        # 'anticipation_convergence_threshold_pct' # Conditionnellement requis
     ]
 
-    def __init__(self, params: dict):
-        super().__init__(params)
-        self.log_prefix = f"[{self.__class__.__name__}]"
+    def __init__(self, strategy_name: str, symbol: str, params: Dict[str, Any]):
+        super().__init__(strategy_name, symbol, params)
+        self.log_prefix = f"[{self.strategy_name}][{self.symbol}]"
         
         self.ma_short_col_strat = "MA_SHORT_strat"
         self.ma_medium_col_strat = "MA_MEDIUM_strat"
@@ -33,46 +37,44 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         self.atr_col_strat = "ATR_strat"
 
         self.allow_shorting = bool(self.get_param('allow_shorting', False))
-        self.order_type_preference = self.get_param('order_type_preference', "MARKET")
-
+        # order_type_preference est déjà dans REQUIRED_PARAMS et géré par get_param
         self.anticipate_crossovers = bool(self.get_param('anticipate_crossovers', False))
+
         if self.anticipate_crossovers:
             self.slope_ma_short_col_strat = "SLOPE_MA_SHORT_strat"
             self.slope_ma_medium_col_strat = "SLOPE_MA_MEDIUM_strat"
-            self.anticipation_slope_period = int(self.get_param('anticipation_slope_period', 3))
-            if self.anticipation_slope_period < 2:
-                logger.warning(f"{self.log_prefix} anticipation_slope_period ({self.anticipation_slope_period}) < 2. Forcé à 2.")
-                self.anticipation_slope_period = 2
-            self.anticipation_convergence_threshold_pct = float(self.get_param('anticipation_convergence_threshold_pct', 0.005))
-            if 'anticipation_slope_period' not in self.params or self.get_param('anticipation_slope_period') is None:
-                 raise ValueError("Missing 'anticipation_slope_period' required when 'anticipate_crossovers' is true.")
-            if 'anticipation_convergence_threshold_pct' not in self.params or self.get_param('anticipation_convergence_threshold_pct') is None:
-                 raise ValueError("Missing 'anticipation_convergence_threshold_pct' required when 'anticipate_crossovers' is true.")
+            # La validation de ces paramètres se fait dans _validate_params
+            self.anticipation_slope_period = int(self.get_param('anticipation_slope_period', 3)) # Default si non fourni
+            self.anticipation_convergence_threshold_pct = float(self.get_param('anticipation_convergence_threshold_pct', 0.005)) # Default
         else:
-            self.slope_ma_short_col_strat = None # Explicitly set to None
-            self.slope_ma_medium_col_strat = None # Explicitly set to None
+            self.slope_ma_short_col_strat = None
+            self.slope_ma_medium_col_strat = None
+            self.anticipation_slope_period = 0 
+            self.anticipation_convergence_threshold_pct = 0.0
 
-        self._signals: Optional[pd.DataFrame] = None
-        logger.info(f"{self.log_prefix} Stratégie initialisée. Anticipation: {self.anticipate_crossovers}. Paramètres: {self.params}")
+        logger.info(f"{self.log_prefix} Stratégie initialisée. Anticipation: {self.anticipate_crossovers}. Params: {self.params}")
 
-    def _calculate_slope(self, series: pd.Series, window: int) -> pd.Series:
-        if not isinstance(series, pd.Series) or series.empty or series.isnull().all() or len(series) < window or window < 2:
-            return pd.Series([np.nan] * len(series), index=series.index, name=f"{series.name}_slope{window}" if series.name else f"slope{window}")
+    def _validate_params(self):
+        # Construire la liste des paramètres requis dynamiquement
+        current_required_params = self.REQUIRED_PARAMS[:] # Copie
+        if self.anticipate_crossovers:
+            if 'anticipation_slope_period' not in current_required_params:
+                 current_required_params.append('anticipation_slope_period')
+            if 'anticipation_convergence_threshold_pct' not in current_required_params:
+                 current_required_params.append('anticipation_convergence_threshold_pct')
         
-        def get_slope_value(y_values_window):
-            y_clean = y_values_window.dropna()
-            if len(y_clean) < 2: 
-                return np.nan
-            x_clean = np.arange(len(y_clean))
-            try:
-                slope = np.polyfit(x_clean, y_clean, 1)[0]
-                return slope
-            except (np.linalg.LinAlgError, TypeError, ValueError):
-                return np.nan
-
-        slopes = series.rolling(window=window, min_periods=window).apply(get_slope_value, raw=False)
-        return slopes.rename(f"{series.name}_slope{window}" if series.name else f"slope{window}")
-
+        missing_params = [p for p in current_required_params if self.get_param(p) is None]
+        if missing_params:
+            raise ValueError(f"{self.log_prefix} Missing required parameters: {', '.join(missing_params)}")
+        
+        if self.anticipate_crossovers:
+            slope_period = self.get_param('anticipation_slope_period')
+            if not isinstance(slope_period, int) or slope_period < 2:
+                 raise ValueError(f"{self.log_prefix} anticipation_slope_period ({slope_period}) must be an integer >= 2 when anticipate_crossovers is true.")
+        
+        if not (0 < self.get_param('capital_allocation_pct') <= 1):
+            raise ValueError(f"{self.log_prefix} capital_allocation_pct must be > 0 and <= 1.")
+        logger.debug(f"{self.log_prefix} Parameters validated successfully.")
 
     def _calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         df = data.copy()
@@ -82,195 +84,199 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         ]
         for col_name in expected_base_strat_cols:
             if col_name not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne indicateur de base attendue '{col_name}' manquante. Ajoutée avec NaN.")
+                logger.error(f"{self.log_prefix} Colonne indicateur de base attendue '{col_name}' manquante.")
                 df[col_name] = np.nan
 
         if self.anticipate_crossovers:
-            # Ensure slope columns are initialized if they are supposed to be used
             if self.slope_ma_short_col_strat and self.slope_ma_short_col_strat not in df.columns:
-                logger.info(f"{self.log_prefix} Colonne '{self.slope_ma_short_col_strat}' non fournie. Tentative de calcul à partir de '{self.ma_short_col_strat}'.")
-                if self.ma_short_col_strat in df and df[self.ma_short_col_strat].notna().any():
-                    df[self.slope_ma_short_col_strat] = self._calculate_slope(df[self.ma_short_col_strat], self.anticipation_slope_period)
-                else:
-                    df[self.slope_ma_short_col_strat] = np.nan # Ensure column exists
-            
+                logger.error(f"{self.log_prefix} Colonne pente '{self.slope_ma_short_col_strat}' manquante pour anticipation.")
+                df[self.slope_ma_short_col_strat] = np.nan
             if self.slope_ma_medium_col_strat and self.slope_ma_medium_col_strat not in df.columns:
-                logger.info(f"{self.log_prefix} Colonne '{self.slope_ma_medium_col_strat}' non fournie. Tentative de calcul à partir de '{self.ma_medium_col_strat}'.")
-                if self.ma_medium_col_strat in df and df[self.ma_medium_col_strat].notna().any():
-                     df[self.slope_ma_medium_col_strat] = self._calculate_slope(df[self.ma_medium_col_strat], self.anticipation_slope_period)
-                else:
-                    df[self.slope_ma_medium_col_strat] = np.nan # Ensure column exists
+                logger.error(f"{self.log_prefix} Colonne pente '{self.slope_ma_medium_col_strat}' manquante pour anticipation.")
+                df[self.slope_ma_medium_col_strat] = np.nan
         
-        required_ohlc = ['open', 'high', 'low', 'close']
+        required_ohlc = ['open', 'high', 'low', 'close', 'volume']
         for col in required_ohlc:
             if col not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne OHLC de base '{col}' manquante. Ajoutée avec NaN.")
+                logger.error(f"{self.log_prefix} Colonne OHLCV de base '{col}' manquante.")
                 df[col] = np.nan
         return df
 
-    def generate_signals(self, data: pd.DataFrame) -> None:
-        df_with_indicators = self._calculate_indicators(data)
+    def _generate_signals(self,
+                          data_with_indicators: pd.DataFrame,
+                          current_position_open: bool,
+                          current_position_direction: int,
+                          current_entry_price: float
+                         ) -> Tuple[int, Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
 
-        required_cols_for_signal = [
-            self.ma_short_col_strat, self.ma_medium_col_strat, self.ma_long_col_strat,
-            self.atr_col_strat, 'close'
-        ]
-        # Add slope columns to required if anticipation is on and columns are defined
+        if len(data_with_indicators) < 2:
+            return 0, self.get_param("order_type_preference", "MARKET"), None, None, None, self.get_param('capital_allocation_pct', 1.0)
+
+        df = data_with_indicators
+        latest_row = df.iloc[-1]
+        previous_row = df.iloc[-2]
+
+        ma_short = latest_row.get(self.ma_short_col_strat)
+        ma_medium = latest_row.get(self.ma_medium_col_strat)
+        ma_long = latest_row.get(self.ma_long_col_strat)
+        atr_val = latest_row.get(self.atr_col_strat)
+        close_price = latest_row.get('close')
+
+        ma_short_prev = previous_row.get(self.ma_short_col_strat)
+        ma_medium_prev = previous_row.get(self.ma_medium_col_strat)
+
+        signal = 0
+        sl_price = None
+        tp_price = None
+        
+        essential_values = [ma_short, ma_medium, ma_long, atr_val, close_price, ma_short_prev, ma_medium_prev]
+        slope_short_val = np.nan
+        slope_medium_val = np.nan
+
         if self.anticipate_crossovers:
-            if self.slope_ma_short_col_strat: required_cols_for_signal.append(self.slope_ma_short_col_strat)
-            if self.slope_ma_medium_col_strat: required_cols_for_signal.append(self.slope_ma_medium_col_strat)
+            slope_short_val = latest_row.get(self.slope_ma_short_col_strat)
+            slope_medium_val = latest_row.get(self.slope_ma_medium_col_strat)
+            essential_values.extend([slope_short_val, slope_medium_val])
 
+        if any(pd.isna(val) for val in essential_values):
+            logger.debug(f"{self.log_prefix} Valeurs NaN dans les indicateurs/prix à {df.index[-1]}. Signal Hold.")
+            return 0, self.get_param("order_type_preference", "MARKET"), None, None, None, self.get_param('capital_allocation_pct', 1.0)
 
-        if df_with_indicators.empty or \
-           any(col not in df_with_indicators.columns for col in required_cols_for_signal) or \
-           df_with_indicators[[self.ma_short_col_strat, self.ma_medium_col_strat, self.atr_col_strat, 'close']].isnull().all().all() or \
-           len(df_with_indicators) < 2:
-            logger.warning(f"{self.log_prefix} Données/colonnes insuffisantes pour générer les signaux. Signaux vides générés.")
-            self._signals = pd.DataFrame(index=data.index, columns=['entry_long', 'exit_long', 'entry_short', 'exit_short', 'sl', 'tp'])
-            self._signals[['sl', 'tp']] = np.nan
-            self._signals[self._signals.select_dtypes(include=['object', 'bool']).columns] = False
-            return
-
-        df = df_with_indicators
         sl_atr_mult = float(self.get_param('sl_atr_mult'))
         tp_atr_mult = float(self.get_param('tp_atr_mult'))
 
-        ma_short = df[self.ma_short_col_strat]
-        ma_medium = df[self.ma_medium_col_strat]
-        ma_long = df[self.ma_long_col_strat]
-        atr_val = df[self.atr_col_strat]
-        close_price = df['close']
-
-        actual_long_entry_cross = (ma_short > ma_medium) & (ma_short.shift(1) <= ma_medium.shift(1))
-        actual_long_exit_cross = (ma_short < ma_medium) & (ma_short.shift(1) >= ma_medium.shift(1))
-        actual_short_entry_cross = pd.Series(False, index=df.index)
-        actual_short_exit_cross = pd.Series(False, index=df.index)
+        actual_long_entry_cross = (ma_short > ma_medium) and (ma_short_prev <= ma_medium_prev)
+        actual_long_exit_cross = (ma_short < ma_medium) and (ma_short_prev >= ma_medium_prev)
+        actual_short_entry_cross = False
+        actual_short_exit_cross = False
         if self.allow_shorting:
-            actual_short_entry_cross = (ma_short < ma_medium) & (ma_short.shift(1) >= ma_medium.shift(1))
-            actual_short_exit_cross = (ma_short > ma_medium) & (ma_short.shift(1) <= ma_medium.shift(1))
+            actual_short_entry_cross = (ma_short < ma_medium) and (ma_short_prev >= ma_medium_prev)
+            actual_short_exit_cross = (ma_short > ma_medium) and (ma_short_prev <= ma_medium_prev)
 
-        anticipated_long_entry = pd.Series(False, index=df.index)
-        anticipated_long_exit = pd.Series(False, index=df.index)
-        anticipated_short_entry = pd.Series(False, index=df.index)
-        anticipated_short_exit = pd.Series(False, index=df.index)
+        anticipated_long_entry = False
+        anticipated_long_exit = False
+        anticipated_short_entry = False
+        anticipated_short_exit = False
 
-        if self.anticipate_crossovers and self.slope_ma_short_col_strat and self.slope_ma_medium_col_strat and \
-           self.slope_ma_short_col_strat in df and self.slope_ma_medium_col_strat in df and \
-           df[self.slope_ma_short_col_strat].notna().any() and df[self.slope_ma_medium_col_strat].notna().any():
-            
-            slope_short = df[self.slope_ma_short_col_strat]
-            slope_medium = df[self.slope_ma_medium_col_strat]
-            convergence_distance = ma_medium * self.anticipation_convergence_threshold_pct
-            ma_diff_abs = abs(ma_short - ma_medium)
+        if self.anticipate_crossovers and pd.notna(slope_short_val) and pd.notna(slope_medium_val):
+            convergence_distance = ma_medium * self.anticipation_convergence_threshold_pct # type: ignore
+            ma_diff_abs = abs(ma_short - ma_medium) # type: ignore
 
-            is_converging_up = slope_short > slope_medium
-            is_below_and_closing_for_long = (ma_short < ma_medium) & (ma_diff_abs < convergence_distance)
+            is_converging_up = slope_short_val > slope_medium_val
+            is_below_and_closing_for_long = (ma_short < ma_medium) and (ma_diff_abs < convergence_distance)
             main_trend_bullish = ma_medium > ma_long
-            anticipated_long_entry = is_converging_up & is_below_and_closing_for_long & main_trend_bullish
+            anticipated_long_entry = is_converging_up and is_below_and_closing_for_long and main_trend_bullish
 
-            is_converging_down_for_exit_long = slope_short < slope_medium
-            is_above_and_closing_for_long_exit = (ma_short > ma_medium) & (ma_diff_abs < convergence_distance)
-            anticipated_long_exit = is_converging_down_for_exit_long & is_above_and_closing_for_long_exit
+            is_converging_down_for_exit_long = slope_short_val < slope_medium_val
+            is_above_and_closing_for_long_exit = (ma_short > ma_medium) and (ma_diff_abs < convergence_distance)
+            anticipated_long_exit = is_converging_down_for_exit_long and is_above_and_closing_for_long_exit
 
             if self.allow_shorting:
-                is_converging_down_for_entry_short = slope_short < slope_medium
-                is_above_and_closing_for_short_entry = (ma_short > ma_medium) & (ma_diff_abs < convergence_distance)
+                is_converging_down_for_entry_short = slope_short_val < slope_medium_val
+                is_above_and_closing_for_short_entry = (ma_short > ma_medium) and (ma_diff_abs < convergence_distance)
                 main_trend_bearish = ma_medium < ma_long
-                anticipated_short_entry = is_converging_down_for_entry_short & is_above_and_closing_for_short_entry & main_trend_bearish
+                anticipated_short_entry = is_converging_down_for_entry_short and is_above_and_closing_for_short_entry and main_trend_bearish
                 
-                is_converging_up_for_exit_short = slope_short > slope_medium
-                is_below_and_closing_for_short_exit = (ma_short < ma_medium) & (ma_diff_abs < convergence_distance)
-                anticipated_short_exit = is_converging_up_for_exit_short & is_below_and_closing_for_short_exit
+                is_converging_up_for_exit_short = slope_short_val > slope_medium_val
+                is_below_and_closing_for_short_exit = (ma_short < ma_medium) and (ma_diff_abs < convergence_distance)
+                anticipated_short_exit = is_converging_up_for_exit_short and is_below_and_closing_for_short_exit
         
-        signals_df = pd.DataFrame(index=df.index)
-        signals_df['entry_long'] = actual_long_entry_cross | anticipated_long_entry
-        signals_df['exit_long'] = actual_long_exit_cross | anticipated_long_exit
-        signals_df['entry_short'] = actual_short_entry_cross | anticipated_short_entry
-        signals_df['exit_short'] = actual_short_exit_cross | anticipated_short_exit
+        final_entry_long = actual_long_entry_cross or anticipated_long_entry
+        final_exit_long = actual_long_exit_cross or anticipated_long_exit
+        final_entry_short = actual_short_entry_cross or anticipated_short_entry
+        final_exit_short = actual_short_exit_cross or anticipated_short_exit
+
+        if not current_position_open:
+            if final_entry_long:
+                signal = 1
+                if pd.notna(atr_val) and atr_val > 0:
+                    sl_price = close_price - (atr_val * sl_atr_mult)
+                    tp_price = close_price + (atr_val * tp_atr_mult)
+            elif final_entry_short: 
+                signal = -1
+                if pd.notna(atr_val) and atr_val > 0:
+                    sl_price = close_price + (atr_val * sl_atr_mult)
+                    tp_price = close_price - (atr_val * tp_atr_mult)
+        else: 
+            if current_position_direction == 1 and final_exit_long:
+                signal = 2 
+            elif current_position_direction == -1 and final_exit_short:
+                signal = 2
         
-        signals_df['sl'] = np.nan
-        signals_df['tp'] = np.nan
-        valid_sltp_data = atr_val.notna() & close_price.notna()
+        order_type = self.get_param("order_type_preference", "MARKET")
+        limit_price = None
+        if signal != 0 and order_type == "LIMIT" and pd.notna(close_price):
+            limit_price = close_price 
 
-        signals_df.loc[signals_df['entry_long'] & valid_sltp_data, 'sl'] = close_price - (atr_val * sl_atr_mult)
-        signals_df.loc[signals_df['entry_long'] & valid_sltp_data, 'tp'] = close_price + (atr_val * tp_atr_mult)
-        if self.allow_shorting:
-            signals_df.loc[signals_df['entry_short'] & valid_sltp_data, 'sl'] = close_price + (atr_val * sl_atr_mult)
-            signals_df.loc[signals_df['entry_short'] & valid_sltp_data, 'tp'] = close_price - (atr_val * tp_atr_mult)
+        position_size_pct = self.get_param('capital_allocation_pct', 1.0)
 
-        self._signals = signals_df[['entry_long', 'exit_long', 'entry_short', 'exit_short', 'sl', 'tp']].reindex(data.index)
+        return signal, order_type, limit_price, sl_price, tp_price, position_size_pct
 
     def generate_order_request(self,
                                data: pd.DataFrame,
-                               symbol: str,
                                current_position: int,
                                available_capital: float,
                                symbol_info: dict
                                ) -> Optional[Tuple[Dict[str, Any], Dict[str, float]]]:
+        
+        data_with_indicators = self._calculate_indicators(data)
+        if data_with_indicators.empty or len(data_with_indicators) < 2:
+            logger.warning(f"{self.log_prefix} [Live] Pas assez de données pour generate_order_request.")
+            return None
+
         if current_position != 0:
-            return None
-        if data.empty or len(data) < 2:
-            logger.warning(f"{self.log_prefix} Données d'entrée vides ou insuffisantes pour generate_order_request.")
+             logger.debug(f"{self.log_prefix} [Live] Position déjà ouverte. generate_order_request ne génère pas de nouvel ordre d'entrée.")
+             return None
+
+        signal, order_type, limit_price, sl_price_raw, tp_price_raw, pos_size_pct = \
+            self._generate_signals(data_with_indicators, False, 0, 0.0)
+
+        if signal not in [1, -1]:
+            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée généré.")
             return None
 
-        df_verified_indicators = self._calculate_indicators(data.copy())
-        latest_signal_info = self.get_signals()
-        if latest_signal_info is None or latest_signal_info.empty:
-            logger.warning(f"{self.log_prefix} Aucun signal disponible via get_signals(). Pas de requête d'ordre.")
-            return None
+        latest_row = data_with_indicators.iloc[-1]
+        entry_price_theoretical = latest_row.get('close')
+        if order_type == "LIMIT" and limit_price is not None:
+            entry_price_theoretical = limit_price
         
-        latest_signals = latest_signal_info.iloc[-1]
-        latest_data_row = df_verified_indicators.iloc[-1]
-
-        entry_price_theoretical = latest_data_row['open']
-        atr_value_for_sltp = latest_data_row.get(self.atr_col_strat)
-
-        if pd.isna(entry_price_theoretical) or pd.isna(atr_value_for_sltp) or atr_value_for_sltp <= 1e-9:
+        if pd.isna(entry_price_theoretical):
+            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique est NaN.")
             return None
 
-        sl_atr_mult = float(self.get_param('sl_atr_mult'))
-        tp_atr_mult = float(self.get_param('tp_atr_mult'))
+        quantity_base = self._calculate_quantity(
+            entry_price=entry_price_theoretical,
+            available_capital=available_capital,
+            qty_precision=get_precision_from_filter(symbol_info, 'LOT_SIZE', 'stepSize'),
+            symbol_info=symbol_info,
+            symbol=self.symbol,
+            position_size_pct=pos_size_pct
+        )
+
+        if quantity_base is None or quantity_base <= 0:
+            logger.warning(f"{self.log_prefix} [Live] Quantité calculée est None ou <= 0 ({quantity_base}).")
+            return None
+
+        price_precision = get_precision_from_filter(symbol_info, 'PRICE_FILTER', 'tickSize')
+        if price_precision is None: return None
         
-        side: Optional[str] = None
-        sl_price_raw: Optional[float] = None
-        tp_price_raw: Optional[float] = None
+        entry_price_for_order_str: Optional[str] = None
+        if order_type == "LIMIT" and limit_price is not None:
+            adjusted_limit_price = adjust_precision(limit_price, price_precision)
+            if adjusted_limit_price is None: return None
+            entry_price_for_order_str = f"{adjusted_limit_price:.{price_precision}f}"
+        
+        entry_order_params = self._build_entry_params_formatted(
+            side="BUY" if signal == 1 else "SELL",
+            quantity_str=f"{quantity_base:.{get_precision_from_filter(symbol_info, 'LOT_SIZE', 'stepSize') or 8}f}",
+            order_type=order_type, # type: ignore
+            entry_price_str=entry_price_for_order_str
+        )
+        if not entry_order_params: return None
 
-        if latest_signals.get('entry_long', False):
-            side = 'BUY'
-            sl_price_raw = entry_price_theoretical - (atr_value_for_sltp * sl_atr_mult)
-            tp_price_raw = entry_price_theoretical + (atr_value_for_sltp * tp_atr_mult)
-        elif self.allow_shorting and latest_signals.get('entry_short', False):
-            side = 'SELL'
-            sl_price_raw = entry_price_theoretical + (atr_value_for_sltp * sl_atr_mult)
-            tp_price_raw = entry_price_theoretical - (atr_value_for_sltp * tp_atr_mult)
-
-        if side and sl_price_raw is not None and tp_price_raw is not None:
-            if (side == 'BUY' and (sl_price_raw >= entry_price_theoretical or tp_price_raw <= entry_price_theoretical)) or \
-               (side == 'SELL' and (sl_price_raw <= entry_price_theoretical or tp_price_raw >= entry_price_theoretical)):
-                return None
-
-            price_precision = get_precision_from_filter(symbol_info, 'PRICE_FILTER', 'tickSize')
-            qty_precision = get_precision_from_filter(symbol_info, 'LOT_SIZE', 'stepSize')
-            if price_precision is None or qty_precision is None: return None
-
-            quantity = self._calculate_quantity(
-                entry_price=entry_price_theoretical, available_capital=available_capital,
-                qty_precision=qty_precision, symbol_info=symbol_info, symbol=symbol
-            )
-            if quantity is None or quantity <= 1e-9: return None
-
-            entry_price_for_order_request = adjust_precision(entry_price_theoretical, price_precision, round)
-            if entry_price_for_order_request is None: return None
-
-            entry_price_str = f"{entry_price_for_order_request:.{price_precision}f}"
-            quantity_str = f"{quantity:.{qty_precision}f}"
-            
-            entry_order_params = self._build_entry_params_formatted(
-                symbol=symbol, side=side, quantity_str=quantity_str,
-                entry_price_str=entry_price_str if self.order_type_preference == "LIMIT" else None,
-                order_type=self.order_type_preference
-            )
-            if not entry_order_params: return None
-            sl_tp_raw_prices = {'sl_price': sl_price_raw, 'tp_price': tp_price_raw}
-            return entry_order_params, sl_tp_raw_prices
-        return None
+        sl_tp_prices_for_live = {}
+        if sl_price_raw is not None: sl_tp_prices_for_live['sl_price'] = sl_price_raw
+        if tp_price_raw is not None: sl_tp_prices_for_live['tp_price'] = tp_price_raw
+        
+        logger.info(f"{self.log_prefix} [Live] Requête d'ordre générée: {entry_order_params}, SL/TP bruts: {sl_tp_prices_for_live}")
+        return entry_order_params, sl_tp_prices_for_live

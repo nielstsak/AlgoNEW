@@ -38,11 +38,11 @@ class SimulationDefaults:
     These are used by the new BacktestSimulator.
     """
     initial_capital: float
-    margin_leverage: int 
+    margin_leverage: int
     # transaction_fee_pct: float # Replaced by trading_fee_bps
     # slippage_pct: float # Replaced by slippage_config dictionary
     trading_fee_bps: float # Trading fee in basis points (e.g., 7 for 0.07%)
-    
+
     # Slippage configuration moved to a nested structure for more detail
     slippage_method: str = "percentage" # e.g., "percentage", "volume_based"
     slippage_percentage_max_bps: Optional[float] = None # Max slippage in BPS for percentage method
@@ -132,7 +132,7 @@ class OptunaSettings:
     pareto_selection_weights: Optional[Dict[str, float]] = None
     pareto_selection_pnl_threshold: Optional[float] = None
     # n_best_for_oos: int = 10 # Moved to WfoSettings as top_n_trials_for_oos_validation
-    
+
     default_profile_to_activate: Optional[str] = None
     sampler_pruner_profiles: Optional[Dict[str, Dict[str, Any]]] = field(default_factory=dict)
 
@@ -195,9 +195,9 @@ class HistoricalPeriod:
             pd_start_date = pd.to_datetime(self.start_date, errors='raise')
             if self.end_date:
                 pd_end_date = pd.to_datetime(self.end_date, errors='raise')
-                if pd_start_date > pd_end_date: 
+                if pd_start_date > pd_end_date:
                     raise ValueError(f"HistoricalPeriod: start_date ({self.start_date}) cannot be after end_date ({self.end_date}).")
-        except Exception as e: 
+        except Exception as e:
              raise ValueError(f"HistoricalPeriod: start_date '{self.start_date}' and/or end_date '{self.end_date}' are not valid date strings. Error: {e}")
 
 
@@ -275,12 +275,12 @@ class ParamDetail:
                 if self.step is not None and not isinstance(self.step, int):
                      if isinstance(self.step, float) and self.step.is_integer(): self.step = int(self.step)
                      else: raise ValueError(f"ParamDetail: 'step' ({self.step}) must be an integer for 'int' type parameters.")
-        if self.type == "float" and self.log_scale and self.low <= 0:
+        if self.type == "float" and self.log_scale and self.low <= 0: # type: ignore
             raise ValueError("ParamDetail: 'low' must be > 0 for float parameters with log_scale=True.")
 
 
 @dataclass
-class StrategyParams: # Renamed from StrategyParams to avoid confusion with strategy instance params
+class StrategyParamsConfig: # MODIFIED HERE (was StrategyParams)
     """
     Configuration for a specific trading strategy, including its parameter space for optimization
     and default parameters.
@@ -297,7 +297,7 @@ class StrategiesConfig:
     Container for configurations of multiple trading strategies.
     The keys are strategy names (e.g., "MACross1").
     """
-    strategies: Dict[str, StrategyParams]
+    strategies: Dict[str, StrategyParamsConfig] # MODIFIED HERE to use StrategyParamsConfig
 
 
 @dataclass
@@ -458,7 +458,7 @@ class AppConfig:
             aliases = [acc.account_alias for acc in self.accounts_config]
             if len(aliases) != len(set(aliases)):
                 raise ValueError("AppConfig: account_alias in accounts_config must be unique.")
-        
+
         # Example: Set project_root dynamically if not provided
         if self.project_root is None:
             try:
@@ -473,4 +473,3 @@ class AppConfig:
                 pass # Requires more context to set robustly
             except Exception:
                 pass # Silently ignore if cannot determine, or log a warning
-
