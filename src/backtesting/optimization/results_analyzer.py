@@ -10,7 +10,7 @@ from src.config.definitions import GlobalConfig, StrategyParamsConfig, ExchangeS
 from src.utils import file_utils 
 from src.strategies.base import BaseStrategy
 from src.backtesting.simulator import BacktestSimulator
-from src.backtesting.performance import calculate_performance_metrics_from_inputs
+from src.backtesting.performance_analyzer import calculate_performance_metrics_from_inputs
 
 logger = logging.getLogger(__name__)
 

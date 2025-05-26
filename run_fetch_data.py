@@ -1,317 +1,328 @@
+# run_fetch_data.py
+"""
+Ce script orchestre la récupération, le nettoyage initial des données 1-minute,
+l'agrégation en timeframes supérieurs, et le calcul d'indicateurs de base
+(comme les ATRs sur différentes périodes) pour les données historiques.
+"""
 import logging
-import os # Peut être remplacé par pathlib pour la plupart des usages
-import sys # <<< IMPORT AJOUTÉ ICI
+import os 
+import sys
 import time
 from argparse import ArgumentParser
 from pathlib import Path
-import re # Pour convertir les minutes en label de fréquence
-from typing import Optional, List # Assurez-vous que List est aussi importé si utilisé ailleurs
+import re 
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, cast
+from datetime import timedelta 
 
 import pandas as pd
-import numpy as np # Pour la gestion des NaN si besoin
+import numpy as np 
 
-# Imports depuis le projet src
+# --- Configuration initiale du logging (sera surchargée par load_all_configs) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__) 
+
+# --- Ajout de la racine du projet au PYTHONPATH ---
 try:
-    # Ajuster le chemin si src n'est pas directement dans le PYTHONPATH
-    # Cela suppose que le script est lancé depuis la racine du projet ou que src y est.
-    if str(Path.cwd() / 'src') not in sys.path and str(Path(__file__).resolve().parent / 'src') not in sys.path :
-         # Si src n'est pas dans le CWD, et que ce script n'est pas DANS src, on ajoute le parent/src
-         # Cela suppose que ce script est à la racine, et src est un sous-dossier.
-        sys.path.insert(0, str(Path(__file__).resolve().parent)) # Ajouter la racine du projet
-        # print(f"Added to sys.path: {str(Path(__file__).resolve().parent)}")
+    PROJECT_ROOT = Path(__file__).resolve().parent
+except NameError:
+    PROJECT_ROOT = Path(".").resolve()
 
+SRC_PATH = PROJECT_ROOT / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+    logger.debug(f"Ajouté {SRC_PATH} au PYTHONPATH par run_fetch_data.py")
 
-    from src.config.loader import load_all_configs, AppConfig
-    from src.data.acquisition import fetch_all_historical_data # Pour le fetch et nettoyage initial 1-min
-    from src.data import data_utils # Pour l'agrégation et le calcul d'ATR sur les timeframes supérieurs
-    # setup_logging est appelé dans load_all_configs
+# --- Imports des modules de l'application ---
+if TYPE_CHECKING:
+    from src.config.loader import AppConfig
+
+try:
+    from src.config.loader import load_all_configs
+    from src.data.acquisition import fetch_all_historical_data
+    from src.data import data_utils 
 except ImportError as e:
-    # Fallback logger si les imports ci-dessus échouent avant que le logging principal soit configuré
-    logging.basicConfig(level=logging.CRITICAL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logging.critical(f"CRITICAL ERROR: Failed to import necessary modules: {e}. "
-                     f"PYTHONPATH: {sys.path}. CWD: {Path.cwd()}", exc_info=True)
+    logger.critical(f"ÉCHEC CRITIQUE (run_fetch_data.py): Impossible d'importer les modules nécessaires: {e}. "
+                    f"Vérifiez PYTHONPATH et les installations. CWD: {Path.cwd()}, sys.path: {sys.path}", exc_info=True)
+    sys.exit(1)
+except Exception as e_imp: # pylint: disable=broad-except
+    logger.critical(f"ÉCHEC CRITIQUE (run_fetch_data.py): Erreur inattendue lors des imports initiaux: {e_imp}", exc_info=True)
     sys.exit(1)
 
+# --- Définition des constantes utilisées dans ce script ---
+BASE_OHLCV_COLS: List[str] = ['open', 'high', 'low', 'close', 'volume']
 
-logger = logging.getLogger(__name__)
-
-# Configuration pour les périodes ATR (peut être externalisée dans config_data.json à l'avenir)
-ATR_CONFIG = {
+ATR_ENRICHMENT_CONFIG: Dict[str, int] = {
     "atr_low": 10,
-    "atr_high": 21, # Inclusif
-    "atr_step": 1   # Pour générer ATR_10, ATR_11, ..., ATR_21
-    # Alternative: une liste fixe de périodes, ex: [14, 20]
-    # "atr_periods": [14, 20]
+    "atr_high": 21,
+    "atr_step": 1
 }
 
 def _parse_timeframe_string_to_minutes(tf_string: str) -> Optional[int]:
     """
-    Convertit une chaîne de timeframe (ex: "1m", "5min", "1h", "1d") en un nombre total de minutes.
-    Retourne None si le format est inconnu.
+    Convertit une chaîne de timeframe (ex: "1m", "5min", "1h", "1d")
+    en un nombre total de minutes.
+    Retourne None si le format est inconnu ou invalide.
     """
     if not isinstance(tf_string, str) or not tf_string.strip():
         return None
     
     tf_lower = tf_string.lower().strip()
-    match = re.fullmatch(r"(\d+)\s*(m|min|h|d)", tf_lower)
+    match = re.fullmatch(r"(\d+)\s*(s|m|min|h|d|w)", tf_lower)
     if not match:
+        logger.warning(f"_parse_timeframe_string_to_minutes: Format de timeframe non reconnu '{tf_string}'.")
         return None
     
-    value = int(match.group(1))
-    unit = match.group(2)
+    try:
+        value = int(match.group(1))
+        unit = match.group(2)
+        if value <= 0: return None
+    except ValueError:
+        return None
 
-    if unit in ("m", "min"):
+    if unit == "s":
+        if value % 60 == 0: return value // 60
+        logger.debug(f"_parse_timeframe_string_to_minutes: Timeframe en secondes '{tf_string}' non multiple de 60s.")
+        return None
+    elif unit in ("m", "min"):
         return value
     elif unit == "h":
         return value * 60
     elif unit == "d":
-        return value * 60 * 24
+        return value * 24 * 60
+    elif unit == "w":
+        return value * 7 * 24 * 60
     return None
-
-def _get_frequency_label_from_minutes(tf_minutes: int) -> str:
-    """
-    Convertit un nombre de minutes en un label de fréquence string (ex: 5 -> "5min", 60 -> "60min").
-    Utilisé pour le nommage des colonnes.
-    """
-    if tf_minutes < 60:
-        return f"{tf_minutes}min"
-    elif tf_minutes % 60 == 0 and tf_minutes < (24*60) :
-        hours = tf_minutes // 60
-        return f"{hours}h" # Ou f"{tf_minutes}min" pour la cohérence avec get_kline_prefix_effective
-    elif tf_minutes % (24*60) == 0:
-        days = tf_minutes // (24*60)
-        return f"{days}d" # Ou f"{tf_minutes}min"
-    return f"{tf_minutes}min" # Fallback
 
 
 def main():
+    """
+    Point d'entrée principal pour le script de récupération et d'enrichissement
+    des données historiques.
+    """
     script_start_time = time.time()
-    # Le logging est configuré par load_all_configs
 
-    parser = ArgumentParser(description="Fetch, clean, and enrich historical market data.")
+    parser = ArgumentParser(description="Récupère, nettoie et enrichit les données de marché historiques.")
     parser.add_argument(
         "--root",
         type=str,
-        default=None, # Sera déterminé si non fourni
-        help="Specify the project root directory if the script is not run from the project root.",
+        default=None,
+        help="Spécifiez le répertoire racine du projet si le script n'est pas lancé depuis la racine du projet.",
     )
     args = parser.parse_args()
 
-    project_root_arg = args.root
-    if project_root_arg is None:
-        # Si --root n'est pas fourni, on suppose que ce script est à la racine du projet.
-        project_root_arg = str(Path(__file__).resolve().parent)
-        
-    logger.info(f"--- Starting Data Fetch, Clean, and Enrichment Script (Project Root: {project_root_arg}) ---")
+    project_root_arg = args.root if args.root else str(PROJECT_ROOT)
+    project_root_path = Path(project_root_arg).resolve()
 
+    logger.info(f"--- Démarrage du Script de Récupération et Enrichissement des Données (Racine Projet: {project_root_path}) ---")
+
+    app_config: Optional['AppConfig'] = None
     try:
-        config: AppConfig = load_all_configs(project_root=project_root_arg)
-        logger.info("Application configuration loaded successfully.")
-    except Exception as e_conf:
-        logger.critical(f"Failed to load application configuration: {e_conf}", exc_info=True)
+        app_config = load_all_configs(project_root=str(project_root_path))
+        logger.info("Configuration de l'application chargée avec succès.")
+    except Exception as e_conf: # pylint: disable=broad-except
+        logger.critical(f"Échec du chargement de la configuration de l'application : {e_conf}", exc_info=True)
         sys.exit(1)
 
-    # --- Étape 1 : Fetch et Nettoyage des Données 1-Minute ---
-    logger.info("Step 1: Starting historical 1-minute data fetching and initial cleaning...")
+    if not app_config:
+        logger.critical("AppConfig n'a pas pu être chargée (est None). Abandon.")
+        sys.exit(1)
+
+    # --- Étape 1 : Récupération et Nettoyage des Données 1-Minute ---
+    logger.info("=== ÉTAPE 1: Démarrage de la récupération et du nettoyage initial des données historiques 1-minute ===")
+    raw_data_run_dir_path_str: Optional[str] = None
     try:
-        # fetch_all_historical_data sauvegarde les .parquet nettoyés dans paths.data_historical_processed_cleaned
-        # et retourne le chemin du répertoire de run pour les CSV "bruts-nettoyés".
-        raw_data_run_dir_str = fetch_all_historical_data(config) # type: ignore
+        raw_data_run_dir_path_str = fetch_all_historical_data(app_config)
         
-        if not raw_data_run_dir_str or not Path(raw_data_run_dir_str).is_dir():
-            logger.error("Historical data fetching and cleaning did not return a valid raw data directory path. Aborting enrichment.")
-            return
+        if not raw_data_run_dir_path_str or not Path(raw_data_run_dir_path_str).is_dir():
+            logger.error("La récupération des données historiques n'a pas retourné un chemin de répertoire valide pour les données brutes. "
+                         "L'enrichissement ne peut pas continuer.")
+            sys.exit(1)
         
-        cleaned_1min_data_dir = Path(config.global_config.paths.data_historical_processed_cleaned)
-        logger.info(f"Historical 1-minute data fetching and cleaning complete.")
-        logger.info(f"Run-specific raw (cleaned) CSVs saved in: {raw_data_run_dir_str}")
-        logger.info(f"Cleaned 1-minute Parquet files available in: {cleaned_1min_data_dir}")
+        cleaned_1min_data_dir = Path(app_config.project_root) / app_config.global_config.paths.data_historical_processed_cleaned # type: ignore
+        logger.info("Récupération et nettoyage initial des données historiques 1-minute terminés.")
+        logger.info(f"  CSVs bruts (nettoyés) spécifiques à ce run sauvegardés dans : {raw_data_run_dir_path_str}")
+        logger.info(f"  Fichiers Parquet 1-minute nettoyés disponibles dans : {cleaned_1min_data_dir}")
 
-    except Exception as fetch_exc:
-        logger.error("An error occurred during historical data fetching and cleaning.", exc_info=True)
-        logger.error("Aborting script due to fetching/cleaning error.")
-        return
+    except Exception as e_fetch: # pylint: disable=broad-except
+        logger.error("Une erreur s'est produite lors de la récupération et du nettoyage des données historiques 1-minute.", exc_info=True)
+        logger.error("Abandon du script en raison d'une erreur lors de l'étape de récupération/nettoyage.")
+        sys.exit(1)
 
-    # --- Étape 2 : Enrichissement des Données (Agrégation et Calcul d'Indicateurs de Base) ---
-    logger.info("Step 2: Starting data enrichment process (aggregation and base indicator calculation)...")
+    # --- Étape 2 : Enrichissement des Données (Agrégation et Indicateurs de Base) ---
+    logger.info("=== ÉTAPE 2: Démarrage du processus d'enrichissement des données (agrégation et calcul d'indicateurs de base) ===")
     
-    enriched_data_dir = Path(config.global_config.paths.data_historical_processed_enriched)
+    enriched_data_output_dir = Path(app_config.project_root) / app_config.global_config.paths.data_historical_processed_enriched # type: ignore
     try:
-        enriched_data_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Enriched data will be saved to: {enriched_data_dir}")
-    except OSError as e_mkdir:
-        logger.error(f"Failed to create enriched data directory {enriched_data_dir}: {e_mkdir}. Aborting.")
-        return
+        enriched_data_output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Les données enrichies seront sauvegardées dans : {enriched_data_output_dir}")
+    except OSError as e_mkdir_enriched:
+        logger.error(f"Échec de la création du répertoire des données enrichies {enriched_data_output_dir}: {e_mkdir_enriched}. Abandon.")
+        sys.exit(1)
 
-    pairs_to_process = config.data_config.assets_and_timeframes.pairs
-    timeframes_config_strings = config.data_config.assets_and_timeframes.timeframes
+    pairs_to_process: List[str] = app_config.data_config.assets_and_timeframes.pairs
+    config_timeframes_str: List[str] = app_config.data_config.assets_and_timeframes.timeframes
     
-    timeframes_to_aggregate_minutes: List[int] = []
-    for tf_str in timeframes_config_strings:
-        minutes = _parse_timeframe_string_to_minutes(tf_str)
-        if minutes is not None and minutes > 1: # On n'agrège pas le 1-min sur lui-même
-            if minutes not in timeframes_to_aggregate_minutes: # Eviter les doublons
-                 timeframes_to_aggregate_minutes.append(minutes)
+    timeframes_for_aggregation_minutes: List[int] = []
+    for tf_str_from_config in config_timeframes_str:
+        minutes = _parse_timeframe_string_to_minutes(tf_str_from_config)
+        if minutes is not None and minutes > 1:
+            if minutes not in timeframes_for_aggregation_minutes:
+                 timeframes_for_aggregation_minutes.append(minutes)
         elif minutes == 1:
-            logger.debug(f"Timeframe '1min' or equivalent found in config, will not be aggregated further in this step.")
-        else:
-            logger.warning(f"Could not parse timeframe string '{tf_str}' to minutes. It will be ignored for aggregation.")
+            logger.debug(f"Timeframe '1min' trouvé dans la config, ne sera pas agrégé davantage ici.")
     
-    timeframes_to_aggregate_minutes.sort() # Traiter par ordre croissant de timeframe
-    logger.info(f"Timeframes to aggregate (in minutes): {timeframes_to_aggregate_minutes}")
+    timeframes_for_aggregation_minutes.sort()
+    logger.info(f"Timeframes cibles pour l'agrégation (en minutes) : {timeframes_for_aggregation_minutes}")
 
-    if not timeframes_to_aggregate_minutes:
-        logger.info("No timeframes > 1min configured for aggregation. Enrichment will only consist of base 1-min data.")
+    if not timeframes_for_aggregation_minutes and not ("1min" in config_timeframes_str or "1m" in config_timeframes_str) :
+        logger.info("Aucun timeframe (y compris 1-min pour ATR direct) configuré pour l'enrichissement. "
+                    "L'enrichissement se limitera aux données 1-minute de base.")
 
 
-    for pair_symbol in pairs_to_process:
-        pair_log_prefix = f"[{pair_symbol}]"
-        logger.info(f"{pair_log_prefix} Starting enrichment process...")
+    for pair_symbol_current in pairs_to_process:
+        pair_log_prefix = f"[{pair_symbol_current.upper()}]"
+        logger.info(f"{pair_log_prefix} Démarrage du processus d'enrichissement...")
         
-        cleaned_1min_file = cleaned_1min_data_dir / f"{pair_symbol}_1min_cleaned_with_taker.parquet"
-        if not cleaned_1min_file.is_file(): # Utiliser is_file() pour plus de robustesse
-            logger.warning(f"{pair_log_prefix} Cleaned 1-minute data file not found: {cleaned_1min_file}. Skipping enrichment for this pair.")
+        path_to_cleaned_1min_parquet = cleaned_1min_data_dir / f"{pair_symbol_current.upper()}_1min_cleaned_with_taker.parquet"
+        if not path_to_cleaned_1min_parquet.is_file():
+            logger.warning(f"{pair_log_prefix} Fichier Parquet 1-minute nettoyé non trouvé : {path_to_cleaned_1min_parquet}. "
+                           "Enrichissement sauté pour cette paire.")
             continue
 
         try:
-            df_1min = pd.read_parquet(cleaned_1min_file)
-            logger.debug(f"{pair_log_prefix} Loaded {cleaned_1min_file.name}, shape: {df_1min.shape}")
-        except Exception as e_load_parquet:
-            logger.error(f"{pair_log_prefix} Error loading Parquet file {cleaned_1min_file}: {e_load_parquet}", exc_info=True)
+            df_1min_current_pair = pd.read_parquet(path_to_cleaned_1min_parquet)
+            logger.debug(f"{pair_log_prefix} Chargé {path_to_cleaned_1min_parquet.name}, shape: {df_1min_current_pair.shape}")
+        except Exception as e_load_pq_enrich: # pylint: disable=broad-except
+            logger.error(f"{pair_log_prefix} Erreur lors du chargement du fichier Parquet {path_to_cleaned_1min_parquet} pour enrichissement : {e_load_pq_enrich}", exc_info=True)
             continue
         
-        if df_1min.empty:
-            logger.warning(f"{pair_log_prefix} DataFrame from {cleaned_1min_file.name} is empty. Skipping.")
+        if df_1min_current_pair.empty:
+            logger.warning(f"{pair_log_prefix} DataFrame chargé depuis {path_to_cleaned_1min_parquet.name} est vide. Enrichissement sauté.")
             continue
 
-        if 'timestamp' not in df_1min.columns:
-            logger.error(f"{pair_log_prefix} 'timestamp' column missing in {cleaned_1min_file.name}. Cannot proceed with enrichment.")
+        if 'timestamp' not in df_1min_current_pair.columns:
+            logger.error(f"{pair_log_prefix} Colonne 'timestamp' manquante dans {path_to_cleaned_1min_parquet.name}. Enrichissement impossible.")
             continue
         
         try:
-            df_1min['timestamp'] = pd.to_datetime(df_1min['timestamp'], errors='coerce', utc=True)
-            df_1min.dropna(subset=['timestamp'], inplace=True) # Important si des conversions échouent
-            df_1min = df_1min.set_index('timestamp', drop=False) # Garder 'timestamp' comme colonne aussi
-            if not df_1min.index.is_monotonic_increasing:
-                df_1min = df_1min.sort_index()
-            if not df_1min.index.is_unique:
-                df_1min = df_1min[~df_1min.index.duplicated(keep='first')]
-            logger.debug(f"{pair_log_prefix} Timestamp index prepared. Shape after prep: {df_1min.shape}")
-        except Exception as e_idx_prep:
-            logger.error(f"{pair_log_prefix} Error preparing timestamp index for {cleaned_1min_file.name}: {e_idx_prep}", exc_info=True)
+            df_1min_current_pair['timestamp'] = pd.to_datetime(df_1min_current_pair['timestamp'], errors='coerce', utc=True)
+            df_1min_current_pair.dropna(subset=['timestamp'], inplace=True)
+            # df_1min_current_pair_indexed est utilisé pour le resampling, il a besoin de 'timestamp' comme index
+            df_1min_current_pair_indexed = df_1min_current_pair.set_index('timestamp') # drop=True par défaut
+            if not df_1min_current_pair_indexed.index.is_monotonic_increasing:
+                df_1min_current_pair_indexed = df_1min_current_pair_indexed.sort_index()
+            if not df_1min_current_pair_indexed.index.is_unique:
+                df_1min_current_pair_indexed = df_1min_current_pair_indexed[~df_1min_current_pair_indexed.index.duplicated(keep='first')]
+            logger.debug(f"{pair_log_prefix} Index 'timestamp' préparé pour resampling. Shape : {df_1min_current_pair_indexed.shape}")
+        except Exception as e_idx_prep_enrich: # pylint: disable=broad-except
+            logger.error(f"{pair_log_prefix} Erreur lors de la préparation de l'index 'timestamp' pour {path_to_cleaned_1min_parquet.name}: {e_idx_prep_enrich}", exc_info=True)
             continue
             
-        if df_1min.empty: # Vérifier à nouveau après dropna et déduplication
-            logger.warning(f"{pair_log_prefix} DataFrame became empty after timestamp preparation. Skipping.")
+        if df_1min_current_pair_indexed.empty:
+            logger.warning(f"{pair_log_prefix} DataFrame devenu vide après préparation de l'index 'timestamp'. Enrichissement sauté.")
             continue
 
         # final_df_for_pair commence avec les données 1-min (avec 'timestamp' comme colonne)
-        final_df_for_pair = df_1min.reset_index(drop=True).copy()
-        # S'assurer que les colonnes OHLCV de base sont présentes
-        base_ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in final_df_for_pair.columns for col in base_ohlcv_cols):
-            logger.error(f"{pair_log_prefix} Base OHLCV columns missing in df_1min after loading. Cannot proceed.")
+        final_df_for_pair = df_1min_current_pair.copy() 
+        if not all(col in final_df_for_pair.columns for col in BASE_OHLCV_COLS):
+            logger.error(f"{pair_log_prefix} Colonnes OHLCV de base manquantes dans df_1min après chargement. Enrichissement impossible.")
             continue
 
+        for tf_mins in timeframes_for_aggregation_minutes:
+            tf_log_prefix_loop = f"{pair_log_prefix}[TF:{tf_mins}min]"
+            logger.info(f"{tf_log_prefix_loop} Agrégation des K-lines et calcul des ATRs...")
 
-        for tf_minutes in timeframes_to_aggregate_minutes:
-            tf_log_prefix = f"{pair_log_prefix}[TF:{tf_minutes}min]"
-            logger.info(f"{tf_log_prefix} Aggregating K-lines...")
-
-            # Pour resample, l'index doit être DatetimeIndex. df_1min a déjà 'timestamp' comme index.
-            df_1min_for_agg = df_1min # Utiliser df_1min qui a déjà le bon index
-
-            # Règles d'agrégation pour les volumes Taker et autres métadonnées
-            extra_agg_rules = {
-                'quote_asset_volume': 'sum',
-                'number_of_trades': 'sum',
-                'taker_buy_base_asset_volume': 'sum',
-                'taker_sell_base_asset_volume': 'sum',
-                'taker_buy_quote_asset_volume': 'sum',
-                'taker_sell_quote_asset_volume': 'sum'
-            }
-            # S'assurer que seules les colonnes existantes sont dans les règles
-            actual_extra_agg_rules = {k: v for k, v in extra_agg_rules.items() if k in df_1min_for_agg.columns}
-
-            df_aggregated = data_utils.aggregate_klines_to_dataframe(
-                df_1min_for_agg, tf_minutes, extra_agg_rules=actual_extra_agg_rules
+            df_aggregated_tf = data_utils.aggregate_klines_to_dataframe(
+                df_1min_current_pair_indexed, 
+                tf_mins
             )
 
-            if df_aggregated.empty:
-                logger.warning(f"{tf_log_prefix} Aggregation resulted in an empty DataFrame. Skipping ATR calculation for this timeframe.")
+            if df_aggregated_tf.empty:
+                logger.warning(f"{tf_log_prefix_loop} L'agrégation a résulté en un DataFrame vide. Calcul ATR sauté pour ce timeframe.")
                 continue
             
-            logger.info(f"{tf_log_prefix} Calculating ATRs (Periods: {ATR_CONFIG['atr_low']}-{ATR_CONFIG['atr_high']}, Step: {ATR_CONFIG['atr_step']})...")
-            df_aggregated_with_atr = data_utils.calculate_atr_for_dataframe(
-                df_aggregated,
-                atr_low=ATR_CONFIG['atr_low'],
-                atr_high=ATR_CONFIG['atr_high'],
-                atr_step=ATR_CONFIG['atr_step']
+            df_aggregated_tf_with_atr = data_utils.calculate_atr_for_dataframe(
+                df_aggregated_tf,
+                atr_low=ATR_ENRICHMENT_CONFIG['atr_low'],
+                atr_high=ATR_ENRICHMENT_CONFIG['atr_high'],
+                atr_step=ATR_ENRICHMENT_CONFIG['atr_step']
             )
 
-            # Renommage des colonnes agrégées et d'ATR
-            # Utiliser le label de fréquence original de la config si possible, sinon générer à partir de tf_minutes
-            # data_utils.get_kline_prefix_effective attend une string comme "5min", "1h"
-            # Nous avons tf_minutes (int). Il faut le reconvertir en string de fréquence.
-            freq_label_str = _get_frequency_label_from_minutes(tf_minutes) # ex: 60 -> "60min" ou "1h"
-            kline_prefix = data_utils.get_kline_prefix_effective(freq_label_str) # ex: "60min" -> "Klines_60min"
+            tf_string_for_prefix = f"{tf_mins}min" 
+            kline_col_prefix = data_utils.get_kline_prefix_effective(tf_string_for_prefix)
             
-            renamed_columns = {}
-            for col in df_aggregated_with_atr.columns:
-                if col.startswith('ATR_'):
-                    renamed_columns[col] = f"{kline_prefix}_{col}" # Ex: Klines_5min_ATR_14
-                else: # OHLCV et autres colonnes agrégées
-                    renamed_columns[col] = f"{kline_prefix}_{col}" # Ex: Klines_5min_open
+            renamed_cols_for_merge: Dict[str, str] = {}
+            for col_agg in df_aggregated_tf_with_atr.columns:
+                if col_agg.startswith('ATR_'):
+                    renamed_cols_for_merge[col_agg] = f"{kline_col_prefix}_{col_agg}"
+                else: 
+                    renamed_cols_for_merge[col_agg] = f"{kline_col_prefix}_{col_agg}"
             
-            df_aggregated_with_atr.rename(columns=renamed_columns, inplace=True)
-            logger.debug(f"{tf_log_prefix} Colonnes renommées: {list(df_aggregated_with_atr.columns)}")
+            df_to_merge = df_aggregated_tf_with_atr.rename(columns=renamed_cols_for_merge)
+            df_to_merge = df_to_merge.reset_index() # 'timestamp' (fin de période agrégée) devient une colonne
 
-            # Fusionner avec final_df_for_pair
-            # L'index de df_aggregated_with_atr est le timestamp de fin de chaque barre agrégée.
-            # L'index de final_df_for_pair est un RangeIndex à ce stade (après reset_index).
-            # On doit fusionner sur la colonne 'timestamp'.
-            if not df_aggregated_with_atr.empty:
-                df_aggregated_with_atr_ts_col = df_aggregated_with_atr.reset_index() # 'timestamp' devient une colonne
-                final_df_for_pair = pd.merge(final_df_for_pair, df_aggregated_with_atr_ts_col, on='timestamp', how='left', suffixes=('', f'_{freq_label_str}_dup'))
-                # Remplir les valeurs NaN introduites par le merge (pour les lignes 1-min qui ne correspondent pas à une fin de barre agrégée)
-                # avec la dernière valeur valide de la colonne agrégée/ATR.
-                cols_to_ffill = [col for col in final_df_for_pair.columns if col.startswith("Klines_")]
-                if cols_to_ffill:
-                    final_df_for_pair[cols_to_ffill] = final_df_for_pair[cols_to_ffill].ffill()
-                logger.debug(f"{tf_log_prefix} Données agrégées et ATR fusionnées. Shape final_df_for_pair: {final_df_for_pair.shape}")
+            if not df_to_merge.empty:
+                final_df_for_pair = pd.merge(final_df_for_pair, df_to_merge, on='timestamp', how='left')
+                cols_just_merged = [col for col in final_df_for_pair.columns if col.startswith(kline_col_prefix)]
+                if cols_just_merged:
+                    final_df_for_pair[cols_just_merged] = final_df_for_pair[cols_just_merged].ffill()
+                logger.debug(f"{tf_log_prefix_loop} Données agrégées et ATRs fusionnées. Shape de final_df_for_pair : {final_df_for_pair.shape}")
+            else:
+                logger.warning(f"{tf_log_prefix_loop} DataFrame à fusionner (df_to_merge) est vide après renommage/reset_index.")
+        
+        if "1min" in config_timeframes_str or "1m" in config_timeframes_str:
+            logger.info(f"{pair_log_prefix} Calcul des ATRs sur les données 1-minute de base...")
+            # df_1min_current_pair_indexed a 'timestamp' comme index.
+            # calculate_atr_for_dataframe prend un df et retourne une copie avec les colonnes ATR.
+            # Il ne modifie pas l'index.
+            df_1min_with_atr_direct = data_utils.calculate_atr_for_dataframe(
+                df_1min_current_pair_indexed.copy(), # Utiliser une copie
+                atr_low=ATR_ENRICHMENT_CONFIG['atr_low'],
+                atr_high=ATR_ENRICHMENT_CONFIG['atr_high'],
+                atr_step=ATR_ENRICHMENT_CONFIG['atr_step']
+            )
+            atr_cols_1min = [col for col in df_1min_with_atr_direct.columns if col.startswith('ATR_')]
+            if atr_cols_1min and not df_1min_with_atr_direct.empty:
+                # Pour fusionner, nous avons besoin de 'timestamp' comme colonne dans df_1min_with_atr_direct.
+                # Puisque df_1min_current_pair_indexed avait 'timestamp' comme index (drop=True implicite),
+                # df_1min_with_atr_direct l'aura aussi comme index. reset_index() le mettra en colonne.
+                df_atrs_to_merge_1min = df_1min_with_atr_direct.reset_index() # 'timestamp' devient une colonne
+                
+                cols_for_merge_1min_atr = ['timestamp'] + atr_cols_1min
+                if all(c in df_atrs_to_merge_1min.columns for c in cols_for_merge_1min_atr):
+                    final_df_for_pair = pd.merge(
+                        final_df_for_pair, 
+                        df_atrs_to_merge_1min[cols_for_merge_1min_atr], 
+                        on='timestamp', 
+                        how='left', 
+                        suffixes=('', '_1min_atr_direct_dup') 
+                    )
+                    logger.debug(f"{pair_log_prefix} ATRs 1-minute fusionnés. Shape de final_df_for_pair : {final_df_for_pair.shape}")
+                else:
+                    logger.warning(f"{pair_log_prefix} Colonnes manquantes pour la fusion des ATRs 1-minute directs. Attendu: {cols_for_merge_1min_atr}, Trouvé: {df_atrs_to_merge_1min.columns.tolist()}")
+            else:
+                logger.warning(f"{pair_log_prefix} Le calcul direct des ATRs 1-minute n'a pas produit de colonnes ATR ou un DataFrame vide.")
 
-        # Sauvegarde du fichier enrichi pour la paire
-        output_file_enriched = enriched_data_dir / f"{pair_symbol}_enriched.parquet"
+
+        output_file_enriched_pair = enriched_data_output_dir / f"{pair_symbol_current.upper()}_enriched.parquet"
         try:
-            # S'assurer que 'timestamp' est bien la première colonne si elle existe
             if 'timestamp' in final_df_for_pair.columns:
-                cols = ['timestamp'] + [col for col in final_df_for_pair.columns if col != 'timestamp']
-                final_df_for_pair = final_df_for_pair[cols]
+                cols_ordered = ['timestamp'] + [col for col in final_df_for_pair.columns if col != 'timestamp']
+                final_df_for_pair = final_df_for_pair[cols_ordered]
             
-            final_df_for_pair.to_parquet(output_file_enriched, index=False, engine='pyarrow')
-            logger.info(f"{pair_log_prefix} Enriched data saved to {output_file_enriched} (Shape: {final_df_for_pair.shape})")
-        except Exception as e_save_enriched:
-            logger.error(f"{pair_log_prefix} Error saving enriched Parquet file {output_file_enriched}: {e_save_enriched}", exc_info=True)
+            final_df_for_pair.to_parquet(output_file_enriched_pair, index=False, engine='pyarrow')
+            logger.info(f"{pair_log_prefix} Données enrichies sauvegardées dans {output_file_enriched_pair} (Shape: {final_df_for_pair.shape})")
+        except Exception as e_save_final_enriched: # pylint: disable=broad-except
+            logger.error(f"{pair_log_prefix} Erreur lors de la sauvegarde du fichier Parquet enrichi {output_file_enriched_pair}: {e_save_final_enriched}", exc_info=True)
 
     script_end_time = time.time()
-    logger.info(f"--- Data Fetch, Clean, and Enrichment Script Finished ---")
-    logger.info(f"Total execution time: {script_end_time - script_start_time:.2f} seconds")
+    total_duration = script_end_time - script_start_time
+    logger.info(f"--- Script de Récupération et Enrichissement des Données Terminé ---")
+    logger.info(f"Temps d'exécution total : {total_duration:.2f} secondes ({timedelta(seconds=total_duration)})")
 
 if __name__ == "__main__":
-    # Le logging est configuré par load_all_configs appelé dans main()
-    # Cette configuration de secours est pour les erreurs très précoces ou si le script est exécuté d'une manière
-    # où load_all_configs n'est pas appelé comme prévu (ce qui ne devrait pas être le cas ici).
-    # La configuration principale du logging se fait via load_all_configs.
-    # Si load_all_configs échoue, le logging de base configuré dans ce bloc if __name__ == '__main__'
-    # ne sera pas utilisé car sys.exit() sera appelé avant.
-    # Il est donc principalement là pour le cas où le script serait exécuté d'une manière
-    # qui ne passe pas par la logique de chargement de config principale.
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                        handlers=[logging.StreamHandler(sys.stdout)]) # Utilisation de sys.stdout ici
-
-    logger.info("Running src/data/acquisition.py directly for testing...") # Ce message ne devrait pas apparaître normalement
-    logger.warning("This script is intended to be called by run_fetch_data.py, which provides AppConfig.")
-    logger.warning("Direct execution of acquisition.py for testing requires manual AppConfig setup or mocking.")
     main()
-

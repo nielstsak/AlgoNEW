@@ -17,7 +17,7 @@ try:
     from src.data import data_utils
     from src.strategies.base import BaseStrategy
     from src.config.definitions import ParamDetail, AppConfig, GlobalConfig, ExchangeSettings # GlobalConfig au lieu de GlobalSettings
-    from src.backtesting.performance import calculate_performance_metrics_from_inputs # Importer la fonction renommée
+    from src.backtesting.performance_analyzer import calculate_performance_metrics_from_inputs # Importer la fonction renommée
 except ImportError as e:
     logging.basicConfig(level=logging.WARNING)
     logging.getLogger(__name__).critical(f"ObjectiveEvaluator: Critical import error: {e}. Ensure PYTHONPATH is correct.", exc_info=True)

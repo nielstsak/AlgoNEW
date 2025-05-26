@@ -1,407 +1,415 @@
+# src/data/preprocessing_live.py
+"""
+Ce module est responsable du prétraitement des données brutes 1-minute acquises
+en direct pour une stratégie spécifique. Il charge les données brutes, simule des
+K-lines agrégées si nécessaire, calcule les indicateurs requis par la stratégie
+(avec les paramètres optimisés), et sauvegarde le DataFrame traité prêt à être
+utilisé par LiveTradingManager.
+"""
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Union # Union ajouté
 import re
+
 import pandas as pd
 import numpy as np
 import pandas_ta as ta # type: ignore
 
-# Tentative d'importation depuis src.data. Si ce script est dans src/data, cela pourrait être data_utils
+# Tentative d'importation depuis src.data.data_utils
 try:
     from src.data import data_utils
 except ImportError:
-    # Fallback si l'importation directe échoue (par exemple, lors de tests unitaires ou exécution isolée)
-    # Cela suppose que data_utils.py est dans le même répertoire ou que le PYTHONPATH est configuré.
-    try:
-        import data_utils # type: ignore
-    except ImportError:
-        logging.getLogger(__name__).critical(
-            "CRITICAL: Failed to import data_utils. Ensure it's accessible via PYTHONPATH "
-            "or in the same directory if running standalone."
-        )
-        # Définir des fonctions factices pour permettre au reste du module de se charger pour l'analyse
-        # mais cela ne fonctionnera pas réellement.
-        class data_utils: # type: ignore
-            @staticmethod
-            def get_kline_prefix_effective(freq_param_value: Optional[str]) -> str: return ""
-            @staticmethod
-            def calculate_taker_pressure_ratio(df, buy_col, sell_col, out_col): return df
-            @staticmethod
-            def calculate_taker_pressure_delta(df, buy_col, sell_col, out_col): return df
+    # Fallback si l'importation directe échoue
+    logging.getLogger(__name__).critical(
+        "CRITICAL (preprocessing_live): Échec de l'import de data_utils. "
+        "Assurez-vous qu'il est accessible via PYTHONPATH."
+    )
+    # Définir une fonction factice pour data_utils.get_kline_prefix_effective
+    class data_utils: # type: ignore
+        @staticmethod
+        def get_kline_prefix_effective(freq_param_value: Optional[str]) -> str:
+            # Logique de fallback très simplifiée
+            if freq_param_value and freq_param_value.lower() not in ["1min", "1m", None, ""]:
+                return f"Klines_{freq_param_value}_" # Note: le vrai ajoute 'min' et gère h/d
+            return ""
+        @staticmethod
+        def calculate_taker_pressure_ratio(df: pd.DataFrame, buy_col: str, sell_col: str, out_col: str) -> pd.DataFrame:
+            df[out_col] = np.nan
+            return df
+        @staticmethod
+        def calculate_taker_pressure_delta(df: pd.DataFrame, buy_col: str, sell_col: str, out_col: str) -> pd.DataFrame:
+            df[out_col] = np.nan
+            return df
+
 
 logger = logging.getLogger(__name__)
 
-# Colonnes OHLCV de base attendues dans le fichier brut 1-minute après chargement et nettoyage initial
-BASE_OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
+# Colonnes OHLCV de base attendues dans le fichier brut 1-minute
+BASE_OHLCV_COLS: List[str] = ['open', 'high', 'low', 'close', 'volume']
 
-# Colonnes Taker de base attendues dans le fichier brut 1-minute (après calcul si nécessaire)
-BASE_TAKER_COLS = [
+# Colonnes Taker de base attendues dans le fichier brut 1-minute
+BASE_TAKER_COLS: List[str] = [
     'taker_buy_base_asset_volume', 'taker_sell_base_asset_volume',
     'taker_buy_quote_asset_volume', 'taker_sell_quote_asset_volume',
-    'quote_asset_volume', 'number_of_trades' # quote_asset_volume et number_of_trades sont aussi agrégés
+    'quote_asset_volume', 'number_of_trades'
 ]
 
-
-def _ensure_required_columns(df: pd.DataFrame, required_cols: List[str], df_name: str = "DataFrame") -> bool:
+def _ensure_required_columns(df: pd.DataFrame, required_cols: List[str], df_name: str = "DataFrame", log_prefix: str = "") -> bool:
     """Vérifie si toutes les colonnes requises sont présentes dans le DataFrame."""
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        logger.error(f"{df_name} is missing required columns: {missing_cols}. Available: {df.columns.tolist()}")
+        logger.error(f"{log_prefix} Le {df_name} manque les colonnes requises : {missing_cols}. Colonnes disponibles : {df.columns.tolist()}")
         return False
     return True
 
-# --- Fonctions de calcul d'indicateurs (peuvent être migrées vers data_utils.py) ---
-# Note: pandas_ta.ema et pandas_ta.atr sont généralement préférés pour la robustesse et les options.
-# Ces versions personnalisées sont conservées pour correspondre à votre code existant.
+# --- Fonctions de calcul d'indicateurs (conservées temporairement, pourraient migrer vers IndicatorCalculator/data_utils) ---
+# Note: pandas_ta.ema et pandas_ta.atr sont généralement préférés.
+# Ces versions sont gardées pour correspondre au code existant et être appelées par la logique ci-dessous.
 
-def _calculate_ema_rolling(series: pd.Series, period: int, 
+def _calculate_ema_rolling(series: pd.Series, period: int,
                            series_name_debug: str = "Series") -> pd.Series:
     """Calcule l'EMA en utilisant ewm.mean()."""
     log_prefix_calc = f"[_calculate_ema_rolling for {series_name_debug}({period})]"
     if not isinstance(series, pd.Series):
-        logger.warning(f"{log_prefix_calc} Input is not a pandas Series. Type: {type(series)}")
-        return pd.Series(np.nan, name=f"EMA_{period}", index=getattr(series, 'index', None))
+        logger.warning(f"{log_prefix_calc} L'entrée n'est pas une pandas Series. Type: {type(series)}")
+        return pd.Series(np.nan, name=f"EMA_{period}", index=getattr(series, 'index', None)) # type: ignore
     if series.empty:
-        logger.debug(f"{log_prefix_calc} Input series is empty.")
-        return pd.Series(np.nan, index=series.index, name=f"EMA_{period}")
+        logger.debug(f"{log_prefix_calc} La série d'entrée est vide.")
+        return pd.Series(np.nan, index=series.index, name=f"EMA_{period}") # type: ignore
     if series.isnull().all():
-        logger.debug(f"{log_prefix_calc} Input series is all NaN.")
-        return pd.Series(np.nan, index=series.index, name=f"EMA_{period}")
+        logger.debug(f"{log_prefix_calc} La série d'entrée est entièrement NaN.")
+        return pd.Series(np.nan, index=series.index, name=f"EMA_{period}") # type: ignore
     if not isinstance(period, int) or period <= 0:
-        logger.warning(f"{log_prefix_calc} Invalid period: {period}. Must be a positive integer.")
-        return pd.Series(np.nan, index=series.index, name=f"EMA_{period}")
+        logger.warning(f"{log_prefix_calc} Période invalide : {period}. Doit être un entier positif.")
+        return pd.Series(np.nan, index=series.index, name=f"EMA_{period}") # type: ignore
     
-    # min_periods=period assure que l'EMA n'est calculée que lorsque suffisamment de données sont disponibles.
-    # adjust=False est commun pour les EMA financières pour correspondre à certaines plateformes.
-    return series.ewm(span=period, adjust=False, min_periods=period).mean()
+    return series.ewm(span=period, adjust=False, min_periods=max(1, period)).mean() # min_periods=period
 
-def _calculate_atr_rolling(high_series: pd.Series, low_series: pd.Series, close_series: pd.Series, 
+def _calculate_atr_rolling(high_series: pd.Series, low_series: pd.Series, close_series: pd.Series,
                            period: int, series_name_debug: str = "SeriesATR") -> pd.Series:
-    """Calcule l'ATR."""
+    """Calcule l'ATR en utilisant pandas-ta."""
     log_prefix_calc = f"[_calculate_atr_rolling for {series_name_debug}({period})]"
-    valid_index = getattr(close_series, 'index', None) # Default index
+    # Utiliser l'index de close_series comme référence si les autres sont vides ou d'un type différent
+    valid_index = getattr(close_series, 'index', None)
 
     if not all(isinstance(s, pd.Series) for s in [high_series, low_series, close_series]):
-        logger.warning(f"{log_prefix_calc} One or more inputs are not pandas Series.")
-        return pd.Series(np.nan, name=f"ATR_{period}", index=valid_index)
+        logger.warning(f"{log_prefix_calc} Une ou plusieurs entrées ne sont pas des pandas Series.")
+        return pd.Series(np.nan, name=f"ATR_{period}", index=valid_index) # type: ignore
     if high_series.empty or low_series.empty or close_series.empty:
-        logger.debug(f"{log_prefix_calc} One or more input HLC series is empty.")
-        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}")
+        logger.debug(f"{log_prefix_calc} Une ou plusieurs séries HLC d'entrée sont vides.")
+        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}") # type: ignore
     if high_series.isnull().all() or low_series.isnull().all() or close_series.isnull().all():
-        logger.debug(f"{log_prefix_calc} One or more input HLC series is all NaN.")
-        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}")
+        logger.debug(f"{log_prefix_calc} Une ou plusieurs séries HLC d'entrée sont entièrement NaN.")
+        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}") # type: ignore
     if not isinstance(period, int) or period <= 0:
-        logger.warning(f"{log_prefix_calc} Invalid period: {period}. Must be positive integer.")
-        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}")
+        logger.warning(f"{log_prefix_calc} Période invalide : {period}. Doit être un entier positif.")
+        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}") # type: ignore
 
-    # Utilisation de pandas_ta.atr pour une implémentation standard et robuste
     try:
         atr_series = ta.atr(high=high_series.astype(float), low=low_series.astype(float), close=close_series.astype(float), length=period, append=False)
         if isinstance(atr_series, pd.Series):
             return atr_series
-        else: # Should not happen with ta.atr if inputs are valid Series
-            logger.warning(f"{log_prefix_calc} pandas_ta.atr did not return a Series. Result type: {type(atr_series)}")
-            return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}")
+        else:
+            logger.warning(f"{log_prefix_calc} pandas_ta.atr n'a pas retourné une Series. Type résultat : {type(atr_series)}")
+            return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}") # type: ignore
     except Exception as e:
-        logger.error(f"{log_prefix_calc} Error calculating ATR using pandas_ta: {e}", exc_info=True)
-        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}")
-
+        logger.error(f"{log_prefix_calc} Erreur lors du calcul de l'ATR avec pandas_ta : {e}", exc_info=True)
+        return pd.Series(np.nan, index=valid_index, name=f"ATR_{period}") # type: ignore
 # --- Fin des fonctions de calcul d'indicateurs ---
 
 def preprocess_live_data_for_strategy(
     raw_data_path: Path,
     processed_output_path: Path,
     strategy_params: Dict[str, Any],
-    strategy_name: str
+    strategy_name: str # Nom de la stratégie pour le logging et la logique spécifique (temporaire)
 ) -> Optional[pd.DataFrame]:
     """
-    Preprocesses raw 1-minute live data for a specific strategy by calculating required indicators.
+    Prétraite les données brutes 1-minute acquises en direct pour une stratégie spécifique.
+    Simule des K-lines agrégées, calcule les indicateurs requis par la stratégie
+    (avec les paramètres optimisés), et sauvegarde le DataFrame traité.
 
     Args:
-        raw_data_path: Path to the raw 1-minute data CSV file (e.g., PAIR_1min_live_raw.csv).
-        processed_output_path: Path to save the processed DataFrame (1-min OHLCV + _strat indicators).
-        strategy_params: Dictionary of optimized parameters for the strategy.
-        strategy_name: Name of the strategy to determine which indicators to calculate.
+        raw_data_path (Path): Chemin vers le fichier CSV des données brutes 1-minute.
+        processed_output_path (Path): Chemin où sauvegarder le DataFrame traité en CSV.
+        strategy_params (Dict[str, Any]): Dictionnaire des paramètres optimisés pour la stratégie.
+        strategy_name (str): Nom de la stratégie (utilisé pour le logging et la logique
+                             de calcul d'indicateurs spécifique si IndicatorCalculator
+                             n'est pas encore utilisé).
 
     Returns:
-        A pandas DataFrame containing the latest row of processed data (1-min OHLCV + indicators),
-        or None if processing fails.
+        Optional[pd.DataFrame]: Le DataFrame final traité et sauvegardé, ou None en cas d'échec majeur.
     """
-    pair_symbol_log = raw_data_path.name.split('_')[0] # Extract pair from filename
-    log_prefix = f"[{pair_symbol_log}][{strategy_name}]"
-    logger.info(f"{log_prefix} Starting live data preprocessing for strategy. Output: {processed_output_path.name}")
-    logger.debug(f"{log_prefix} Strategy params: {strategy_params}")
+    pair_symbol_from_filename = raw_data_path.name.split('_')[0] # Extraire la paire du nom de fichier
+    log_prefix = f"[PreprocLive][{pair_symbol_from_filename}][{strategy_name}]"
+    logger.info(f"{log_prefix} Démarrage du prétraitement des données live. Sortie vers : {processed_output_path.name}")
+    logger.debug(f"{log_prefix} Paramètres de la stratégie : {strategy_params}")
     processing_start_time = time.time()
 
-    # 1. Load and Clean Raw 1-minute Data
+    # 1. Chargement et Nettoyage des Données Brutes 1-minute
     if not raw_data_path.exists() or raw_data_path.stat().st_size == 0:
-        logger.warning(f"{log_prefix} Raw 1-minute data file not found or empty: {raw_data_path}.")
+        logger.warning(f"{log_prefix} Fichier de données brutes 1-minute non trouvé ou vide : {raw_data_path}.")
         return None
     
     df_1m_raw: pd.DataFrame
     try:
         df_1m_raw = pd.read_csv(raw_data_path, low_memory=False)
         if df_1m_raw.empty:
-            logger.warning(f"{log_prefix} Raw data file {raw_data_path} is empty after loading.")
+            logger.warning(f"{log_prefix} Le fichier de données brutes {raw_data_path.name} est vide après chargement.")
             return None
 
         if 'timestamp' not in df_1m_raw.columns:
-            logger.error(f"{log_prefix} 'timestamp' column missing in {raw_data_path.name}.")
+            logger.error(f"{log_prefix} Colonne 'timestamp' manquante dans {raw_data_path.name}.")
             return None
         
         df_1m_raw['timestamp'] = pd.to_datetime(df_1m_raw['timestamp'], errors='coerce', utc=True)
         df_1m_raw.dropna(subset=['timestamp'], inplace=True)
         if df_1m_raw.empty:
-            logger.warning(f"{log_prefix} DataFrame empty after timestamp conversion/dropna for {raw_data_path.name}.")
+            logger.warning(f"{log_prefix} DataFrame vide après conversion/dropna du timestamp pour {raw_data_path.name}.")
             return None
         
         df_1m_raw = df_1m_raw.set_index('timestamp').sort_index()
         if not df_1m_raw.index.is_unique:
+            logger.info(f"{log_prefix} Timestamps dupliqués trouvés dans les données brutes. Conservation de la dernière occurrence.")
             df_1m_raw = df_1m_raw[~df_1m_raw.index.duplicated(keep='last')]
         
-        # Ensure base OHLCV and Taker columns are numeric and handle NaNs
-        cols_to_convert_and_clean = BASE_OHLCV_COLS + BASE_TAKER_COLS
-        if not _ensure_required_columns(df_1m_raw, cols_to_convert_and_clean, f"{log_prefix} Raw Data"):
-             logger.error(f"{log_prefix} Essential base OHLCV or Taker columns missing in raw data. Cannot proceed.")
+        # S'assurer que les colonnes OHLCV de base et Taker sont présentes et numériques
+        cols_to_check_and_convert = BASE_OHLCV_COLS + BASE_TAKER_COLS
+        if not _ensure_required_columns(df_1m_raw, cols_to_check_and_convert, f"{log_prefix} Données Brutes", log_prefix):
+             logger.error(f"{log_prefix} Colonnes OHLCV ou Taker de base essentielles manquantes dans les données brutes. Prétraitement annulé.")
              return None
 
-        for col in cols_to_convert_and_clean:
+        for col in cols_to_check_and_convert:
             df_1m_raw[col] = pd.to_numeric(df_1m_raw[col], errors='coerce')
         
-        # Fill NaNs in OHLCV first, then drop rows if still NaN (critical)
+        # Gestion des NaNs pour OHLCV et Taker
         df_1m_raw[BASE_OHLCV_COLS] = df_1m_raw[BASE_OHLCV_COLS].ffill().bfill()
-        df_1m_raw.dropna(subset=BASE_OHLCV_COLS, inplace=True)
+        df_1m_raw.dropna(subset=BASE_OHLCV_COLS, inplace=True) # Les OHLCV sont critiques
         
         if df_1m_raw.empty:
-            logger.warning(f"{log_prefix} DataFrame 1-minute empty after OHLCV NaN cleaning.")
+            logger.warning(f"{log_prefix} DataFrame 1-minute vide après nettoyage des NaNs OHLCV.")
             return None
         
-        # For Taker columns, ffill might be acceptable if some intermediate NaNs occur
-        df_1m_raw[BASE_TAKER_COLS] = df_1m_raw[BASE_TAKER_COLS].ffill()
+        df_1m_raw[BASE_TAKER_COLS] = df_1m_raw[BASE_TAKER_COLS].ffill() # ffill pour les données Taker
 
-
-        # Initialize df_processed with base 1-min OHLCV
-        df_processed = df_1m_raw[BASE_OHLCV_COLS].copy()
-        logger.info(f"{log_prefix} Loaded and cleaned raw 1-min data. Shape: {df_1m_raw.shape}")
+        # df_processed contiendra les OHLCV 1min + Klines agrégées + indicateurs _strat
+        df_processed = df_1m_raw[BASE_OHLCV_COLS + BASE_TAKER_COLS].copy() # Commencer avec 1-min OHLCV et Taker
+        logger.info(f"{log_prefix} Données brutes 1-minute chargées et nettoyées. Shape : {df_1m_raw.shape}")
 
     except Exception as e_load:
-        logger.error(f"{log_prefix} Error loading/cleaning raw 1-min data from {raw_data_path}: {e_load}", exc_info=True)
+        logger.error(f"{log_prefix} Erreur lors du chargement/nettoyage des données brutes 1-minute depuis {raw_data_path}: {e_load}", exc_info=True)
         return None
 
-    # 2. Build Frequency Map and Determine Rolling Windows for K-line Simulation
-    freq_map_for_rolling: Dict[str, List[str]] = {} # Maps config frequency string to list of indicator contexts
-    # Example: {"5min": ["EMA", "MACD_FREQ"], "1h": ["ATR_SLTP_FREQ"]}
-    
-    # Populate freq_map_for_rolling based on strategy_params
-    # This logic needs to scan strategy_params for all 'indicateur_frequence_XYZ' keys
+    # 2. Simulation des K-lines Agrégées (si nécessaire)
+    # Identifier les fréquences uniques nécessaires pour les indicateurs de la stratégie
+    required_frequencies_from_params: set[str] = set()
     for param_key, param_value in strategy_params.items():
-        if "indicateur_frequence" in param_key and isinstance(param_value, str) and param_value:
-            # Extract a context name (e.g., "EMA", "MACD", "PSAR")
-            context_name_match = re.search(r"indicateur_frequence_([a-zA-Z0-9_]+)", param_key)
-            context_name = context_name_match.group(1).upper() if context_name_match else param_key.upper()
-            
-            if param_value not in freq_map_for_rolling:
-                freq_map_for_rolling[param_value] = []
-            if context_name not in freq_map_for_rolling[param_value]:
-                freq_map_for_rolling[param_value].append(context_name)
-
-    # Add ATR base frequency for SL/TP explicitly
-    atr_freq_sl_tp_raw = strategy_params.get('atr_base_frequency_sl_tp', strategy_params.get('atr_base_frequency'))
-    if isinstance(atr_freq_sl_tp_raw, str) and atr_freq_sl_tp_raw:
-        if atr_freq_sl_tp_raw not in freq_map_for_rolling:
-            freq_map_for_rolling[atr_freq_sl_tp_raw] = []
-        if "ATR_SL_TP_FREQ" not in freq_map_for_rolling[atr_freq_sl_tp_raw]: # Unique context
-            freq_map_for_rolling[atr_freq_sl_tp_raw].append("ATR_SL_TP_FREQ")
+        if "indicateur_frequence" in param_key and isinstance(param_value, str) and param_value.lower() not in ["1min", "1m", "none", ""]:
+            required_frequencies_from_params.add(param_value)
     
-    logger.debug(f"{log_prefix} Frequency map for rolling aggregations: {freq_map_for_rolling}")
+    # Ajouter la fréquence de base pour l'ATR SL/TP si elle est différente de 1min
+    atr_base_freq_sl_tp = strategy_params.get('atr_base_frequency_sl_tp', strategy_params.get('atr_base_frequency')) # Fallback
+    if atr_base_freq_sl_tp and isinstance(atr_base_freq_sl_tp, str) and atr_base_freq_sl_tp.lower() not in ["1min", "1m", "none", ""]:
+        required_frequencies_from_params.add(atr_base_freq_sl_tp)
 
-    rolling_windows_to_calculate: Dict[int, str] = {} # Maps window_size_minutes to config_freq_label
-    for freq_str_config, contexts in freq_map_for_rolling.items():
-        if freq_str_config.lower() == "1min": # Skip 1min as it's the base
+    logger.info(f"{log_prefix} Fréquences d'indicateurs requises (hors 1min) : {required_frequencies_from_params}")
+
+    # Calculer les K-lines agrégées par rolling window
+    for freq_str_config in sorted(list(required_frequencies_from_params)): # Trier pour un ordre cohérent
+        tf_minutes = data_utils.parse_timeframe_to_seconds(freq_str_config) # Convertir en secondes puis en minutes
+        if tf_minutes is None:
+            logger.warning(f"{log_prefix} Impossible de parser la fréquence '{freq_str_config}' en minutes. Agrégation pour cette fréquence ignorée.")
             continue
-        match = re.fullmatch(r"(\d+)(min|m|h|d)", freq_str_config.lower().strip())
-        if match:
-            num, unit = int(match.group(1)), match.group(2)
-            window_minutes = 0
-            if unit in ["min", "m"]: window_minutes = num
-            elif unit == "h": window_minutes = num * 60
-            elif unit == "d": window_minutes = num * 24 * 60
-            
-            if window_minutes > 0:
-                if window_minutes not in rolling_windows_to_calculate:
-                    rolling_windows_to_calculate[window_minutes] = freq_str_config
-                # If already mapped, ensure consistency or log warning (first one wins for label)
-            else:
-                logger.warning(f"{log_prefix} Invalid window_minutes ({window_minutes}) for freq '{freq_str_config}'.")
-        else:
-            logger.warning(f"{log_prefix} Could not parse window size from freq_str: '{freq_str_config}' (contexts: {contexts})")
-    
-    logger.info(f"{log_prefix} Rolling windows to simulate (minutes: label): {rolling_windows_to_calculate}")
+        tf_minutes //= 60 # Convertir secondes en minutes
 
-    # 3. Calculate Aggregated K-lines using Rolling Windows on 1-min data
-    for window_mins, period_label_cfg in sorted(rolling_windows_to_calculate.items()):
-        if window_mins <= 0: continue # Should be caught by previous logic
-        logger.debug(f"{log_prefix} Simulating {period_label_cfg} K-lines (window: {window_mins} mins)...")
+        if tf_minutes <= 1: # Déjà géré par les données 1-min de base
+            continue
+
+        logger.debug(f"{log_prefix} Simulation des K-lines agrégées pour {freq_str_config} (fenêtre : {tf_minutes} minutes)...")
         
-        # Ensure min_periods equals window_mins for complete K-lines
-        min_p = window_mins 
+        # Utiliser min_periods = window_size_minutes pour s'assurer que les barres agrégées sont complètes
+        min_p_agg = tf_minutes
         
-        df_processed[f"Kline_{period_label_cfg}_open"] = df_1m_raw['open'].rolling(window=window_mins, min_periods=min_p).apply(lambda x: x[0] if len(x) >= min_p else np.nan, raw=True)
-        df_processed[f"Kline_{period_label_cfg}_high"] = df_1m_raw['high'].rolling(window=window_mins, min_periods=min_p).max()
-        df_processed[f"Kline_{period_label_cfg}_low"] = df_1m_raw['low'].rolling(window=window_mins, min_periods=min_p).min()
-        df_processed[f"Kline_{period_label_cfg}_close"] = df_1m_raw['close'].rolling(window=window_mins, min_periods=min_p).apply(lambda x: x[-1] if len(x) >= min_p else np.nan, raw=True)
-        df_processed[f"Kline_{period_label_cfg}_volume"] = df_1m_raw['volume'].rolling(window=window_mins, min_periods=min_p).sum()
+        kline_prefix_agg = data_utils.get_kline_prefix_effective(freq_str_config) # Ex: "Klines_5min"
 
-        for taker_col in BASE_TAKER_COLS: # Aggregate all base taker columns
-            if taker_col in df_1m_raw.columns:
-                df_processed[f"Kline_{period_label_cfg}_{taker_col}"] = df_1m_raw[taker_col].rolling(window=window_mins, min_periods=min_p).sum()
-            else: # Should not happen if _ensure_required_columns passed
-                df_processed[f"Kline_{period_label_cfg}_{taker_col}"] = np.nan
-    
-    logger.debug(f"{log_prefix} df_processed columns after K-line simulation: {df_processed.columns.tolist()}")
+        # Agrégation OHLCV
+        df_processed[f"{kline_prefix_agg}_open"] = df_1m_raw['open'].rolling(window=min_p_agg, min_periods=min_p_agg).apply(lambda x: x[0] if len(x) >= min_p_agg else np.nan, raw=True)
+        df_processed[f"{kline_prefix_agg}_high"] = df_1m_raw['high'].rolling(window=min_p_agg, min_periods=min_p_agg).max()
+        df_processed[f"{kline_prefix_agg}_low"] = df_1m_raw['low'].rolling(window=min_p_agg, min_periods=min_p_agg).min()
+        df_processed[f"{kline_prefix_agg}_close"] = df_1m_raw['close'].rolling(window=min_p_agg, min_periods=min_p_agg).apply(lambda x: x[-1] if len(x) >= min_p_agg else np.nan, raw=True)
+        df_processed[f"{kline_prefix_agg}_volume"] = df_1m_raw['volume'].rolling(window=min_p_agg, min_periods=min_p_agg).sum()
 
-    # 4. Calculate ATR_strat (for SL/TP)
-    atr_period_sl_tp_key = 'atr_period_sl_tp' if 'atr_period_sl_tp' in strategy_params else 'atr_period'
-    atr_freq_sl_tp_key = 'atr_base_frequency_sl_tp' if 'atr_base_frequency_sl_tp' in strategy_params else 'atr_base_frequency'
+        # Agrégation des volumes Taker et autres métadonnées
+        for taker_col in BASE_TAKER_COLS:
+            if taker_col in df_1m_raw.columns: # Vérifier si la colonne source existe
+                df_processed[f"{kline_prefix_agg}_{taker_col}"] = df_1m_raw[taker_col].rolling(window=min_p_agg, min_periods=min_p_agg).sum()
+            else: # Ne devrait pas arriver si le nettoyage initial est correct
+                df_processed[f"{kline_prefix_agg}_{taker_col}"] = np.nan
     
+    logger.debug(f"{log_prefix} Colonnes dans df_processed après simulation des K-lines agrégées : {df_processed.columns.tolist()}")
+
+
+    # 3. Calcul des Indicateurs Spécifiques à la Stratégie (colonnes _strat)
+    # Cette section est une adaptation de la logique existante et sera remplacée/améliorée
+    # par IndicatorCalculator dans le futur.
+    logger.info(f"{log_prefix} Calcul des indicateurs spécifiques à la stratégie...")
+
+    # ATR_strat (pour SL/TP)
+    atr_period_sl_tp_key = 'atr_period_sl_tp'
+    atr_freq_sl_tp_key = 'atr_base_frequency_sl_tp'
     atr_period_val = strategy_params.get(atr_period_sl_tp_key)
     atr_freq_raw_val = strategy_params.get(atr_freq_sl_tp_key)
 
     if atr_period_val is not None and atr_freq_raw_val is not None:
         atr_period_int = int(atr_period_val)
-        # Get the effective label (e.g., "5min", "60min") for constructing column names
-        # data_utils.get_kline_prefix_effective returns "Klines_5min" or "" for 1min
-        # We need the "5min" part or handle "" for 1min.
-        kline_prefix_for_atr_source = data_utils.get_kline_prefix_effective(str(atr_freq_raw_val))
+        kline_prefix_atr_src = data_utils.get_kline_prefix_effective(str(atr_freq_raw_val))
         
-        atr_high_col_src = f"{kline_prefix_for_atr_source}_high" if kline_prefix_for_atr_source else "high"
-        atr_low_col_src = f"{kline_prefix_for_atr_source}_low" if kline_prefix_for_atr_source else "low"
-        atr_close_col_src = f"{kline_prefix_for_atr_source}_close" if kline_prefix_for_atr_source else "close"
+        atr_high_col_src = f"{kline_prefix_atr_src}_high" if kline_prefix_atr_src else "high"
+        atr_low_col_src = f"{kline_prefix_atr_src}_low" if kline_prefix_atr_src else "low"
+        atr_close_col_src = f"{kline_prefix_atr_src}_close" if kline_prefix_atr_src else "close"
         
-        logger.debug(f"{log_prefix} ATR_strat: Period={atr_period_int}, FreqRaw='{atr_freq_raw_val}', PrefixSrc='{kline_prefix_for_atr_source}'. Source HLC cols: {atr_high_col_src}, {atr_low_col_src}, {atr_close_col_src}")
-
         if all(col in df_processed.columns for col in [atr_high_col_src, atr_low_col_src, atr_close_col_src]):
             df_processed['ATR_strat'] = _calculate_atr_rolling(
                 df_processed[atr_high_col_src], df_processed[atr_low_col_src], df_processed[atr_close_col_src],
                 period=atr_period_int, series_name_debug=f"ATR_SLTP_Src({atr_freq_raw_val})"
             )
-            if 'ATR_strat' in df_processed: logger.info(f"{log_prefix} ATR_strat calculated. NaNs: {df_processed['ATR_strat'].isnull().sum()}/{len(df_processed)}")
+            if 'ATR_strat' in df_processed: logger.info(f"{log_prefix} ATR_strat calculé. NaNs: {df_processed['ATR_strat'].isnull().sum()}/{len(df_processed)}")
         else:
-            logger.warning(f"{log_prefix} Source HLC columns for ATR_strat not found in df_processed (needed: {atr_high_col_src}, {atr_low_col_src}, {atr_close_col_src}). ATR_strat will be NaN.")
+            logger.warning(f"{log_prefix} Colonnes sources HLC pour ATR_strat non trouvées dans df_processed (nécessaires: {atr_high_col_src}, {atr_low_col_src}, {atr_close_col_src}). ATR_strat sera NaN.")
             df_processed['ATR_strat'] = np.nan
     else:
-        logger.warning(f"{log_prefix} ATR_strat parameters ('{atr_period_sl_tp_key}' or '{atr_freq_sl_tp_key}') missing. ATR_strat will be NaN.")
+        logger.warning(f"{log_prefix} Paramètres ATR_strat ('{atr_period_sl_tp_key}' ou '{atr_freq_sl_tp_key}') manquants. ATR_strat sera NaN.")
         df_processed['ATR_strat'] = np.nan
 
-    # 5. Calculate Strategy-Specific Indicators
-    # This section needs to be customized for each strategy, similar to ObjectiveEvaluator
-    # For brevity, only a placeholder structure is shown.
-    # The key is to use data_utils.get_kline_prefix_effective and select the correct
-    # Kline_{TF}_<ohlcv> columns from df_processed as input to ta functions.
+    # Logique spécifique par stratégie (temporaire, à remplacer par IndicatorCalculator)
+    # Note: Cette section est une simplification et devrait être remplacée par un appel
+    # à IndicatorCalculator qui utilise strategy.get_required_indicator_configs().
+    # Pour l'instant, on garde une logique similaire à l'ancien preprocessing_live.py
+    # pour les stratégies connues, en se basant sur les noms de paramètres.
 
-    strategy_name_lower = strategy_name.lower()
-    # Example for a strategy that uses EMA
-    if "ema" in strategy_name_lower: # Generic check, refine for actual strategy names
-        ema_short_p = strategy_params.get('ema_short_period')
-        ema_freq_raw = strategy_params.get('indicateur_frequence_ema') # Example param name
-        if ema_short_p is not None and ema_freq_raw is not None:
-            kline_prefix_ema_src = data_utils.get_kline_prefix_effective(str(ema_freq_raw))
-            ema_close_col_src = f"{kline_prefix_ema_src}_close" if kline_prefix_ema_src else "close"
-            if ema_close_col_src in df_processed.columns:
-                df_processed['EMA_short_strat'] = _calculate_ema_rolling(df_processed[ema_close_col_src], period=int(ema_short_p), series_name_debug=f"EMA_short_Src({ema_freq_raw})")
-            else:
-                df_processed['EMA_short_strat'] = np.nan
-                logger.warning(f"{log_prefix} Source close column '{ema_close_col_src}' for EMA_short_strat not found.")
-    
-    # Example for MACD
-    if "macd" in strategy_name_lower:
-        macd_fast = strategy_params.get('macd_fast_period')
-        macd_slow = strategy_params.get('macd_slow_period')
-        macd_signal = strategy_params.get('macd_signal_period')
-        macd_freq_raw = strategy_params.get('indicateur_frequence_macd')
-        if all(p is not None for p in [macd_fast, macd_slow, macd_signal, macd_freq_raw]):
-            kline_prefix_macd_src = data_utils.get_kline_prefix_effective(str(macd_freq_raw))
-            macd_close_col_src = f"{kline_prefix_macd_src}_close" if kline_prefix_macd_src else "close"
-            if macd_close_col_src in df_processed.columns:
-                macd_df = ta.macd(close=df_processed[macd_close_col_src].astype(float), 
-                                  fast=int(macd_fast), slow=int(macd_slow), signal=int(macd_signal), 
-                                  append=False)
-                if macd_df is not None and not macd_df.empty:
-                    # Column names from pandas_ta.macd are typically like MACD_F_S_signal, MACDh_F_S_signal, MACDs_F_S_signal
-                    df_processed['MACD_line_strat'] = macd_df.iloc[:,0] # MACD Line
-                    df_processed['MACD_hist_strat'] = macd_df.iloc[:,1] # MACD Histogram
-                    df_processed['MACD_signal_strat'] = macd_df.iloc[:,2] # MACD Signal Line
-                else:
-                    df_processed['MACD_line_strat'] = np.nan; df_processed['MACD_hist_strat'] = np.nan; df_processed['MACD_signal_strat'] = np.nan
-            else:
-                logger.warning(f"{log_prefix} Source close column '{macd_close_col_src}' for MACD not found.")
-                df_processed['MACD_line_strat'] = np.nan; df_processed['MACD_hist_strat'] = np.nan; df_processed['MACD_signal_strat'] = np.nan
-
-
-    # 6. Calculate Taker Pressure Indicators (if applicable)
-    taker_ma_period_param = strategy_params.get('taker_pressure_indicator_period')
-    taker_freq_raw_param = strategy_params.get('indicateur_frequence_taker_pressure')
-    if taker_ma_period_param is not None and taker_freq_raw_param is not None:
-        taker_ma_period = int(taker_ma_period_param)
-        kline_prefix_taker_src = data_utils.get_kline_prefix_effective(str(taker_freq_raw_param))
+    if "ma_type" in strategy_params: # Indice d'une stratégie de type MA Crossover ou Triple MA
+        ma_type_strat = str(strategy_params.get('ma_type', 'ema')).lower()
         
-        buy_vol_col_name = f"{kline_prefix_taker_src}_taker_buy_base_asset_volume" if kline_prefix_taker_src else "taker_buy_base_asset_volume"
-        sell_vol_col_name = f"{kline_prefix_taker_src}_taker_sell_base_asset_volume" if kline_prefix_taker_src else "taker_sell_base_asset_volume"
+        # Pour MaCrossoverStrategy
+        if 'fast_ma_period' in strategy_params and 'indicateur_frequence_ma_rapide' in strategy_params:
+            kline_prefix_fast = data_utils.get_kline_prefix_effective(str(strategy_params['indicateur_frequence_ma_rapide']))
+            close_col_fast = f"{kline_prefix_fast}_close" if kline_prefix_fast else "close"
+            if close_col_fast in df_processed.columns:
+                df_processed['MA_FAST_strat'] = _calculate_ema_rolling(df_processed[close_col_fast], int(strategy_params['fast_ma_period']))
+            else: df_processed['MA_FAST_strat'] = np.nan
+        
+        if 'slow_ma_period' in strategy_params and 'indicateur_frequence_ma_lente' in strategy_params:
+            kline_prefix_slow = data_utils.get_kline_prefix_effective(str(strategy_params['indicateur_frequence_ma_lente']))
+            close_col_slow = f"{kline_prefix_slow}_close" if kline_prefix_slow else "close"
+            if close_col_slow in df_processed.columns:
+                df_processed['MA_SLOW_strat'] = _calculate_ema_rolling(df_processed[close_col_slow], int(strategy_params['slow_ma_period']))
+            else: df_processed['MA_SLOW_strat'] = np.nan
 
-        if buy_vol_col_name in df_processed.columns and sell_vol_col_name in df_processed.columns:
-            # Use the utility from data_utils
-            df_processed = data_utils.calculate_taker_pressure_ratio(
-                df_processed, buy_vol_col_name, sell_vol_col_name, "TakerPressureRatio_Raw_Temp"
-            )
-            if "TakerPressureRatio_Raw_Temp" in df_processed.columns and df_processed["TakerPressureRatio_Raw_Temp"].notna().any():
-                df_processed["TakerPressureRatio_MA_strat"] = _calculate_ema_rolling(
-                    df_processed["TakerPressureRatio_Raw_Temp"], period=taker_ma_period, 
-                    series_name_debug=f"TakerRatioMARaw_Src({taker_freq_raw_param})"
-                )
-                df_processed.drop(columns=["TakerPressureRatio_Raw_Temp"], inplace=True, errors='ignore')
+        # Pour TripleMAAnticipationStrategy (ajoute/surcharge les MAs)
+        if 'ma_short_period' in strategy_params and 'indicateur_frequence_mms' in strategy_params: # MMS = MA Mobile Short
+            k_pref_s = data_utils.get_kline_prefix_effective(str(strategy_params['indicateur_frequence_mms']))
+            c_col_s = f"{k_pref_s}_close" if k_pref_s else "close"
+            if c_col_s in df_processed.columns:
+                df_processed['MA_SHORT_strat'] = _calculate_ema_rolling(df_processed[c_col_s], int(strategy_params['ma_short_period']))
+            else: df_processed['MA_SHORT_strat'] = np.nan
+
+        if 'ma_medium_period' in strategy_params and 'indicateur_frequence_mmm' in strategy_params: # MMM = MA Mobile Medium
+            k_pref_m = data_utils.get_kline_prefix_effective(str(strategy_params['indicateur_frequence_mmm']))
+            c_col_m = f"{k_pref_m}_close" if k_pref_m else "close"
+            if c_col_m in df_processed.columns:
+                df_processed['MA_MEDIUM_strat'] = _calculate_ema_rolling(df_processed[c_col_m], int(strategy_params['ma_medium_period']))
+            else: df_processed['MA_MEDIUM_strat'] = np.nan
+        
+        if 'ma_long_period' in strategy_params and 'indicateur_frequence_mml' in strategy_params: # MML = MA Mobile Long
+            k_pref_l = data_utils.get_kline_prefix_effective(str(strategy_params['indicateur_frequence_mml']))
+            c_col_l = f"{k_pref_l}_close" if k_pref_l else "close"
+            if c_col_l in df_processed.columns:
+                df_processed['MA_LONG_strat'] = _calculate_ema_rolling(df_processed[c_col_l], int(strategy_params['ma_long_period']))
+            else: df_processed['MA_LONG_strat'] = np.nan
+        
+        # Pentes pour TripleMAAnticipation
+        if strategy_params.get('anticipate_crossovers', False) and 'anticipation_slope_period' in strategy_params:
+            slope_period = int(strategy_params['anticipation_slope_period'])
+            if slope_period >= 2:
+                if 'MA_SHORT_strat' in df_processed and df_processed['MA_SHORT_strat'].notna().any():
+                    df_processed['SLOPE_MA_SHORT_strat'] = ta.slope(df_processed['MA_SHORT_strat'].dropna(), length=slope_period, append=False).reindex(df_processed.index, method='ffill') # type: ignore
+                else: df_processed['SLOPE_MA_SHORT_strat'] = np.nan
+                
+                if 'MA_MEDIUM_strat' in df_processed and df_processed['MA_MEDIUM_strat'].notna().any():
+                    df_processed['SLOPE_MA_MEDIUM_strat'] = ta.slope(df_processed['MA_MEDIUM_strat'].dropna(), length=slope_period, append=False).reindex(df_processed.index, method='ffill') # type: ignore
+                else: df_processed['SLOPE_MA_MEDIUM_strat'] = np.nan
+
+
+    if 'psar_step' in strategy_params: # Indice de PsarReversalOtocoStrategy
+        kline_prefix_psar = data_utils.get_kline_prefix_effective(str(strategy_params.get('indicateur_frequence_psar')))
+        h_col = f"{kline_prefix_psar}_high" if kline_prefix_psar else "high"
+        l_col = f"{kline_prefix_psar}_low" if kline_prefix_psar else "low"
+        c_col = f"{kline_prefix_psar}_close" if kline_prefix_psar else "close" # PSAR utilise aussi close pour l'initialisation
+        if all(col in df_processed.columns for col in [h_col, l_col, c_col]):
+            psar_df = ta.psar(high=df_processed[h_col], low=df_processed[l_col], close=df_processed[c_col], # pandas-ta psar a besoin de close
+                              af=float(strategy_params['psar_step']), max_af=float(strategy_params['psar_max_step']), append=False)
+            if psar_df is not None and isinstance(psar_df, pd.DataFrame):
+                # Les noms de colonnes de ta.psar peuvent être PSARl_AF_MAX_AF, PSARs_AF_MAX_AF
+                psarl_col_name = next((col for col in psar_df.columns if 'psarl' in col.lower()), None)
+                psars_col_name = next((col for col in psar_df.columns if 'psars' in col.lower()), None)
+                if psarl_col_name: df_processed['PSARl_strat'] = psar_df[psarl_col_name].reindex(df_processed.index, method='ffill')
+                else: df_processed['PSARl_strat'] = np.nan
+                if psars_col_name: df_processed['PSARs_strat'] = psar_df[psars_col_name].reindex(df_processed.index, method='ffill')
+                else: df_processed['PSARs_strat'] = np.nan
             else:
-                df_processed["TakerPressureRatio_MA_strat"] = np.nan
+                df_processed['PSARl_strat'] = np.nan; df_processed['PSARs_strat'] = np.nan
         else:
-            logger.warning(f"{log_prefix} Source Taker columns ('{buy_vol_col_name}', '{sell_vol_col_name}') not found in df_processed. TakerPressureRatio_MA_strat will be NaN.")
-            df_processed["TakerPressureRatio_MA_strat"] = np.nan
+            df_processed['PSARl_strat'] = np.nan; df_processed['PSARs_strat'] = np.nan
 
-    # 7. Finalization and Save
-    strat_cols = [col for col in df_processed.columns if col.endswith('_strat')]
-    if strat_cols:
-        df_processed[strat_cols] = df_processed[strat_cols].ffill()
-        logger.debug(f"{log_prefix} Applied ffill to _strat columns: {strat_cols}")
 
-    df_final_to_save = df_processed.reset_index() # timestamp becomes a column
+    # 4. Finalisation et Sauvegarde
+    strat_cols_final = [col for col in df_processed.columns if col.endswith('_strat')]
+    if strat_cols_final:
+        df_processed[strat_cols_final] = df_processed[strat_cols_final].ffill()
+        logger.debug(f"{log_prefix} ffill appliqué aux colonnes _strat finales : {strat_cols_final}")
 
-    # Define desired column order
-    ordered_cols = ['timestamp'] + BASE_OHLCV_COLS
-    # Add aggregated Kline columns, sorted by timeframe then type
-    for window_mins, period_label_cfg in sorted(rolling_windows_to_calculate.items()):
-        for ohlcv_part in BASE_OHLCV_COLS:
-            ordered_cols.append(f"Kline_{period_label_cfg}_{ohlcv_part}")
-        for taker_part in BASE_TAKER_COLS:
-             ordered_cols.append(f"Kline_{period_label_cfg}_{taker_part}")
-    # Add _strat columns
-    ordered_cols.extend(sorted(strat_cols))
+    df_final_to_save = df_processed.reset_index() # 'timestamp' redevient une colonne
+
+    # Définir un ordre de colonnes logique pour la sortie
+    # Commencer par timestamp et OHLCV de base 1-min
+    ordered_output_cols: List[str] = ['timestamp'] + BASE_OHLCV_COLS
+    # Ajouter les colonnes Taker 1-min
+    ordered_output_cols.extend(col for col in BASE_TAKER_COLS if col in df_final_to_save.columns)
     
-    # Reindex, adding missing columns with NaN if any (should not happen if logic is correct)
-    current_cols_set = set(df_final_to_save.columns)
-    final_ordered_cols_present = [col for col in ordered_cols if col in current_cols_set]
-    # Add any other columns that might have been created but are not in the defined order (should be rare)
-    other_cols = [col for col in df_final_to_save.columns if col not in final_ordered_cols_present]
-    df_final_to_save = df_final_to_save[final_ordered_cols_present + other_cols]
+    # Ajouter les K-lines agrégées, groupées par timeframe puis par type (OHLCV, Taker)
+    # D'abord, extraire tous les préfixes Kline_ (ex: Kline_5min, Kline_1h)
+    kline_prefixes_present = sorted(list(set(
+        col.split('_')[0] + "_" + col.split('_')[1] # Ex: "Kline_5min"
+        for col in df_final_to_save.columns if col.startswith("Kline_")
+    )))
+
+    for k_pref in kline_prefixes_present:
+        for ohlcv_part in BASE_OHLCV_COLS: # o,h,l,c,v
+            col_name = f"{k_pref}_{ohlcv_part}"
+            if col_name in df_final_to_save.columns: ordered_output_cols.append(col_name)
+        for taker_part in BASE_TAKER_COLS:
+            col_name = f"{k_pref}_{taker_part}"
+            if col_name in df_final_to_save.columns: ordered_output_cols.append(col_name)
+            
+    # Ajouter les colonnes _strat (indicateurs finaux)
+    ordered_output_cols.extend(sorted(strat_cols_final))
+    
+    # S'assurer que toutes les colonnes de df_final_to_save sont dans ordered_output_cols
+    # et que l'ordre est appliqué.
+    final_columns_ordered_existing = [col for col in ordered_output_cols if col in df_final_to_save.columns]
+    # Ajouter les colonnes restantes qui n'étaient pas dans l'ordre défini (au cas où)
+    remaining_cols = [col for col in df_final_to_save.columns if col not in final_columns_ordered_existing]
+    df_final_to_save = df_final_to_save[final_columns_ordered_existing + remaining_cols]
 
     try:
         processed_output_path.parent.mkdir(parents=True, exist_ok=True)
         df_final_to_save.to_csv(processed_output_path, index=False, float_format='%.8f')
-        processing_time = time.time() - processing_start_time
-        logger.info(f"{log_prefix} Preprocessed live data saved to: {processed_output_path} "
-                    f"(Shape: {df_final_to_save.shape}, Time: {processing_time:.3f}s)")
+        processing_time_secs = time.time() - processing_start_time
+        logger.info(f"{log_prefix} Données live prétraitées sauvegardées dans : {processed_output_path} "
+                    f"(Shape: {df_final_to_save.shape}, Temps: {processing_time_secs:.3f}s)")
     except Exception as e_save:
-        logger.error(f"{log_prefix} Error saving processed live data to {processed_output_path}: {e_save}", exc_info=True)
-        return None # Return None if save fails
+        logger.error(f"{log_prefix} Erreur lors de la sauvegarde des données live prétraitées dans {processed_output_path}: {e_save}", exc_info=True)
+        return None
 
-    # Return the latest row of the processed data
-    return df_final_to_save if not df_final_to_save.empty else None
+    return df_final_to_save
 

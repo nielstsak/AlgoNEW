@@ -1,11 +1,18 @@
+# src/live/execution.py
+"""
+Ce module définit la classe OrderExecutionClient, responsable de toutes les
+interactions avec l'API de l'exchange (Binance). Cela inclut la récupération
+d'informations de compte, d'informations sur les symboles, et le
+placement/gestion des ordres sur marge.
+"""
 import logging
 import os
 import sys # Pour le logger initial si les imports échouent
 import time
 import json # Pour le logging de paramètres complexes
-from typing import Dict, Optional, Any, List, Union, Callable
+from typing import Dict, Optional, Any, List, Union, Callable, cast # cast ajouté
 
-import requests # Pour requests.exceptions.Timeout
+import requests # Pour requests.exceptions.Timeout et autres
 
 # Gestion des imports Binance avec fallback
 try:
@@ -15,571 +22,740 @@ try:
     from binance.exceptions import BinanceAPIException, BinanceRequestException, BinanceOrderException
     BINANCE_IMPORTS_OK = True
     BINANCE_VERSION = getattr(binance, '__version__', 'unknown')
-    logging.getLogger(__name__).info(f"Successfully imported python-binance version: {BINANCE_VERSION}")
-except ImportError as e_import:
+    # Le logger n'est pas encore configuré au niveau du module, donc pas de log ici.
+except ImportError as e_import_binance:
     BINANCE_IMPORTS_OK = False
     BINANCE_VERSION = 'not_installed'
-    logging.getLogger(__name__).critical(
-        f"CRITICAL FAILURE: python-binance library import failed: {e_import}. "
-        "The application will not be able to interact with the Binance API. "
-        "Please ensure 'python-binance' (version >= 1.0.19 recommended) is installed.",
+    # Logger un message critique si la bibliothèque est manquante.
+    # Utiliser un logger basique car le logging de l'application n'est peut-être pas encore prêt.
+    _initial_logger = logging.getLogger(__name__ + "_bootstrap")
+    _initial_logger.addHandler(logging.StreamHandler(sys.stderr))
+    _initial_logger.setLevel(logging.CRITICAL)
+    _initial_logger.critical(
+        f"ÉCHEC CRITIQUE (execution.py): L'import de la bibliothèque python-binance a échoué : {e_import_binance}. "
+        "L'application ne pourra pas interagir avec l'API Binance. "
+        "Veuillez vous assurer que 'python-binance' (version >= 1.0.19 recommandée) est installée.",
         exc_info=True
     )
-    # Définition de classes factices pour permettre au reste du module de se charger (pour analyse statique/tests limités)
-    # mais les opérations réelles échoueront.
-    class BinanceAPIException(Exception): pass
-    class BinanceRequestException(Exception): pass
-    class BinanceOrderException(Exception): pass
+    # Définition de classes factices pour permettre au reste du module de se charger
+    # (pour l'analyse statique ou des tests limités), mais les opérations réelles échoueront.
+    class BinanceAPIException(Exception): pass # type: ignore
+    class BinanceRequestException(Exception): pass # type: ignore
+    class BinanceOrderException(Exception): pass # type: ignore
     class BinanceSdkClient: # type: ignore
+        """Client SDK Binance factice pour fallback."""
+        KLINE_INTERVAL_1MINUTE = "1m" # Constante de classe
+        ORDER_TYPE_LIMIT = 'LIMIT'
+        ORDER_TYPE_MARKET = 'MARKET'
+        # ... autres constantes si nécessaires pour le typage ...
+
         def __init__(self, api_key=None, api_secret=None, tld='com', testnet=False, requests_params=None):
-            logging.critical("Dummy BinanceSdkClient used due to import failure. API calls will NOT work.")
-        def ping(self): raise NotImplementedError("Dummy BinanceSdkClient")
+            _initial_logger.critical("Utilisation du client BinanceSdkClient FACTICE en raison d'un échec d'importation. Les appels API NE fonctionneront PAS.")
+        def ping(self): raise NotImplementedError("BinanceSdkClient factice")
         def get_server_time(self): return {'serverTime': int(time.time() * 1000)}
-        def get_symbol_info(self, symbol): raise NotImplementedError("Dummy BinanceSdkClient")
-        def get_isolated_margin_account(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def get_margin_account(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def get_open_margin_orders(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def get_all_oco_orders(self, **params): raise NotImplementedError("Dummy BinanceSdkClient") # Note: params for this can be tricky
-        def get_margin_order(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def get_all_margin_orders(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def create_margin_order(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def create_margin_oco_order(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def repay_margin_loan(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def cancel_margin_order(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def cancel_margin_oco_order(self, **params): raise NotImplementedError("Dummy BinanceSdkClient")
-        def close(self): pass # Dummy close
+        def get_exchange_info(self): raise NotImplementedError("BinanceSdkClient factice") # Ajouté
+        def get_symbol_info(self, symbol): raise NotImplementedError("BinanceSdkClient factice")
+        def get_isolated_margin_account(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def get_margin_account(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def get_open_margin_orders(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def get_all_oco_orders(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def get_margin_order(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        # def get_all_margin_orders(self, **params): raise NotImplementedError("BinanceSdkClient factice") # Moins utilisé, peut être omis
+        def create_margin_order(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def create_margin_oco_order(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def repay_margin_loan(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def cancel_margin_order(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def cancel_margin_oco_order(self, **params): raise NotImplementedError("BinanceSdkClient factice")
+        def close_connection(self): pass # Méthode de fermeture factice
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__) # Logger standard pour le reste du module
 
-ACCOUNT_TYPE_MAP = {
-    "SPOT": "SPOT", # Bien que ce client soit orienté marge, SPOT est un type valide.
+ACCOUNT_TYPE_MAP: Dict[str, str] = {
+    "SPOT": "SPOT",
     "MARGIN": "MARGIN", # Cross Margin
     "ISOLATED_MARGIN": "ISOLATED_MARGIN",
-    "FUTURES": "FUTURES_USD_M" # Exemple, non entièrement supporté par ce client pour les ordres.
+    "FUTURES_USDT": "FUTURES_USDT", # Pour USD-M Futures
+    "FUTURES_COIN": "FUTURES_COIN"  # Pour COIN-M Futures (non entièrement géré par ce client pour les ordres)
 }
-USDC_ASSET = "USDC" # Ou BUSD, USDT selon la paire de cotation principale
-DEFAULT_API_TIMEOUT_SECONDS = 15 # Augmenté légèrement
+# Actif de cotation principal (peut être rendu configurable si d'autres sont utilisés)
+USDC_ASSET = "USDC" # Ou BUSD, USDT, etc.
+DEFAULT_API_TIMEOUT_SECONDS = 15
 MAX_API_RETRIES = 3
-INITIAL_RETRY_DELAY_SECONDS = 2.0 # Float pour time.sleep
+INITIAL_RETRY_DELAY_SECONDS = 2.0
+
 
 class OrderExecutionClient:
+    """
+    Client pour interagir avec l'API de l'exchange (Binance), gérant les appels API,
+    la récupération d'informations, et le placement/gestion des ordres sur marge.
+    """
     def __init__(self,
                  api_key: Optional[str],
                  api_secret: Optional[str],
-                 account_type: str = "MARGIN",
+                 account_type: str = "MARGIN", # Ex: "SPOT", "MARGIN", "ISOLATED_MARGIN", "FUTURES_USDT"
                  is_testnet: bool = False):
+        """
+        Initialise le client d'exécution d'ordres.
+
+        Args:
+            api_key (Optional[str]): Clé API Binance.
+            api_secret (Optional[str]): Secret API Binance.
+            account_type (str): Type de compte à utiliser. Valeurs valides dans ACCOUNT_TYPE_MAP.
+                                Par défaut "MARGIN" (cross margin).
+            is_testnet (bool): Si True, utilise l'environnement de testnet de Binance.
+                               Par défaut False.
         
-        self.log_prefix = f"[ExecClient][{account_type.upper()}{'-TESTNET' if is_testnet else ''}]"
-        logger.info(f"{self.log_prefix} Initializing...")
+        Raises:
+            ImportError: Si la bibliothèque python-binance n'est pas installée.
+            ValueError: Si les clés API sont manquantes ou si account_type est invalide.
+            ConnectionError: Si l'initialisation du client SDK Binance échoue.
+        """
+        self.log_prefix = f"[OrderExecClient][{account_type.upper()}{'-TESTNET' if is_testnet else ''}]"
+        logger.info(f"{self.log_prefix} Initialisation...")
 
         if not BINANCE_IMPORTS_OK:
-            # Log critique déjà émis lors de l'échec de l'import
-            raise ImportError(
-                "OrderExecutionClient cannot function because python-binance library failed to import."
-            )
+            # Le message critique a déjà été loggué au niveau du module.
+            raise ImportError("OrderExecutionClient ne peut pas fonctionner car la bibliothèque python-binance n'a pas pu être importée.")
 
-        self.api_key = api_key
-        self.api_secret = api_secret
-
-        if not self.api_key or not self.api_secret:
-            logger.error(f"{self.log_prefix} Binance API key or secret not provided.")
-            raise ValueError("Binance API key and secret are required.")
+        if not api_key or not api_secret:
+            msg = "Clé API et Secret API Binance sont requis."
+            logger.error(f"{self.log_prefix} {msg}")
+            raise ValueError(msg)
         
-        self.raw_account_type = account_type.upper()
-        self.mapped_account_type = ACCOUNT_TYPE_MAP.get(self.raw_account_type)
+        self.api_key: str = api_key
+        self.api_secret: str = api_secret
+
+        self.raw_account_type: str = account_type.upper()
+        self.mapped_account_type: Optional[str] = ACCOUNT_TYPE_MAP.get(self.raw_account_type)
         
         if not self.mapped_account_type:
-            logger.warning(f"{self.log_prefix} Unsupported account_type '{account_type}'. Defaulting to MARGIN.")
+            logger.warning(f"{self.log_prefix} account_type '{account_type}' non supporté ou invalide. "
+                           f"Options valides : {list(ACCOUNT_TYPE_MAP.keys())}. Utilisation de 'MARGIN' par défaut.")
             self.mapped_account_type = "MARGIN" # Cross Margin
             self.raw_account_type = "MARGIN"
 
-        self.is_testnet = is_testnet
-        self.is_isolated_margin_trading = (self.raw_account_type == "ISOLATED_MARGIN")
+        self.is_testnet: bool = is_testnet
+        self.is_isolated_margin_trading: bool = (self.raw_account_type == "ISOLATED_MARGIN")
         
         try:
             requests_params = {'timeout': DEFAULT_API_TIMEOUT_SECONDS}
-            # Utiliser BinanceSdkClient (le SDK Binance)
             self.client: BinanceSdkClient = BinanceSdkClient(
                 self.api_key, self.api_secret, testnet=self.is_testnet, requests_params=requests_params
             )
-            logger.info(f"{self.log_prefix} Binance SDK Client initialized (Testnet: {self.is_testnet}).")
-        except Exception as e_init:
-            logger.critical(f"{self.log_prefix} Failed to initialize Binance SDK Client: {e_init}", exc_info=True)
-            raise ConnectionError(f"Binance SDK Client initialization failed: {e_init}") from e_init
+            logger.info(f"{self.log_prefix} Client SDK Binance initialisé (Testnet: {self.is_testnet}). Version SDK: {BINANCE_VERSION}")
+        except Exception as e_init_sdk:
+            logger.critical(f"{self.log_prefix} Échec de l'initialisation du client SDK Binance : {e_init_sdk}", exc_info=True)
+            raise ConnectionError(f"Initialisation du client SDK Binance échouée : {e_init_sdk}") from e_init_sdk
 
         self._symbol_info_cache: Dict[str, Dict[str, Any]] = {}
-        logger.info(f"{self.log_prefix} OrderExecutionClient initialized successfully.")
+        self._exchange_info_cache: Optional[Dict[str, Any]] = None # Cache pour get_exchange_info_raw
+        
+        logger.info(f"{self.log_prefix} OrderExecutionClient initialisé avec succès.")
 
-    def _prepare_margin_params(self, params: Dict[str, Any], symbol_for_isolated: Optional[str] = None) -> Dict[str, Any]:
+    def _make_api_call(self,
+                       api_method: Callable[..., Any],
+                       log_context_override: Optional[str] = None,
+                       **kwargs: Any) -> Optional[Any]:
         """
-        Adds 'isIsolated' parameter if operating on an ISOLATED_MARGIN account type
-        and the symbol matches, or if it's a general MARGIN (cross) account.
+        Wrapper robuste pour les appels à l'API Binance, gérant les re-essais et les erreurs.
+
+        Args:
+            api_method (Callable[..., Any]): La méthode du client SDK Binance à appeler.
+            log_context_override (Optional[str]): Contexte de log spécifique pour cet appel.
+                                                  Si None, le nom de api_method est utilisé.
+            **kwargs: Arguments à passer à api_method.
+
+        Returns:
+            Optional[Any]: La réponse brute de l'API en cas de succès, ou un dictionnaire
+                           standardisé `{"status": "ERROR", ...}` en cas d'échec après
+                           re-essais, ou None si une erreur imprévue majeure survient.
         """
-        prepared_params = params.copy()
-        if self.raw_account_type == "ISOLATED_MARGIN":
-            if symbol_for_isolated and prepared_params.get('symbol', '').upper() == symbol_for_isolated.upper():
-                prepared_params['isIsolated'] = "TRUE"
-            elif not symbol_for_isolated and 'symbol' in prepared_params : # If symbol_for_isolated not given, but symbol is in params
-                 prepared_params['isIsolated'] = "TRUE" # Assume it's for this isolated pair
-            # If symbol_for_isolated is given but doesn't match, or if no symbol at all, it's an issue.
-            # The calling function should ensure symbol_for_isolated is correct for isolated margin operations.
-        elif self.raw_account_type == "MARGIN": # Cross Margin
-            # isIsolated is typically not sent or can be "FALSE" for cross margin.
-            # Some endpoints might require it to be "FALSE" if the parameter is supported.
-            # For safety, if an endpoint *could* take isIsolated, and we are cross, set to FALSE.
-            # However, many cross margin endpoints don't use this param.
-            # The python-binance SDK handles this for most cases.
-            # We will explicitly add it if the method is known to support it for cross.
-            # For now, we assume the SDK handles it or the specific methods will add it if needed.
-            pass
-        return prepared_params
+        num_retries = MAX_API_RETRIES
+        current_retry_delay = INITIAL_RETRY_DELAY_SECONDS
+        
+        effective_log_context = log_context_override if log_context_override else \
+                                (api_method.__name__ if hasattr(api_method, '__name__') else 'unknown_api_method')
 
-    def _make_api_call(self, api_method: Callable[..., Any], *args: Any, **kwargs: Any) -> Optional[Any]:
-        num_retries = kwargs.pop('num_retries', MAX_API_RETRIES)
-        current_retry_delay = kwargs.pop('initial_delay', INITIAL_RETRY_DELAY_SECONDS) # Use this for current delay
-        log_context = kwargs.pop('log_context', api_method.__name__ if hasattr(api_method, '__name__') else 'unknown_api_method')
-
-        # Remove internal params before passing to SDK method
-        kwargs.pop('initial_delay', None)
-
-
+        # Tronquer les kwargs pour le logging si nécessaire (ex: données de payload volumineuses)
+        # Pour l'instant, on logue les kwargs tels quels, en supposant qu'ils ne sont pas trop gros.
+        # Si des secrets sont passés directement (ce qui ne devrait pas être le cas ici), ils seraient loggués.
+        # Les clés API sont dans self.client, pas dans kwargs pour les méthodes du SDK.
+        
         for attempt in range(num_retries):
             try:
-                logger.debug(f"{self.log_prefix}[{log_context}] API call attempt {attempt + 1}/{num_retries}. Args: {args}, Kwargs: {json.dumps(kwargs, default=str)[:200]}...")
-                response = api_method(*args, **kwargs)
-                logger.debug(f"{self.log_prefix}[{log_context}] API response received: {str(response)[:300]}...") # Log snippet
-                return response
-            except BinanceAPIException as e:
-                logger.error(f"{self.log_prefix}[{log_context}] Binance API Exception (Attempt {attempt + 1}/{num_retries}): Code={e.code}, Msg='{e.message}'")
-                if e.code == -1021: # Timestamp error
-                    logger.warning(f"{self.log_prefix}[{log_context}] Timestamp error (-1021). Check system clock sync. No retry for this.")
-                    return {"status": "ERROR", "code": e.code, "message": e.message, "is_timestamp_error": True} # Special return
-                if e.status_code in [429, 418] or e.code == -1003: # Rate limit or IP ban
-                    if attempt < num_retries - 1:
-                        logger.warning(f"{self.log_prefix}[{log_context}] Rate limit (HTTP {e.status_code}, Code {e.code}). Retrying in {current_retry_delay:.2f}s...")
-                        time.sleep(current_retry_delay)
-                        current_retry_delay *= 2 # Exponential backoff
-                        continue
-                # For other BinanceAPIErrors, decide if retry is useful. Some are permanent.
-                # e.g. -2010 (Insufficient balance), -1121 (Invalid symbol) should not be retried indefinitely.
-                # For now, we retry all non-timestamp BinanceAPIErrors up to num_retries.
-                if attempt < num_retries - 1:
-                    time.sleep(current_retry_delay)
-                    current_retry_delay *= 1.5 # Gentler backoff for other errors
-                    continue
-                logger.error(f"{self.log_prefix}[{log_context}] Max retries reached after Binance API error.")
-                return {"status": "ERROR", "code": e.code, "message": e.message} # Return error dict
-            except BinanceRequestException as e: # Errors in request parameters, etc. Usually not recoverable by retry.
-                logger.error(f"{self.log_prefix}[{log_context}] Binance Request Exception: {e}. No retry.")
-                return {"status": "ERROR", "message": f"Request Exception: {e}"}
+                # Utiliser json.dumps avec default=str pour les kwargs peut aider si des objets non sérialisables sont passés,
+                # mais les méthodes du SDK Binance attendent généralement des types simples.
+                logger.debug(f"{self.log_prefix}[{effective_log_context}] Appel API (tentative {attempt + 1}/{num_retries}). "
+                             f"Params: {json.dumps(kwargs, default=str, indent=None, ensure_ascii=False)[:250]}...") # Tronquer pour lisibilité
+                
+                response = api_method(**kwargs)
+                
+                # Loguer un snippet de la réponse pour le débogage
+                response_str_snippet = str(response)
+                if len(response_str_snippet) > 300:
+                    response_str_snippet = response_str_snippet[:297] + "..."
+                logger.debug(f"{self.log_prefix}[{effective_log_context}] Réponse API reçue : {response_str_snippet}")
+                return response # Succès
+            
+            except BinanceAPIException as e_api:
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Exception API Binance (Tentative {attempt + 1}/{num_retries}): "
+                             f"HTTP={e_api.status_code}, Code={e_api.code}, Msg='{e_api.message}'")
+                if e_api.code == -1021: # Erreur de timestamp -> synchro horloge système nécessaire
+                    logger.warning(f"{self.log_prefix}[{effective_log_context}] Erreur de timestamp (-1021). "
+                                   "Vérifiez la synchronisation de l'horloge système. Pas de re-essai pour cette erreur.")
+                    return {"status": "ERROR", "code": e_api.code, "message": e_api.message, "is_timestamp_error": True}
+                
+                is_rate_limit = e_api.status_code in [429, 418] or e_api.code == -1003 # Rate limit ou IP ban
+                if attempt < num_retries - 1: # Si ce n'est pas la dernière tentative
+                    delay_multiplier = 2.0 if is_rate_limit else 1.5 # Backoff plus agressif pour rate limit
+                    actual_sleep_time = current_retry_delay * delay_multiplier
+                    log_level = logging.WARNING if is_rate_limit else logging.INFO
+                    logger.log(log_level, f"{self.log_prefix}[{effective_log_context}] Re-essai dans {actual_sleep_time:.2f}s...")
+                    time.sleep(actual_sleep_time)
+                    current_retry_delay = actual_sleep_time # Augmenter le délai pour le prochain re-essai potentiel
+                    continue # Passer à la prochaine tentative
+                else: # Dernière tentative échouée
+                    logger.error(f"{self.log_prefix}[{effective_log_context}] Nombre maximum de re-essais atteint après exception API Binance.")
+                    return {"status": "ERROR", "code": e_api.code, "message": f"Max retries: {e_api.message}"}
+
+            except BinanceRequestException as e_req: # Erreurs dans les paramètres de la requête, etc. Généralement non récupérables par re-essai.
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Exception de Requête Binance : {e_req}. Pas de re-essai.", exc_info=True)
+                return {"status": "ERROR", "message": f"Request Exception: {str(e_req)}"}
+            
             except requests.exceptions.Timeout as e_timeout:
-                logger.error(f"{self.log_prefix}[{log_context}] Request Timeout (Attempt {attempt + 1}/{num_retries}): {e_timeout}")
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Timeout de la requête (Tentative {attempt + 1}/{num_retries}): {e_timeout}")
                 if attempt < num_retries - 1:
                     time.sleep(current_retry_delay)
-                    current_retry_delay *= 2
+                    current_retry_delay *= 2 # Backoff exponentiel
                     continue
-                logger.error(f"{self.log_prefix}[{log_context}] Max retries reached after Timeout.")
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Nombre maximum de re-essais atteint après Timeout.")
                 return {"status": "ERROR", "message": "Request Timeout"}
+
             except requests.exceptions.ConnectionError as e_conn:
-                logger.error(f"{self.log_prefix}[{log_context}] Connection Error (Attempt {attempt + 1}/{num_retries}): {e_conn}")
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Erreur de Connexion (Tentative {attempt + 1}/{num_retries}): {e_conn}")
                 if attempt < num_retries - 1:
                     time.sleep(current_retry_delay)
                     current_retry_delay *= 2
                     continue
-                logger.error(f"{self.log_prefix}[{log_context}] Max retries reached after Connection Error.")
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Nombre maximum de re-essais atteint après Erreur de Connexion.")
                 return {"status": "ERROR", "message": "Connection Error"}
-            except Exception as e_general:
-                logger.error(f"{self.log_prefix}[{log_context}] Unexpected error during API call (Attempt {attempt + 1}/{num_retries}): {e_general}", exc_info=True)
+
+            except Exception as e_general: # pylint: disable=broad-except
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Erreur inattendue durant l'appel API (Tentative {attempt + 1}/{num_retries}): {e_general}", exc_info=True)
                 if attempt < num_retries - 1:
                     time.sleep(current_retry_delay)
                     current_retry_delay *= 1.5
                     continue
-                logger.error(f"{self.log_prefix}[{log_context}] Max retries reached after unexpected error.")
-                return {"status": "ERROR", "message": f"Unexpected error: {e_general}"}
-        return None # Should be unreachable if errors return dicts, but as a fallback
+                logger.error(f"{self.log_prefix}[{effective_log_context}] Nombre maximum de re-essais atteint après erreur inattendue.")
+                return {"status": "ERROR", "message": f"Unexpected error: {str(e_general)}"}
+        
+        # Si la boucle se termine sans succès (ne devrait pas arriver si les erreurs retournent un dict)
+        logger.critical(f"{self.log_prefix}[{effective_log_context}] La boucle _make_api_call s'est terminée sans succès ni retour d'erreur explicite. C'est inattendu.")
+        return None
+
 
     def test_connection(self) -> bool:
-        """Tests API connection by pinging and getting server time."""
+        """
+        Teste la connexion à l'API en effectuant un ping et en récupérant l'heure du serveur.
+
+        Returns:
+            bool: True si la connexion est réussie, False sinon.
+        """
         log_ctx = "test_connection"
         try:
-            ping_response = self._make_api_call(self.client.ping, log_context=f"{log_ctx}_ping")
-            # ping() returns None on success or raises exception.
-            # We need to check if it raised an exception implicitly via _make_api_call returning error dict.
+            # client.ping() retourne None en cas de succès, ou lève une exception.
+            # _make_api_call gère les exceptions et retourne un dict d'erreur si échec.
+            ping_response = self._make_api_call(self.client.ping, log_context_override=f"{log_ctx}_ping")
             if isinstance(ping_response, dict) and ping_response.get("status") == "ERROR":
-                logger.error(f"{self.log_prefix}[{log_ctx}] Ping failed: {ping_response.get('message')}")
+                logger.error(f"{self.log_prefix}[{log_ctx}] Ping API échoué : {ping_response.get('message')}")
                 return False
+            # Si ping_response n'est pas un dict d'erreur, c'est un succès (None).
             
-            server_time_response = self._make_api_call(self.client.get_server_time, log_context=f"{log_ctx}_getServerTime")
+            server_time_response = self._make_api_call(self.client.get_server_time, log_context_override=f"{log_ctx}_getServerTime")
             if server_time_response and isinstance(server_time_response, dict) and server_time_response.get('serverTime'):
-                logger.info(f"{self.log_prefix}[{log_ctx}] API connection successful. Server time: {server_time_response['serverTime']}")
+                logger.info(f"{self.log_prefix}[{log_ctx}] Connexion API réussie. Heure serveur : {server_time_response['serverTime']}")
                 return True
             else:
-                logger.error(f"{self.log_prefix}[{log_ctx}] Failed to get server time. Response: {server_time_response}")
+                err_msg = server_time_response.get('message') if isinstance(server_time_response, dict) else str(server_time_response)
+                logger.error(f"{self.log_prefix}[{log_ctx}] Échec de la récupération de l'heure du serveur. Réponse : {err_msg}")
                 return False
-        except Exception as e: # Catch any other exception during the process
-            logger.error(f"{self.log_prefix}[{log_ctx}] Exception during connection test: {e}", exc_info=True)
+        except Exception as e: # Attraper toute autre exception durant le processus
+            logger.error(f"{self.log_prefix}[{log_ctx}] Exception durant le test de connexion : {e}", exc_info=True)
             return False
 
+    def get_exchange_info_raw(self) -> Optional[Dict[str, Any]]:
+        """
+        Récupère les informations complètes de l'exchange (exchangeInfo).
+        Utilisé par ExchangeInfoProvider pour mettre à jour son cache.
+
+        Returns:
+            Optional[Dict[str, Any]]: Les informations brutes de l'exchange, ou None en cas d'erreur.
+        """
+        log_ctx = "get_exchange_info_raw"
+        logger.debug(f"{self.log_prefix}[{log_ctx}] Récupération des informations complètes de l'exchange.")
+        
+        # Utiliser le client SDK Binance directement car cette méthode est standard
+        if hasattr(self.client, 'get_exchange_info'):
+            response = self._make_api_call(self.client.get_exchange_info, log_context_override=log_ctx)
+            if response and isinstance(response, dict) and "symbols" in response and not response.get("status") == "ERROR":
+                logger.info(f"{self.log_prefix}[{log_ctx}] Informations de l'exchange récupérées avec succès ({len(response.get('symbols',[]))} symboles).")
+                return response
+            else:
+                err_msg = response.get('message') if isinstance(response, dict) else str(response)
+                logger.error(f"{self.log_prefix}[{log_ctx}] Échec de la récupération des informations de l'exchange. Réponse : {err_msg}")
+                return None
+        else:
+            logger.error(f"{self.log_prefix}[{log_ctx}] La méthode get_exchange_info n'est pas disponible sur le client SDK.")
+            return None
+
+
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Retrieves and caches symbol information from the exchange."""
+        """
+        Récupère et met en cache les informations pour un symbole spécifique de l'exchange.
+
+        Args:
+            symbol (str): Le symbole de la paire de trading (ex: BTCUSDT).
+
+        Returns:
+            Optional[Dict[str, Any]]: Un dictionnaire contenant les informations du symbole
+                                      si trouvé et récupéré avec succès, sinon None.
+        """
         symbol_upper = symbol.upper()
         log_ctx = f"get_symbol_info_{symbol_upper}"
+
         if symbol_upper not in self._symbol_info_cache:
-            logger.debug(f"{self.log_prefix}[{log_ctx}] Cache miss. Fetching from API...")
-            info = self._make_api_call(self.client.get_symbol_info, symbol_upper, log_context=log_ctx)
-            if info and isinstance(info, dict) and not (info.get("status") == "ERROR"): # Check it's not an error dict from _make_api_call
+            logger.debug(f"{self.log_prefix}[{log_ctx}] Cache miss. Récupération depuis l'API...")
+            # L'appel à get_symbol_info du SDK Binance est direct.
+            info = self._make_api_call(self.client.get_symbol_info, symbol=symbol_upper, log_context_override=log_ctx)
+            
+            if info and isinstance(info, dict) and not (info.get("status") == "ERROR"):
                 self._symbol_info_cache[symbol_upper] = info
-                logger.info(f"{self.log_prefix}[{log_ctx}] Symbol info cached.")
+                logger.info(f"{self.log_prefix}[{log_ctx}] Informations du symbole mises en cache.")
             else:
-                logger.error(f"{self.log_prefix}[{log_ctx}] Failed to fetch symbol info. Response: {info}")
-                return None
+                err_msg = info.get('message') if isinstance(info, dict) else str(info)
+                logger.error(f"{self.log_prefix}[{log_ctx}] Échec de la récupération des informations du symbole. Réponse : {err_msg}")
+                return None # Ne pas mettre en cache une réponse d'erreur
         else:
             logger.debug(f"{self.log_prefix}[{log_ctx}] Cache hit.")
         return self._symbol_info_cache.get(symbol_upper)
 
+
     def get_margin_asset_balance(self, asset: str, symbol_pair_for_isolated: Optional[str] = None) -> Optional[float]:
-        """Gets the 'free' balance of a specific asset in the margin account."""
+        """
+        Récupère le solde 'free' (disponible) d'un actif spécifique dans le compte sur marge.
+
+        Args:
+            asset (str): Le symbole de l'actif (ex: "USDT", "BTC").
+            symbol_pair_for_isolated (Optional[str]): Requis si le compte est de type
+                ISOLATED_MARGIN, spécifie la paire de marge isolée (ex: "BTCUSDT").
+                Ignoré pour les comptes MARGIN (cross).
+
+        Returns:
+            Optional[float]: Le solde disponible de l'actif, ou None en cas d'erreur.
+                             Retourne 0.0 si l'actif n'est pas trouvé avec un solde.
+        """
         asset_upper = asset.upper()
         log_ctx = f"get_margin_balance_{asset_upper}"
         
-        account_details: Optional[Dict[str, Any]] = None
+        account_details_response: Optional[Dict[str, Any]] = None
         try:
             if self.is_isolated_margin_trading:
                 if not symbol_pair_for_isolated:
-                    logger.error(f"{self.log_prefix}[{log_ctx}] symbol_pair_for_isolated is required for ISOLATED_MARGIN account type.")
+                    logger.error(f"{self.log_prefix}[{log_ctx}] symbol_pair_for_isolated est requis pour le type de compte ISOLATED_MARGIN.")
                     return None
                 log_ctx += f"_iso_{symbol_pair_for_isolated.upper()}"
-                # The 'symbols' parameter for get_isolated_margin_account can take a single symbol string
-                account_details_response = self._make_api_call(self.client.get_isolated_margin_account, symbols=symbol_pair_for_isolated.upper(), log_context=log_ctx)
-                if account_details_response and isinstance(account_details_response, dict) and 'assets' in account_details_response:
-                    account_details = account_details_response # The response itself is the dict for one symbol pair
-                elif isinstance(account_details_response, list) and account_details_response: # If API changes to list for single symbol
-                     account_details = account_details_response[0]
-
+                # Le SDK python-binance pour get_isolated_margin_account avec un seul symbole dans `symbols`
+                # retourne un dictionnaire contenant les détails de cette paire.
+                account_details_response = self._make_api_call(self.client.get_isolated_margin_account, symbols=symbol_pair_for_isolated.upper(), log_context_override=log_ctx)
+            
             elif self.raw_account_type == "MARGIN": # Cross Margin
-                account_details = self._make_api_call(self.client.get_margin_account, log_context=log_ctx)
+                account_details_response = self._make_api_call(self.client.get_margin_account, log_context_override=log_ctx)
             else:
-                logger.error(f"{self.log_prefix}[{log_ctx}] Unsupported account type for get_margin_asset_balance: {self.raw_account_type}")
+                logger.error(f"{self.log_prefix}[{log_ctx}] Type de compte non supporté pour get_margin_asset_balance : {self.raw_account_type}")
                 return None
 
-            if not account_details or (isinstance(account_details, dict) and account_details.get("status") == "ERROR"):
-                logger.warning(f"{self.log_prefix}[{log_ctx}] Failed to fetch account details. Response: {account_details}")
+            if not account_details_response or (isinstance(account_details_response, dict) and account_details_response.get("status") == "ERROR"):
+                err_msg = account_details_response.get('message') if isinstance(account_details_response, dict) else str(account_details_response)
+                logger.warning(f"{self.log_prefix}[{log_ctx}] Échec de la récupération des détails du compte. Réponse : {err_msg}")
                 return None
 
-            asset_info: Optional[Dict[str, Any]] = None
-            if self.is_isolated_margin_trading and isinstance(account_details, dict) and 'assets' in account_details:
-                # For isolated, account_details is for a single pair, structure is different.
-                # The response for a single symbol is a dict like:
-                # {"assets": [{"baseAsset": {...}, "quoteAsset": {...}, "symbol": "BTCUSDT", ...}]}
-                # If the API returns a list even for one symbol:
-                # actual_pair_data = next((p_data for p_data in account_details.get('assets',[]) if p_data.get('symbol') == symbol_pair_for_isolated.upper()), None)
-                # For now, assuming if symbols=ONE_PAIR, response is dict for that pair directly.
-                # The python-binance SDK for get_isolated_margin_account(symbols='BTCUSDT') returns a dict.
-                # If symbols='BTCUSDT,ETHUSDT', it returns a dict with an 'assets' key which is a list.
-                # Let's assume the SDK normalizes this if a single symbol string is passed to `symbols`.
-                # The structure from SDK for single symbol in `symbols` is:
-                # { 'assets': [ { 'baseAsset': ..., 'quoteAsset': ..., 'symbol': 'THE_SYMBOL_PAIR', ... } ] }
-                # So we need to iterate `assets` list.
-                pair_assets_list = account_details.get('assets', [])
-                if pair_assets_list:
-                    pair_data = pair_assets_list[0] # Assuming single symbol query returns list with one item
-                    if pair_data.get('baseAsset', {}).get('asset', '').upper() == asset_upper:
-                        asset_info = pair_data.get('baseAsset')
-                    elif pair_data.get('quoteAsset', {}).get('asset', '').upper() == asset_upper:
-                        asset_info = pair_data.get('quoteAsset')
-            elif self.raw_account_type == "MARGIN" and isinstance(account_details, dict) and 'userAssets' in account_details: # Cross
-                asset_info = next((a for a in account_details.get('userAssets', []) if a.get('asset', '').upper() == asset_upper), None)
+            asset_data_found: Optional[Dict[str, Any]] = None
+            if self.is_isolated_margin_trading and isinstance(account_details_response, dict) and 'assets' in account_details_response:
+                # La réponse pour un symbole isolé est une liste contenant un dict pour la paire.
+                isolated_pair_assets_list = account_details_response.get('assets', [])
+                if isolated_pair_assets_list:
+                    pair_specific_data = isolated_pair_assets_list[0] # Prendre le premier (et unique) élément
+                    if pair_specific_data.get('baseAsset', {}).get('asset', '').upper() == asset_upper:
+                        asset_data_found = pair_specific_data.get('baseAsset')
+                    elif pair_specific_data.get('quoteAsset', {}).get('asset', '').upper() == asset_upper:
+                        asset_data_found = pair_specific_data.get('quoteAsset')
+            elif self.raw_account_type == "MARGIN" and isinstance(account_details_response, dict) and 'userAssets' in account_details_response: # Cross
+                asset_data_found = next((a for a in account_details_response.get('userAssets', []) if a.get('asset', '').upper() == asset_upper), None)
 
-            if asset_info and 'free' in asset_info:
-                balance = float(asset_info['free'])
-                logger.info(f"{self.log_prefix}[{log_ctx}] Free balance for {asset_upper}: {balance}")
+            if asset_data_found and 'free' in asset_data_found:
+                balance = float(asset_data_found['free'])
+                logger.info(f"{self.log_prefix}[{log_ctx}] Solde disponible pour {asset_upper} : {balance}")
                 return balance
             else:
-                logger.warning(f"{self.log_prefix}[{log_ctx}] Asset {asset_upper} not found or 'free' balance missing in account details.")
-                return 0.0 # Asset might not be in margin wallet or no balance
+                logger.warning(f"{self.log_prefix}[{log_ctx}] Actif {asset_upper} non trouvé ou solde 'free' manquant dans les détails du compte.")
+                return 0.0 # Actif non présent ou solde nul
 
-        except Exception as e:
-            logger.error(f"{self.log_prefix}[{log_ctx}] Error getting margin asset balance for {asset_upper}: {e}", exc_info=True)
+        except Exception as e: # pylint: disable=broad-except
+            logger.error(f"{self.log_prefix}[{log_ctx}] Erreur lors de la récupération du solde de l'actif {asset_upper} sur marge : {e}", exc_info=True)
             return None
 
     def get_margin_usdc_balance(self, symbol_pair_for_isolated: Optional[str] = None) -> Optional[float]:
-        """Convenience method to get the USDC balance in the margin account."""
+        """
+        Raccourci pour récupérer le solde USDC disponible dans le compte sur marge.
+
+        Args:
+            symbol_pair_for_isolated (Optional[str]): Requis si compte ISOLATED_MARGIN.
+
+        Returns:
+            Optional[float]: Solde USDC disponible, ou None en cas d'erreur.
+        """
         return self.get_margin_asset_balance(USDC_ASSET, symbol_pair_for_isolated=symbol_pair_for_isolated)
 
     def get_active_margin_loans(self, asset: Optional[str] = None, isolated_symbol_pair: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Gets active margin loans, optionally filtered by asset."""
-        asset_filter = asset.upper() if asset else None
-        log_ctx = f"get_active_loans_{asset_filter or 'ALL'}"
+        """
+        Récupère les prêts sur marge actifs, optionnellement filtrés par actif.
+
+        Args:
+            asset (Optional[str]): Symbole de l'actif à filtrer (ex: "BTC"). Si None, retourne les prêts pour tous les actifs.
+            isolated_symbol_pair (Optional[str]): Requis si compte ISOLATED_MARGIN.
+
+        Returns:
+            List[Dict[str, Any]]: Liste des prêts actifs. Chaque dict contient 'asset', 'borrowed', etc.
+                                  Retourne une liste vide en cas d'erreur ou si aucun prêt.
+        """
+        asset_filter_upper = asset.upper() if asset else None
+        log_ctx = f"get_active_loans_{asset_filter_upper or 'ALL'}"
         
-        account_details: Optional[Dict[str, Any]] = None
-        active_loans_found: List[Dict[str, Any]] = []
+        account_details_response: Optional[Dict[str, Any]] = None
+        active_loans_list: List[Dict[str, Any]] = []
         try:
             if self.is_isolated_margin_trading:
                 if not isolated_symbol_pair:
-                    logger.error(f"{self.log_prefix}[{log_ctx}] symbol_pair_for_isolated is required for ISOLATED_MARGIN loans.")
+                    logger.error(f"{self.log_prefix}[{log_ctx}] symbol_pair_for_isolated est requis pour les prêts ISOLATED_MARGIN.")
                     return []
                 log_ctx += f"_iso_{isolated_symbol_pair.upper()}"
-                account_details_response = self._make_api_call(self.client.get_isolated_margin_account, symbols=isolated_symbol_pair.upper(), log_context=log_ctx)
+                account_details_response = self._make_api_call(self.client.get_isolated_margin_account, symbols=isolated_symbol_pair.upper(), log_context_override=log_ctx)
+
                 if account_details_response and isinstance(account_details_response, dict) and 'assets' in account_details_response:
-                     account_details = account_details_response
-                elif isinstance(account_details_response, list) and account_details_response:
-                     account_details = account_details_response[0]
-
-
-                if account_details and 'assets' in account_details:
-                    pair_assets_list = account_details.get('assets', [])
-                    if pair_assets_list:
-                        pair_data = pair_assets_list[0]
-                        for asset_key in ['baseAsset', 'quoteAsset']:
-                            asset_info = pair_data.get(asset_key, {})
-                            if float(asset_info.get('borrowed', 0.0)) > 0:
-                                if not asset_filter or asset_info.get('asset', '').upper() == asset_filter:
-                                    active_loans_found.append(asset_info)
+                    isolated_pair_assets_list = account_details_response.get('assets', [])
+                    if isolated_pair_assets_list:
+                        pair_data = isolated_pair_assets_list[0]
+                        for asset_key_in_pair in ['baseAsset', 'quoteAsset']: # Vérifier base et quote asset de la paire isolée
+                            asset_info = pair_data.get(asset_key_in_pair, {})
+                            if float(asset_info.get('borrowed', 0.0)) > 1e-9: # Seuil pour considérer un prêt comme actif
+                                if not asset_filter_upper or asset_info.get('asset', '').upper() == asset_filter_upper:
+                                    active_loans_list.append(asset_info)
             elif self.raw_account_type == "MARGIN": # Cross Margin
-                account_details = self._make_api_call(self.client.get_margin_account, log_context=log_ctx)
-                if account_details and isinstance(account_details, dict) and 'userAssets' in account_details:
-                    for user_asset in account_details.get('userAssets', []):
-                        if float(user_asset.get('borrowed', 0.0)) > 0:
-                            if not asset_filter or user_asset.get('asset', '').upper() == asset_filter:
-                                active_loans_found.append(user_asset)
+                account_details_response = self._make_api_call(self.client.get_margin_account, log_context_override=log_ctx)
+                if account_details_response and isinstance(account_details_response, dict) and 'userAssets' in account_details_response:
+                    for user_asset_info in account_details_response.get('userAssets', []):
+                        if float(user_asset_info.get('borrowed', 0.0)) > 1e-9:
+                            if not asset_filter_upper or user_asset_info.get('asset', '').upper() == asset_filter_upper:
+                                active_loans_list.append(user_asset_info)
             else:
-                logger.error(f"{self.log_prefix}[{log_ctx}] Unsupported account type: {self.raw_account_type}")
+                logger.error(f"{self.log_prefix}[{log_ctx}] Type de compte non supporté : {self.raw_account_type}")
                 return []
             
-            logger.info(f"{self.log_prefix}[{log_ctx}] Found {len(active_loans_found)} active loan(s)" + (f" for asset {asset_filter}." if asset_filter else "."))
-            return active_loans_found
-        except Exception as e:
-            logger.error(f"{self.log_prefix}[{log_ctx}] Error getting active margin loans: {e}", exc_info=True)
+            if isinstance(account_details_response, dict) and account_details_response.get("status") == "ERROR":
+                 logger.warning(f"{self.log_prefix}[{log_ctx}] Échec de la récupération des détails du compte pour les prêts. Réponse: {account_details_response.get('message')}")
+                 return []
+
+            logger.info(f"{self.log_prefix}[{log_ctx}] Trouvé {len(active_loans_list)} prêt(s) actif(s)" + (f" pour l'actif {asset_filter_upper}." if asset_filter_upper else "."))
+            return active_loans_list
+        except Exception as e: # pylint: disable=broad-except
+            logger.error(f"{self.log_prefix}[{log_ctx}] Erreur lors de la récupération des prêts sur marge actifs : {e}", exc_info=True)
             return []
 
-    # --- Order Management Methods ---
-    def _get_is_isolated_param_for_call(self, symbol_for_operation: str) -> Dict[str, str]:
-        """ Determines the 'isIsolated' parameter based on account type and symbol. """
-        if self.is_isolated_margin_trading:
-            # For isolated margin, the symbol in the operation must match the isolated pair.
-            # This check should ideally be done by the caller or ensured by design.
-            # Here, we assume if it's isolated, the operation is for ITS isolated pair.
-            return {"isIsolated": "TRUE"}
-        elif self.raw_account_type == "MARGIN": # Cross Margin
-            return {"isIsolated": "FALSE"} # Explicitly FALSE for cross, as some endpoints require it.
-        return {} # Default for SPOT or if logic is unclear (should not happen)
+    def _get_is_isolated_param_for_api(self, is_operation_isolated: bool) -> Dict[str, str]:
+        """Prépare le paramètre 'isIsolated' pour les appels API."""
+        return {"isIsolated": "TRUE"} if is_operation_isolated else {"isIsolated": "FALSE"}
 
     def get_all_open_margin_orders(self, symbol: str, is_isolated_override: Optional[bool] = None) -> List[Dict[str, Any]]:
-        """Gets all open margin orders for a symbol."""
-        log_ctx = f"get_open_margin_orders_{symbol.upper()}"
-        
-        params_api: Dict[str, Any] = {"symbol": symbol.upper()}
-        
-        # Determine isIsolated status
-        # If is_isolated_override is provided, it takes precedence.
-        # Otherwise, use the client's configured is_isolated_margin_trading.
-        final_is_isolated = self.is_isolated_margin_trading
-        if is_isolated_override is not None:
-            final_is_isolated = is_isolated_override
-        
-        if final_is_isolated:
-            params_api["isIsolated"] = "TRUE"
-            log_ctx += "_iso"
-        elif self.raw_account_type == "MARGIN": # Explicitly for cross margin if endpoint supports it
-             params_api["isIsolated"] = "FALSE"
+        """
+        Récupère tous les ordres sur marge ouverts pour un symbole donné.
 
+        Args:
+            symbol (str): Symbole de la paire (ex: BTCUSDT).
+            is_isolated_override (Optional[bool]): Permet de surcharger le mode de marge
+                (isolé/cross) pour cet appel spécifique. Si None, utilise la configuration
+                du client (`self.is_isolated_margin_trading`).
 
-        open_orders = self._make_api_call(self.client.get_open_margin_orders, **params_api, log_context=log_ctx)
-        if isinstance(open_orders, list):
-            return open_orders
-        elif isinstance(open_orders, dict) and open_orders.get("status") == "ERROR":
-            logger.error(f"{self.log_prefix}[{log_ctx}] API error fetching open orders: {open_orders.get('message')}")
+        Returns:
+            List[Dict[str, Any]]: Liste des ordres ouverts, ou liste vide en cas d'erreur.
+        """
+        symbol_upper = symbol.upper()
+        log_ctx = f"get_open_margin_orders_{symbol_upper}"
+        
+        params_api: Dict[str, Any] = {"symbol": symbol_upper}
+        
+        actual_is_isolated_mode = self.is_isolated_margin_trading if is_isolated_override is None else is_isolated_override
+        params_api.update(self._get_is_isolated_param_for_api(actual_is_isolated_mode))
+        if actual_is_isolated_mode: log_ctx += "_iso"
+
+        open_orders_response = self._make_api_call(self.client.get_open_margin_orders, **params_api, log_context_override=log_ctx)
+        
+        if isinstance(open_orders_response, list):
+            return open_orders_response
+        elif isinstance(open_orders_response, dict) and open_orders_response.get("status") == "ERROR":
+            logger.error(f"{self.log_prefix}[{log_ctx}] Erreur API lors de la récupération des ordres ouverts : {open_orders_response.get('message')}")
+        else:
+            logger.warning(f"{self.log_prefix}[{log_ctx}] Réponse inattendue lors de la récupération des ordres ouverts : {open_orders_response}")
         return []
 
     def get_open_margin_oco_orders(self, symbol: str, is_isolated_override: Optional[bool] = None) -> List[Dict[str, Any]]:
-        """Gets all open OCO margin orders for a symbol."""
-        log_ctx = f"get_open_margin_oco_{symbol.upper()}"
-        params_api: Dict[str, Any] = {} # get_all_oco_orders might not take symbol for cross
+        """
+        Récupère tous les ordres OCO (One-Cancels-the-Other) ouverts sur marge pour un symbole.
 
-        final_is_isolated = self.is_isolated_margin_trading
-        if is_isolated_override is not None:
-            final_is_isolated = is_isolated_override
+        Args:
+            symbol (str): Symbole de la paire.
+            is_isolated_override (Optional[bool]): Surcharge pour le mode de marge.
 
-        if final_is_isolated:
-            params_api["symbol"] = symbol.upper() # Symbol is required for isolated OCO list
+        Returns:
+            List[Dict[str, Any]]: Liste des ordres OCO actifs, ou liste vide.
+        """
+        symbol_upper = symbol.upper()
+        log_ctx = f"get_open_oco_orders_{symbol_upper}"
+        params_api: Dict[str, Any] = {}
+
+        actual_is_isolated_mode = self.is_isolated_margin_trading if is_isolated_override is None else is_isolated_override
+
+        if actual_is_isolated_mode:
+            params_api["symbol"] = symbol_upper # Requis pour les OCO isolés
             params_api["isIsolated"] = "TRUE"
             log_ctx += "_iso"
-        # For cross margin, get_all_oco_orders does not take a symbol. We fetch all and filter.
-        
-        all_open_ocos_raw = self._make_api_call(self.client.get_all_oco_orders, **params_api, log_context=log_ctx)
-        
-        active_ocos: List[Dict[str, Any]] = []
-        if isinstance(all_open_ocos_raw, list):
-            for oco in all_open_ocos_raw:
-                # Filter by symbol if it was a cross margin call (all OCOs returned)
-                symbol_match = final_is_isolated or (oco.get('symbol', '').upper() == symbol.upper())
-                if symbol_match and oco.get('listOrderStatus') in ["EXECUTING"]: # "ALL_DONE_PARTIALLY_FILLED" implies one leg filled, other cancelled
-                    active_ocos.append(oco)
-        elif isinstance(all_open_ocos_raw, dict) and all_open_ocos_raw.get("status") == "ERROR":
-             logger.error(f"{self.log_prefix}[{log_ctx}] API error fetching OCO orders: {all_open_ocos_raw.get('message')}")
+        # Pour cross margin, get_all_oco_orders ne prend pas de `symbol` ni `isIsolated` (il retourne tout).
+        # Le filtrage par symbole se fait après.
 
-        logger.info(f"{self.log_prefix}[{log_ctx}] Found {len(active_ocos)} active OCO(s) for {symbol}.")
-        return active_ocos
+        all_open_ocos_raw = self._make_api_call(self.client.get_all_oco_orders, **params_api, log_context_override=log_ctx)
+        
+        active_ocos_for_symbol: List[Dict[str, Any]] = []
+        if isinstance(all_open_ocos_raw, list):
+            for oco_order_list in all_open_ocos_raw:
+                # Pour cross, filtrer par symbole. Pour isolé, le symbole devrait déjà correspondre.
+                symbol_matches = actual_is_isolated_mode or (oco_order_list.get('symbol', '').upper() == symbol_upper)
+                # Un OCO est actif si son listOrderStatus est "EXECUTING"
+                if symbol_matches and oco_order_list.get('listOrderStatus') == "EXECUTING":
+                    active_ocos_for_symbol.append(oco_order_list)
+        elif isinstance(all_open_ocos_raw, dict) and all_open_ocos_raw.get("status") == "ERROR":
+             logger.error(f"{self.log_prefix}[{log_ctx}] Erreur API lors de la récupération des ordres OCO : {all_open_ocos_raw.get('message')}")
+
+        logger.info(f"{self.log_prefix}[{log_ctx}] Trouvé {len(active_ocos_for_symbol)} ordre(s) OCO actif(s) pour {symbol_upper}.")
+        return active_ocos_for_symbol
 
     def get_margin_order_status(self, symbol: str, order_id: Optional[Union[int, str]] = None,
-                                orig_client_order_id: Optional[str] = None, is_isolated_override: Optional[bool] = None) -> Optional[Dict[str, Any]]:
-        log_ctx = f"get_margin_order_status_{symbol.upper()}_id_{order_id or orig_client_order_id}"
+                                orig_client_order_id: Optional[str] = None, is_isolated_override: Optional[bool] = None
+                               ) -> Optional[Dict[str, Any]]:
+        """
+        Récupère le statut d'un ordre sur marge spécifique.
+
+        Args:
+            symbol (str): Symbole de la paire.
+            order_id (Optional[Union[int, str]]): ID de l'ordre de l'exchange.
+            orig_client_order_id (Optional[str]): ID client original de l'ordre.
+            is_isolated_override (Optional[bool]): Surcharge pour le mode de marge.
+
+        Returns:
+            Optional[Dict[str, Any]]: Dictionnaire du statut de l'ordre, ou un dictionnaire
+                                      d'erreur standardisé, ou None si erreur majeure.
+        """
+        log_ctx = f"get_order_status_{symbol.upper()}_id_{order_id or orig_client_order_id}"
         if not order_id and not orig_client_order_id:
-            logger.error(f"{self.log_prefix}[{log_ctx}] order_id or orig_client_order_id is required.")
-            return {"status": "ERROR", "message": "Order ID or Client Order ID required."}
+            logger.error(f"{self.log_prefix}[{log_ctx}] order_id ou orig_client_order_id est requis.")
+            return {"status": "ERROR", "message": "order_id ou orig_client_order_id requis."}
 
         params_api: Dict[str, Any] = {"symbol": symbol.upper()}
-        if order_id: params_api["orderId"] = int(order_id) # Binance API often expects int for orderId
+        if order_id: params_api["orderId"] = int(str(order_id)) # L'API Binance attend souvent un int pour orderId
         if orig_client_order_id: params_api["origClientOrderId"] = orig_client_order_id
         
-        final_is_isolated = self.is_isolated_margin_trading
-        if is_isolated_override is not None:
-            final_is_isolated = is_isolated_override
+        actual_is_isolated_mode = self.is_isolated_margin_trading if is_isolated_override is None else is_isolated_override
+        params_api.update(self._get_is_isolated_param_for_api(actual_is_isolated_mode))
+        if actual_is_isolated_mode: log_ctx += "_iso"
+
+        order_status_response = self._make_api_call(self.client.get_margin_order, **params_api, log_context_override=log_ctx)
+
+        if isinstance(order_status_response, dict):
+            # Vérifier si c'est une réponse d'erreur de _make_api_call
+            if order_status_response.get("status") == "ERROR":
+                # Gérer spécifiquement l'erreur "Order does not exist" (-2013)
+                if order_status_response.get("code") == -2013:
+                    logger.warning(f"{self.log_prefix}[{log_ctx}] Ordre non trouvé sur l'exchange (Code -2013).")
+                    # Retourner un statut clair pour "non trouvé"
+                    return {"api_status": "NOT_FOUND", "original_response": order_status_response}
+                logger.error(f"{self.log_prefix}[{log_ctx}] Erreur API lors de la récupération du statut de l'ordre : {order_status_response.get('message')}")
+                return {"api_status": "API_ERROR_FETCH", "original_response": order_status_response}
+            # Si ce n'est pas un dict d'erreur de _make_api_call, c'est la réponse de l'API
+            return order_status_response
         
-        if final_is_isolated:
-            params_api["isIsolated"] = "TRUE"
-            log_ctx += "_iso"
-        elif self.raw_account_type == "MARGIN":
-             params_api["isIsolated"] = "FALSE"
-
-
-        order_status = self._make_api_call(self.client.get_margin_order, **params_api, log_context=log_ctx)
-
-        if isinstance(order_status, dict):
-            if order_status.get("status") == "ERROR" and order_status.get("code") == -2013: # Order does not exist
-                logger.warning(f"{self.log_prefix}[{log_ctx}] Order not found on exchange (Code -2013).")
-                return {"status_order": "NOT_FOUND", "api_response": order_status} # Standardized somewhat
-            elif order_status.get("status") == "ERROR":
-                logger.error(f"{self.log_prefix}[{log_ctx}] API error getting order status: {order_status.get('message')}")
-                return {"status_order": "API_ERROR_FETCH", "api_response": order_status}
-            return order_status # Successful fetch
-        
-        # Fallback if _make_api_call returned None or unexpected type
-        logger.error(f"{self.log_prefix}[{log_ctx}] Unexpected response type or None from _make_api_call for get_margin_order.")
-        return {"status_order": "UNKNOWN_ERROR_FETCH", "api_response": None}
+        logger.error(f"{self.log_prefix}[{log_ctx}] Réponse inattendue ou None de _make_api_call pour get_margin_order.")
+        return {"api_status": "UNKNOWN_ERROR_FETCH", "original_response": None}
 
 
     def place_margin_order(self, **params: Any) -> Dict[str, Any]:
-        log_ctx = f"place_margin_order_{params.get('symbol','SYM')}_{params.get('side','SIDE')}"
-        final_params = params.copy()
-        final_params.update(self._get_is_isolated_param_for_call(str(params.get("symbol"))))
-        
-        logger.info(f"{self.log_prefix}[{log_ctx}] Attempting: {final_params}")
-        response = self._make_api_call(self.client.create_margin_order, **final_params, log_context=log_ctx)
+        """
+        Place un ordre sur marge (achat ou vente).
 
-        if response and isinstance(response, dict) and (response.get("orderId") or response.get("clientOrderId")) and not response.get("code"): # Success usually has orderId
-            logger.info(f"{self.log_prefix}[{log_ctx}] Margin order placement successful: {response.get('orderId')}")
-            return {"status": "SUCCESS", "data": response}
-        else: # Error or unexpected response
-            err_msg = response.get("message") if isinstance(response, dict) else str(response)
-            logger.error(f"{self.log_prefix}[{log_ctx}] Margin order placement failed. API Response: {response}. Params: {final_params}")
-            return {"status": "API_ERROR", "message": err_msg, "code": response.get("code") if isinstance(response, dict) else None, "params_sent": final_params}
+        Args:
+            **params: Paramètres de l'ordre (symbol, side, type, quantity, price, etc.).
+                      `isIsolated` sera ajouté automatiquement basé sur la configuration du client.
+
+        Returns:
+            Dict[str, Any]: Un dictionnaire standardisé :
+                            `{"status": "SUCCESS", "data": response_api}` ou
+                            `{"status": "API_ERROR", "message": ..., "code": ..., "params_sent": ...}`.
+        """
+        symbol_op = str(params.get("symbol", "SYM_INCONNU"))
+        log_ctx = f"place_margin_order_{symbol_op}_{params.get('side','SIDE')}"
+        
+        # Préparer les paramètres finaux pour l'API
+        final_api_params = params.copy()
+        final_api_params.update(self._get_is_isolated_param_for_api(self.is_isolated_margin_trading and symbol_op == self.symbol if hasattr(self, 'symbol') else self.is_isolated_margin_trading))
+        # Note: La condition `symbol_op == self.symbol` est une heuristique si `self.symbol` est la paire principale isolée.
+        # Idéalement, l'appelant spécifie `isIsolated` si nécessaire pour une paire non principale.
+
+        logger.info(f"{self.log_prefix}[{log_ctx}] Tentative de placement d'ordre sur marge. Params API (partiel) : { {k:v for k,v in final_api_params.items() if k != 'newClientOrderId'} }")
+        api_response = self._make_api_call(self.client.create_margin_order, **final_api_params, log_context_override=log_ctx)
+
+        if api_response and isinstance(api_response, dict) and \
+           (api_response.get("orderId") or api_response.get("clientOrderId")) and \
+           not (api_response.get("status") == "ERROR" or api_response.get("code") is not None and api_response.get("code") != 0): # Succès si orderId/clientOrderId et pas un code d'erreur connu
+            logger.info(f"{self.log_prefix}[{log_ctx}] Placement d'ordre sur marge réussi : OrderID={api_response.get('orderId')}, ClientOrderID={api_response.get('clientOrderId')}")
+            return {"status": "SUCCESS", "data": api_response}
+        else:
+            err_msg = api_response.get("message", "Erreur inconnue") if isinstance(api_response, dict) else str(api_response)
+            err_code = api_response.get("code") if isinstance(api_response, dict) else None
+            logger.error(f"{self.log_prefix}[{log_ctx}] Échec du placement d'ordre sur marge. Réponse API : {api_response}. Paramètres envoyés : {final_api_params}")
+            return {"status": "API_ERROR", "message": err_msg, "code": err_code, "params_sent": final_api_params}
 
     def place_margin_oco_order(self, **params: Any) -> Dict[str, Any]:
-        log_ctx = f"place_margin_oco_{params.get('symbol','SYM')}_{params.get('side','SIDE')}"
-        final_params = params.copy()
-        final_params.update(self._get_is_isolated_param_for_call(str(params.get("symbol"))))
+        """Place un ordre OCO (One-Cancels-the-Other) sur marge."""
+        symbol_op = str(params.get("symbol", "SYM_INCONNU"))
+        log_ctx = f"place_margin_oco_{symbol_op}_{params.get('side','SIDE')}"
+        final_api_params = params.copy()
+        final_api_params.update(self._get_is_isolated_param_for_api(self.is_isolated_margin_trading and symbol_op == self.symbol if hasattr(self, 'symbol') else self.is_isolated_margin_trading))
 
-        logger.info(f"{self.log_prefix}[{log_ctx}] Attempting OCO: {final_params}")
-        response = self._make_api_call(self.client.create_margin_oco_order, **final_params, log_context=log_ctx)
+        logger.info(f"{self.log_prefix}[{log_ctx}] Tentative de placement d'ordre OCO. Params API (partiel) : { {k:v for k,v in final_api_params.items() if 'clientOrderId' not in k.lower()} }")
+        api_response = self._make_api_call(self.client.create_margin_oco_order, **final_api_params, log_context_override=log_ctx)
 
-        if response and isinstance(response, dict) and response.get("orderListId") and not response.get("code"):
-            logger.info(f"{self.log_prefix}[{log_ctx}] Margin OCO placement successful: {response.get('orderListId')}")
-            return {"status": "SUCCESS", "data": response}
+        if api_response and isinstance(api_response, dict) and api_response.get("orderListId") and not (api_response.get("status") == "ERROR" or api_response.get("code")):
+            logger.info(f"{self.log_prefix}[{log_ctx}] Placement d'ordre OCO sur marge réussi : OrderListID={api_response.get('orderListId')}")
+            return {"status": "SUCCESS", "data": api_response}
         else:
-            err_msg = response.get("message") if isinstance(response, dict) else str(response)
-            logger.error(f"{self.log_prefix}[{log_ctx}] Margin OCO placement failed. API Response: {response}. Params: {final_params}")
-            return {"status": "API_ERROR", "message": err_msg, "code": response.get("code") if isinstance(response, dict) else None, "params_sent": final_params}
+            err_msg = api_response.get("message", "Erreur inconnue") if isinstance(api_response, dict) else str(api_response)
+            err_code = api_response.get("code") if isinstance(api_response, dict) else None
+            logger.error(f"{self.log_prefix}[{log_ctx}] Échec du placement d'ordre OCO sur marge. Réponse API : {api_response}. Params envoyés : {final_api_params}")
+            return {"status": "API_ERROR", "message": err_msg, "code": err_code, "params_sent": final_api_params}
 
     def repay_margin_loan(self, asset: str, amount: str, isolated_symbol_pair: Optional[str] = None) -> Dict[str, Any]:
-        log_ctx = f"repay_margin_loan_{asset.upper()}_{amount}"
-        repay_params: Dict[str,Any] = {"asset": asset.upper(), "amount": str(amount)}
+        """Rembourse un prêt sur marge."""
+        asset_upper = asset.upper()
+        log_ctx = f"repay_margin_loan_{asset_upper}_amt_{amount}"
+        
+        repay_params: Dict[str,Any] = {"asset": asset_upper, "amount": str(amount)} # L'API attend amount comme string
         if self.is_isolated_margin_trading:
             if not isolated_symbol_pair:
-                return {"status": "ERROR", "message": "isolated_symbol_pair required for ISOLATED_MARGIN loan repayment."}
+                msg = "isolated_symbol_pair est requis pour le remboursement de prêt sur marge ISOLATED_MARGIN."
+                logger.error(f"{self.log_prefix}[{log_ctx}] {msg}")
+                return {"status": "ERROR", "message": msg}
             repay_params["isIsolated"] = "TRUE"
             repay_params["symbol"] = isolated_symbol_pair.upper()
             log_ctx += f"_iso_{isolated_symbol_pair.upper()}"
-        elif self.raw_account_type == "MARGIN":
-            repay_params["isIsolated"] = "FALSE"
+        elif self.raw_account_type == "MARGIN": # Cross
+            repay_params["isIsolated"] = "FALSE" # Certaines API de remboursement peuvent nécessiter isIsolated=FALSE pour cross
 
+        logger.info(f"{self.log_prefix}[{log_ctx}] Tentative de remboursement de prêt.")
+        api_response = self._make_api_call(self.client.repay_margin_loan, **repay_params, log_context_override=log_ctx)
 
-        logger.info(f"{self.log_prefix}[{log_ctx}] Attempting loan repayment.")
-        response = self._make_api_call(self.client.repay_margin_loan, **repay_params, log_context=log_ctx)
-
-        if response and isinstance(response, dict) and response.get("tranId") and not response.get("code"): # Successful repayment has tranId
-            logger.info(f"{self.log_prefix}[{log_ctx}] Loan repayment successful. TranID: {response.get('tranId')}")
-            return {"status": "SUCCESS", "data": response}
+        if api_response and isinstance(api_response, dict) and api_response.get("tranId") and not (api_response.get("status") == "ERROR" or api_response.get("code")):
+            logger.info(f"{self.log_prefix}[{log_ctx}] Remboursement de prêt réussi. TranID : {api_response.get('tranId')}")
+            return {"status": "SUCCESS", "data": api_response}
         else:
-            err_msg = response.get("message") if isinstance(response, dict) else str(response)
-            logger.error(f"{self.log_prefix}[{log_ctx}] Loan repayment failed. API Response: {response}. Params: {repay_params}")
-            return {"status": "API_ERROR", "message": err_msg, "code": response.get("code") if isinstance(response, dict) else None, "params_sent": repay_params}
+            err_msg = api_response.get("message", "Erreur inconnue") if isinstance(api_response, dict) else str(api_response)
+            err_code = api_response.get("code") if isinstance(api_response, dict) else None
+            logger.error(f"{self.log_prefix}[{log_ctx}] Échec du remboursement de prêt. Réponse API : {api_response}. Params envoyés : {repay_params}")
+            return {"status": "API_ERROR", "message": err_msg, "code": err_code, "params_sent": repay_params}
 
     def cancel_margin_order(self, symbol: str, order_id: Optional[Union[int, str]] = None,
-                            orig_client_order_id: Optional[str] = None, is_isolated_override: Optional[bool] = None) -> Dict[str, Any]:
+                            orig_client_order_id: Optional[str] = None, is_isolated_override: Optional[bool] = None
+                           ) -> Dict[str, Any]:
+        """Annule un ordre sur marge."""
         log_ctx = f"cancel_margin_order_{symbol.upper()}_id_{order_id or orig_client_order_id}"
         if not order_id and not orig_client_order_id:
-            return {"status": "ERROR", "message": "order_id or orig_client_order_id required."}
+            return {"status": "ERROR", "message": "order_id ou orig_client_order_id est requis pour l'annulation."}
 
         params_api: Dict[str, Any] = {"symbol": symbol.upper()}
-        if order_id: params_api["orderId"] = int(order_id)
+        if order_id: params_api["orderId"] = int(str(order_id))
         if orig_client_order_id: params_api["origClientOrderId"] = orig_client_order_id
         
-        final_is_isolated = self.is_isolated_margin_trading
-        if is_isolated_override is not None: final_is_isolated = is_isolated_override
-        
-        if final_is_isolated: params_api["isIsolated"] = "TRUE"; log_ctx+="_iso"
-        elif self.raw_account_type == "MARGIN": params_api["isIsolated"] = "FALSE"
+        actual_is_isolated_mode = self.is_isolated_margin_trading if is_isolated_override is None else is_isolated_override
+        params_api.update(self._get_is_isolated_param_for_api(actual_is_isolated_mode))
+        if actual_is_isolated_mode: log_ctx+="_iso"
 
-        logger.info(f"{self.log_prefix}[{log_ctx}] Attempting cancel.")
-        response = self._make_api_call(self.client.cancel_margin_order, **params_api, log_context=log_ctx)
+        logger.info(f"{self.log_prefix}[{log_ctx}] Tentative d'annulation d'ordre.")
+        api_response = self._make_api_call(self.client.cancel_margin_order, **params_api, log_context_override=log_ctx)
         
-        if response and isinstance(response, dict) and (response.get("orderId") or response.get("clientOrderId")) and not response.get("code"):
-            return {"status": "SUCCESS", "data": response}
+        if api_response and isinstance(api_response, dict) and \
+           (api_response.get("orderId") or api_response.get("clientOrderId")) and \
+           not (api_response.get("status") == "ERROR" or api_response.get("code")):
+            logger.info(f"{self.log_prefix}[{log_ctx}] Annulation d'ordre réussie : {api_response.get('orderId') or api_response.get('clientOrderId')}")
+            return {"status": "SUCCESS", "data": api_response}
         else:
-            err_code = response.get("code") if isinstance(response, dict) else None
-            err_msg = response.get("message") if isinstance(response, dict) else str(response)
-            if err_code == -2011: # Order already filled or cancelled
+            err_code = api_response.get("code") if isinstance(api_response, dict) else None
+            err_msg = api_response.get("message", "Erreur inconnue") if isinstance(api_response, dict) else str(api_response)
+            if err_code == -2011: # Ordre déjà rempli, annulé ou inexistant
+                logger.warning(f"{self.log_prefix}[{log_ctx}] Tentative d'annulation d'un ordre déjà traité ou inexistant (Code -2011). Message : {err_msg}")
                 return {"status": "ORDER_NOT_FOUND_OR_ALREADY_PROCESSED", "code": err_code, "message": err_msg, "params_sent": params_api}
+            logger.error(f"{self.log_prefix}[{log_ctx}] Échec de l'annulation d'ordre. Réponse API : {api_response}. Params envoyés : {params_api}")
             return {"status": "API_ERROR", "code": err_code, "message": err_msg, "params_sent": params_api}
 
     def cancel_margin_oco_order(self, symbol: str, order_list_id: Optional[int] = None,
-                                list_client_order_id: Optional[str] = None, is_isolated_override: Optional[bool] = None) -> Dict[str, Any]:
+                                list_client_order_id: Optional[str] = None, is_isolated_override: Optional[bool] = None
+                               ) -> Dict[str, Any]:
+        """Annule un ordre OCO sur marge."""
         log_ctx = f"cancel_margin_oco_{symbol.upper()}_id_{order_list_id or list_client_order_id}"
         if not order_list_id and not list_client_order_id:
-            return {"status": "ERROR", "message": "order_list_id or list_client_order_id required."}
+            return {"status": "ERROR", "message": "order_list_id ou list_client_order_id est requis pour l'annulation OCO."}
 
         params_api: Dict[str, Any] = {"symbol": symbol.upper()}
-        if order_list_id: params_api["orderListId"] = order_list_id
+        if order_list_id: params_api["orderListId"] = order_list_id # Doit être int
         if list_client_order_id: params_api["listClientOrderId"] = list_client_order_id
         
-        final_is_isolated = self.is_isolated_margin_trading
-        if is_isolated_override is not None: final_is_isolated = is_isolated_override
+        actual_is_isolated_mode = self.is_isolated_margin_trading if is_isolated_override is None else is_isolated_override
+        params_api.update(self._get_is_isolated_param_for_api(actual_is_isolated_mode))
+        if actual_is_isolated_mode: log_ctx+="_iso"
 
-        if final_is_isolated: params_api["isIsolated"] = "TRUE"; log_ctx+="_iso"
-        elif self.raw_account_type == "MARGIN": params_api["isIsolated"] = "FALSE"
+        logger.info(f"{self.log_prefix}[{log_ctx}] Tentative d'annulation d'ordre OCO.")
+        api_response = self._make_api_call(self.client.cancel_margin_oco_order, **params_api, log_context_override=log_ctx)
 
-        logger.info(f"{self.log_prefix}[{log_ctx}] Attempting OCO cancel.")
-        response = self._make_api_call(self.client.cancel_margin_oco_order, **params_api, log_context=log_ctx)
-
-        if response and isinstance(response, dict) and response.get("orderListId") and not response.get("code"):
-            return {"status": "SUCCESS", "data": response}
+        if api_response and isinstance(api_response, dict) and api_response.get("orderListId") and not (api_response.get("status") == "ERROR" or api_response.get("code")):
+            logger.info(f"{self.log_prefix}[{log_ctx}] Annulation d'ordre OCO réussie : OrderListID={api_response.get('orderListId')}")
+            return {"status": "SUCCESS", "data": api_response}
         else:
-            err_code = response.get("code") if isinstance(response, dict) else None
-            err_msg = response.get("message") if isinstance(response, dict) else str(response)
-            if err_code == -2011: # Order list does not exist (e.g. already cancelled/filled)
+            err_code = api_response.get("code") if isinstance(api_response, dict) else None
+            err_msg = api_response.get("message", "Erreur inconnue") if isinstance(api_response, dict) else str(api_response)
+            if err_code == -2011: # Liste d'ordres OCO déjà traitée ou inexistante
+                 logger.warning(f"{self.log_prefix}[{log_ctx}] Tentative d'annulation d'une liste OCO déjà traitée ou inexistante (Code -2011). Message : {err_msg}")
                  return {"status": "ORDER_LIST_NOT_FOUND_OR_ALREADY_PROCESSED", "code": err_code, "message": err_msg, "params_sent": params_api}
+            logger.error(f"{self.log_prefix}[{log_ctx}] Échec de l'annulation d'ordre OCO. Réponse API : {api_response}. Params envoyés : {params_api}")
             return {"status": "API_ERROR", "code": err_code, "message": err_msg, "params_sent": params_api}
 
-    def close(self):
-        """Closes the underlying Binance SDK client session if applicable."""
+    def close(self) -> None:
+        """
+        Ferme la session du client SDK Binance sous-jacent, si la version le supporte.
+        """
         log_ctx = "close_client_session"
-        logger.info(f"{self.log_prefix}[{log_ctx}] Closing OrderExecutionClient session...")
-        if hasattr(self.client, 'close_connection'): # python-binance >= 1.0.16
+        logger.info(f"{self.log_prefix}[{log_ctx}] Fermeture de la session OrderExecutionClient...")
+        if hasattr(self.client, 'close_connection') and callable(self.client.close_connection):
             try:
-                self.client.close_connection() # type: ignore
-                logger.info(f"{self.log_prefix}[{log_ctx}] Binance SDK client session closed.")
-            except Exception as e:
-                logger.error(f"{self.log_prefix}[{log_ctx}] Error closing Binance SDK client session: {e}", exc_info=True)
+                self.client.close_connection()
+                logger.info(f"{self.log_prefix}[{log_ctx}] Session du client SDK Binance fermée avec succès.")
+            except Exception as e_close: # pylint: disable=broad-except
+                logger.error(f"{self.log_prefix}[{log_ctx}] Erreur lors de la fermeture de la session du client SDK Binance : {e_close}", exc_info=True)
         else:
-            logger.debug(f"{self.log_prefix}[{log_ctx}] Binance SDK client does not have a 'close_connection' method (version: {BINANCE_VERSION}). No explicit close needed.")
+            logger.debug(f"{self.log_prefix}[{log_ctx}] Le client SDK Binance (version: {BINANCE_VERSION}) "
+                         "ne possède pas de méthode 'close_connection'. Aucune fermeture explicite de session n'est nécessaire.")
+

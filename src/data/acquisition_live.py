@@ -1,6 +1,13 @@
+# src/data/acquisition_live.py
+"""
+Ce module est responsable de la récupération et de la mise à jour des données
+de K-lines 1-minute pour le trading en direct, en utilisant l'API REST de Binance.
+Il gère l'initialisation des fichiers de données brutes pour les paires configurées.
+"""
 import json
 import logging
-import os # Maintenu pour la compatibilité potentielle, bien que pathlib soit préféré
+import os # Maintenu pour une éventuelle utilisation, bien que pathlib soit préféré
+import sys # Pour la configuration du logging de fallback
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, TYPE_CHECKING
@@ -11,418 +18,520 @@ import requests # Pour les appels REST directs
 
 if TYPE_CHECKING:
     # Utilisation de AppConfig pour une configuration plus complète si disponible
-    from src.config.definitions import AppConfig, LiveFetchConfig, PathsConfig, GlobalLiveSettings
-    # Autrement, LiveConfig pourrait être un sous-ensemble ou un dict
-    # from src.config.loader import LiveConfig
+    from src.config.loader import AppConfig
+    from src.config.definitions import LiveFetchConfig, PathsConfig, GlobalLiveSettings
 
 # KLINE_INTERVAL_1MINUTE peut être défini ici ou importé depuis binance.client
-try:
-    from binance.client import Client as BinanceClient # Uniquement pour la constante
-    KLINE_INTERVAL_1MINUTE = BinanceClient.KLINE_INTERVAL_1MINUTE
-    BINANCE_LIB_AVAILABLE = True
-except ImportError:
-    KLINE_INTERVAL_1MINUTE = "1m" # Fallback si python-binance n'est pas installé
-    BINANCE_LIB_AVAILABLE = False
-    logging.getLogger(__name__).warning(
-        "python-binance library not found. KLINE_INTERVAL_1MINUTE set to '1m'. "
-        "Actual API calls in other modules might fail if they depend on the library."
-    )
+# Pour ce module qui utilise REST directement, nous définissons la constante.
+KLINE_INTERVAL_1MINUTE = "1m"
 
 logger = logging.getLogger(__name__)
 
 # Colonnes telles que reçues de l'API Binance pour les klines
-BINANCE_KLINE_COLUMNS = [
+BINANCE_KLINE_COLUMNS: List[str] = [
     'kline_open_time', 'open', 'high', 'low', 'close', 'volume',
     'kline_close_time', 'quote_asset_volume', 'number_of_trades',
     'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
 ]
 
-# Colonnes finales dans les fichiers de sortie, incluant le timestamp et les données Taker
-# Ce sont les colonnes standardisées pour les fichiers bruts (qu'ils soient historiques ou live)
-BASE_COLUMNS_RAW = [
+# Colonnes finales dans les fichiers de sortie, incluant le timestamp et les données Taker calculées.
+# Standardisées pour les fichiers bruts (historiques ou live).
+BASE_COLUMNS_RAW: List[str] = [
     'timestamp', 'kline_close_time', 'open', 'high', 'low', 'close', 'volume',
     'quote_asset_volume', 'number_of_trades',
     'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume',
-    'taker_sell_base_asset_volume', 'taker_sell_quote_asset_volume'
+    'taker_sell_base_asset_volume', 'taker_sell_quote_asset_volume' # Calculées
 ]
 
 # Limites de l'API Binance pour les klines par requête
 API_BATCH_LIMIT_SPOT_MARGIN = 1000
-API_BATCH_LIMIT_FUTURES = 1500
+API_BATCH_LIMIT_FUTURES = 1500 # Pour USD-M Futures
+API_BATCH_LIMIT_FUTURES_COIN_M = 500 # Pour COIN-M Futures
+
+# Constantes pour les re-essais API
+MAX_API_FETCH_RETRIES = 3
+API_FETCH_RETRY_DELAY_SECONDS = 2.0
 
 
 def get_binance_klines_rest(
     symbol: str,
-    # config_interval_context: str, # Moins pertinent ici car on fetch toujours du 1m pour le brut live
     limit: int = 100,
-    account_type: str = "MARGIN", # SPOT, MARGIN, FUTURES
-    end_timestamp_ms: Optional[int] = None
+    account_type: str = "SPOT", # Ou "MARGIN", "FUTURES_USDT", "FUTURES_COIN"
+    end_timestamp_ms: Optional[int] = None,
+    start_timestamp_ms: Optional[int] = None # Ajouté pour plus de flexibilité
 ) -> Optional[pd.DataFrame]:
     """
-    Récupère les klines 1-minute via l'API REST de Binance.
+    Récupère les K-lines 1-minute via l'API REST publique de Binance.
+    Cette fonction ne nécessite pas de clés API car elle accède à des points d'accès publics.
 
     Args:
-        symbol: Symbole de la paire (ex: BTCUSDT).
-        limit: Nombre de klines à récupérer.
-        account_type: Type de compte/marché ("SPOT", "MARGIN", "FUTURES").
-        end_timestamp_ms: Timestamp de fin (en ms) pour récupérer les klines *avant* ce temps.
-                          Si None, récupère les plus récentes.
+        symbol (str): Symbole de la paire de trading (ex: "BTCUSDT").
+        limit (int): Nombre de K-lines à récupérer (max dépendant de l'endpoint).
+        account_type (str): Type de compte/marché pour déterminer l'URL de base de l'API
+                            et la limite de batch. Options : "SPOT", "MARGIN",
+                            "FUTURES_USDT" (pour USD-M), "FUTURES_COIN" (pour COIN-M).
+        end_timestamp_ms (Optional[int]): Timestamp de fin (en millisecondes, exclusif)
+                                          pour récupérer les K-lines *avant* ce temps.
+                                          Si None, récupère les plus récentes.
+        start_timestamp_ms (Optional[int]): Timestamp de début (en millisecondes, inclusif)
+                                            pour récupérer les K-lines *à partir de* ce temps.
 
     Returns:
-        DataFrame pandas avec les klines ou None en cas d'erreur.
+        Optional[pd.DataFrame]: DataFrame pandas avec les K-lines, ou None en cas d'erreur critique.
+                                Retourne un DataFrame vide si aucune donnée n'est trouvée pour les paramètres.
     """
     actual_fetch_interval = KLINE_INTERVAL_1MINUTE
-    log_ctx = f"[{symbol}][{actual_fetch_interval}][{account_type.upper()}]"
+    log_ctx = f"[{symbol.upper()}][{actual_fetch_interval}][{account_type.upper()}]"
 
     if end_timestamp_ms:
-        logger.debug(f"{log_ctx} Requesting {limit} klines ending before {pd.to_datetime(end_timestamp_ms, unit='ms', utc=True)} via REST API")
+        logger.debug(f"{log_ctx} Requête de {limit} K-lines se terminant avant {pd.to_datetime(end_timestamp_ms, unit='ms', utc=True)} via API REST.")
+    elif start_timestamp_ms:
+        logger.debug(f"{log_ctx} Requête de {limit} K-lines commençant à {pd.to_datetime(start_timestamp_ms, unit='ms', utc=True)} via API REST.")
     else:
-        logger.debug(f"{log_ctx} Requesting latest {limit} klines via REST API")
+        logger.debug(f"{log_ctx} Requête des {limit} K-lines les plus récentes via API REST.")
 
     account_type_upper = account_type.upper()
-    api_batch_limit: int
+    base_url: str
+    endpoint: str = "/klines" # Commun pour la plupart, mais les préfixes d'API changent
+    api_max_limit_for_endpoint: int
 
-    if account_type_upper in ["SPOT", "MARGIN", "BINANCE_MARGIN"]: # BINANCE_MARGIN pour rétrocompatibilité
-        base_url = "https://api.binance.com"
-        endpoint = "/api/v3/klines"
-        api_batch_limit = API_BATCH_LIMIT_SPOT_MARGIN
-    elif account_type_upper == "FUTURES": # USD-M Futures
-        base_url = "https://fapi.binance.com"
-        endpoint = "/fapi/v1/klines"
-        api_batch_limit = API_BATCH_LIMIT_FUTURES
-    # TODO: Ajouter un cas pour COIN-M Futures (https://dapi.binance.com, /dapi/v1/klines) si nécessaire
+    if account_type_upper in ["SPOT", "MARGIN"]: # Binance Spot/Margin API
+        base_url = "https://api.binance.com/api/v3"
+        api_max_limit_for_endpoint = API_BATCH_LIMIT_SPOT_MARGIN
+    elif account_type_upper == "FUTURES_USDT": # USD-M Futures API
+        base_url = "https://fapi.binance.com/fapi/v1"
+        api_max_limit_for_endpoint = API_BATCH_LIMIT_FUTURES
+    elif account_type_upper == "FUTURES_COIN": # COIN-M Futures API
+        base_url = "https://dapi.binance.com/dapi/v1"
+        api_max_limit_for_endpoint = API_BATCH_LIMIT_FUTURES_COIN_M
     else:
-        logger.error(f"{log_ctx} Unsupported account_type for kline fetching: {account_type}")
+        logger.error(f"{log_ctx} Type de compte non supporté pour la récupération de K-lines : {account_type}")
         return None
 
-    current_fetch_limit = min(limit, api_batch_limit)
+    # S'assurer que la limite demandée ne dépasse pas la limite de l'API pour cet endpoint
+    current_fetch_limit = min(limit, api_max_limit_for_endpoint)
+    if limit > api_max_limit_for_endpoint:
+        logger.debug(f"{log_ctx} Limite demandée ({limit}) > limite API ({api_max_limit_for_endpoint}). Utilisation de {api_max_limit_for_endpoint}.")
+
+
     url = base_url + endpoint
-    params: Dict[str, Any] = {"symbol": symbol.upper(), "interval": actual_fetch_interval, "limit": current_fetch_limit}
+    params: Dict[str, Any] = {
+        "symbol": symbol.upper(),
+        "interval": actual_fetch_interval,
+        "limit": current_fetch_limit
+    }
     if end_timestamp_ms:
         params["endTime"] = end_timestamp_ms
+    if start_timestamp_ms:
+        params["startTime"] = start_timestamp_ms
 
     try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        response = requests.get(url, params=params, timeout=15) # Timeout augmenté à 15s
+        response.raise_for_status() # Lève une HTTPError pour les codes d'erreur HTTP (4XX, 5XX)
+        data_raw = response.json()
 
-        if not data:
-            logger.warning(f"{log_ctx} No kline data received from Binance API.")
-            return pd.DataFrame(columns=BASE_COLUMNS_RAW) # Retourner un DF vide avec les bonnes colonnes
+        if not data_raw: # Si l'API retourne une liste vide
+            logger.info(f"{log_ctx} Aucune donnée K-line reçue de l'API Binance pour les paramètres : {params}")
+            return pd.DataFrame(columns=BASE_COLUMNS_RAW)
 
-        df = pd.DataFrame(data, columns=BINANCE_KLINE_COLUMNS)
+        df = pd.DataFrame(data_raw, columns=BINANCE_KLINE_COLUMNS)
+        # Renommer 'kline_open_time' en 'timestamp' pour la cohérence
         df.rename(columns={'kline_open_time': 'timestamp'}, inplace=True)
 
+        # Conversion des timestamps
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True, errors='coerce')
         df['kline_close_time'] = pd.to_datetime(df['kline_close_time'], unit='ms', utc=True, errors='coerce')
 
+        # Conversion des colonnes numériques
         numeric_cols = ['open', 'high', 'low', 'close', 'volume',
                         'quote_asset_volume', 'number_of_trades',
                         'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-            else:
-                df[col] = np.nan # Assurer que la colonne existe
+            else: # Devrait être rare si BINANCE_KLINE_COLUMNS est correct
+                df[col] = np.nan
 
         # Calcul des volumes Taker vendeurs
+        # taker_sell_base = total_base_volume - taker_buy_base_volume
+        # taker_sell_quote = total_quote_volume - taker_buy_quote_volume
         if 'volume' in df.columns and 'taker_buy_base_asset_volume' in df.columns:
-            df['taker_sell_base_asset_volume'] = df['volume'].sub(df['taker_buy_base_asset_volume'], fill_value=0)
+            df['taker_sell_base_asset_volume'] = df['volume'].sub(df['taker_buy_base_asset_volume'], fill_value=np.nan)
         else:
             df['taker_sell_base_asset_volume'] = np.nan
+        
         if 'quote_asset_volume' in df.columns and 'taker_buy_quote_asset_volume' in df.columns:
-            df['taker_sell_quote_asset_volume'] = df['quote_asset_volume'].sub(df['taker_buy_quote_asset_volume'], fill_value=0)
+            df['taker_sell_quote_asset_volume'] = df['quote_asset_volume'].sub(df['taker_buy_quote_asset_volume'], fill_value=np.nan)
         else:
             df['taker_sell_quote_asset_volume'] = np.nan
 
-        # S'assurer que toutes les colonnes de BASE_COLUMNS_RAW sont présentes
+        # S'assurer que toutes les colonnes de BASE_COLUMNS_RAW sont présentes et dans le bon ordre
         for col in BASE_COLUMNS_RAW:
             if col not in df.columns:
-                df[col] = np.nan
-        
-        df = df[BASE_COLUMNS_RAW] # Sélectionner et ordonner
+                df[col] = np.nan # Ajouter la colonne avec NaNs si elle manque
+        df = df[BASE_COLUMNS_RAW]
 
+        # Supprimer les lignes où les timestamps ou OHLC essentiels sont NaNs après conversion
         essential_cols_for_dropna = ['timestamp', 'open', 'high', 'low', 'close', 'kline_close_time']
         df.dropna(subset=essential_cols_for_dropna, how='any', inplace=True)
         
-        logger.info(f"{log_ctx} Fetched and processed {len(df)} klines via REST API.")
+        if df.empty:
+            logger.info(f"{log_ctx} DataFrame vide après nettoyage des K-lines (NaNs dans colonnes essentielles).")
+        else:
+            logger.info(f"{log_ctx} Récupéré et traité {len(df)} K-lines via API REST.")
         return df
 
     except requests.exceptions.HTTPError as http_err:
-        logger.error(f"{log_ctx} HTTP error fetching klines: {http_err}. Response: {http_err.response.text if http_err.response else 'No response body'}")
-    except requests.exceptions.RequestException as req_err:
-        logger.error(f"{log_ctx} Request error fetching klines: {req_err}")
+        logger.error(f"{log_ctx} Erreur HTTP lors de la récupération des K-lines : {http_err}. "
+                     f"Réponse : {http_err.response.text if http_err.response else 'Pas de corps de réponse'}")
+    except requests.exceptions.RequestException as req_err: # Timeout, ConnectionError, etc.
+        logger.error(f"{log_ctx} Erreur de requête lors de la récupération des K-lines : {req_err}")
     except json.JSONDecodeError as json_err:
-        logger.error(f"{log_ctx} JSON decode error processing klines response: {json_err}")
-    except Exception as e:
-        logger.error(f"{log_ctx} Unexpected error fetching/processing klines: {e}", exc_info=True)
+        logger.error(f"{log_ctx} Erreur de décodage JSON lors du traitement de la réponse des K-lines : {json_err}")
+    except Exception as e: # pylint: disable=broad-except
+        logger.error(f"{log_ctx} Erreur inattendue lors de la récupération/traitement des K-lines : {e}", exc_info=True)
     return None
 
 
 def initialize_pair_data(
     pair: str,
-    raw_path: Path, # Chemin vers le fichier {PAIR}_1min_live_raw.csv
-    total_klines_to_fetch: int,
-    account_type: str
-):
+    raw_path: Path, # Chemin vers le fichier CSV brut (ex: PAIR_1min_live_raw.csv)
+    total_klines_to_fetch: int, # Nombre total de K-lines 1-min souhaité dans le fichier
+    account_type: str # Pour get_binance_klines_rest (SPOT, MARGIN, FUTURES_USDT, etc.)
+) -> None:
     """
-    Initializes the raw 1-minute data file for a pair, fetching historical data in batches if needed.
-    The `config_interval_context` is implicitly "1min" as this function deals with the base 1-min raw data.
+    Initialise le fichier de données brutes 1-minute pour une paire.
+    Si le fichier existe, il est complété avec des données plus anciennes pour atteindre
+    `total_klines_to_fetch`. Si le fichier n'existe pas, il est créé avec
+    `total_klines_to_fetch` K-lines historiques.
+
+    Args:
+        pair (str): Symbole de la paire (ex: BTCUSDT).
+        raw_path (Path): Chemin complet vers le fichier CSV de données brutes 1-minute.
+        total_klines_to_fetch (int): Nombre total de K-lines 1-minute à avoir dans le fichier.
+        account_type (str): Type de compte/marché pour l'appel API.
     """
-    log_ctx = f"[{pair}][1min][{account_type.upper()}]" # Contexte pour le logging
-    logger.info(f"{log_ctx} Initializing live raw data file: {raw_path}")
+    pair_upper = pair.upper()
+    log_ctx = f"[{pair_upper}][1min][InitData][{account_type.upper()}]"
+    logger.info(f"{log_ctx} Initialisation du fichier de données brutes live : {raw_path}")
+    logger.info(f"{log_ctx} Nombre total de K-lines 1-minute visé : {total_klines_to_fetch}")
 
-    try:
-        df_existing = pd.DataFrame(columns=BASE_COLUMNS_RAW)
-        if raw_path.exists() and raw_path.stat().st_size > 0:
-            try:
-                df_existing = pd.read_csv(raw_path)
-                # Convert timestamp column immediately after loading
-                if 'timestamp' in df_existing.columns:
-                    df_existing['timestamp'] = pd.to_datetime(df_existing['timestamp'], utc=True, errors='coerce')
-                    df_existing.dropna(subset=['timestamp'], inplace=True) # Remove rows where timestamp conversion failed
-                else: # If no timestamp column, treat as empty for safety
-                    logger.warning(f"{log_ctx} Existing file {raw_path} lacks 'timestamp' column. Treating as empty.")
-                    df_existing = pd.DataFrame(columns=BASE_COLUMNS_RAW)
-
-            except pd.errors.EmptyDataError:
-                logger.warning(f"{log_ctx} Raw file {raw_path} is empty. Will fetch full history.")
-            except Exception as e_read:
-                logger.error(f"{log_ctx} Error reading existing raw file {raw_path}: {e_read}. Attempting to re-fetch history.", exc_info=True)
-        else:
-            logger.info(f"{log_ctx} Raw file {raw_path} not found or empty. Will fetch history.")
-            # Ensure the file exists with headers if it's completely new
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(columns=BASE_COLUMNS_RAW).to_csv(raw_path, index=False)
-
-
-        num_lines_existing = len(df_existing)
-        klines_needed = total_klines_to_fetch - num_lines_existing
-        logger.info(f"{log_ctx} Existing rows: {num_lines_existing}. Target total: {total_klines_to_fetch}. Klines needed: {klines_needed}")
-
-        if klines_needed > 0:
-            logger.info(f"{log_ctx} Fetching {klines_needed} historical 1-minute klines to complete initial history...")
-            all_new_klines_list: List[pd.DataFrame] = []
-            current_end_timestamp_ms: Optional[int] = None # Start with most recent and go backwards
-
-            # Determine API batch limit
-            api_batch_limit = API_BATCH_LIMIT_SPOT_MARGIN if account_type.upper() in ["SPOT", "MARGIN"] else API_BATCH_LIMIT_FUTURES
-
-            retries_for_full_history = 3
-            fetch_attempt = 0
-
-            while klines_needed > 0 and fetch_attempt < retries_for_full_history :
-                fetch_this_batch = min(klines_needed, api_batch_limit)
-                logger.info(f"{log_ctx} Fetching batch of {fetch_this_batch} klines (remaining needed: {klines_needed}). EndTime ms for API: {current_end_timestamp_ms}")
-
-                df_batch = get_binance_klines_rest(
-                    symbol=pair,
-                    limit=fetch_this_batch,
-                    account_type=account_type,
-                    end_timestamp_ms=current_end_timestamp_ms
-                )
-
-                if df_batch is not None and not df_batch.empty:
-                    all_new_klines_list.append(df_batch)
-                    klines_needed -= len(df_batch)
-                    
-                    # Prepare for next older batch: oldest timestamp from current batch - 1ms
-                    # Ensure 'timestamp' is datetime before trying to access .iloc[0]
-                    if not pd.api.types.is_datetime64_any_dtype(df_batch['timestamp']):
-                        df_batch['timestamp'] = pd.to_datetime(df_batch['timestamp'], utc=True, errors='coerce')
-                        df_batch.dropna(subset=['timestamp'], inplace=True) # Reclean if conversion failed for some
-                    
-                    if df_batch.empty: # If all rows dropped after timestamp conversion
-                        logger.warning(f"{log_ctx} Batch became empty after timestamp conversion/dropna. Stopping history fetch for this cycle.")
-                        break
-
-
-                    oldest_ts_in_batch: pd.Timestamp = df_batch['timestamp'].iloc[0]
-                    current_end_timestamp_ms = int(oldest_ts_in_batch.timestamp() * 1000) -1 # Go back from this point
-
-                    if len(df_batch) < fetch_this_batch:
-                        logger.info(f"{log_ctx} API returned fewer klines ({len(df_batch)}) than requested ({fetch_this_batch}). Assuming end of available history.")
-                        break
-                    time.sleep(0.3) # API rate limit respect
-                else:
-                    logger.warning(f"{log_ctx} Failed to fetch a batch or batch empty. Stopping history fetch for this cycle.")
-                    fetch_attempt +=1
-                    if fetch_attempt < retries_for_full_history:
-                        logger.info(f"{log_ctx} Retrying history fetch in 5 seconds (attempt {fetch_attempt}/{retries_for_full_history})")
-                        time.sleep(5)
-                    else:
-                        logger.error(f"{log_ctx} Max retries reached for fetching historical batches.")
-                        break
-            
-            if all_new_klines_list:
-                df_new_total = pd.concat(all_new_klines_list, ignore_index=True)
-                
-                # Combine with existing, sort, and remove duplicates
-                df_combined = pd.concat([df_existing, df_new_total], ignore_index=True)
-                if 'timestamp' in df_combined.columns: # Should always be true
-                    if not pd.api.types.is_datetime64_any_dtype(df_combined['timestamp']):
-                        df_combined['timestamp'] = pd.to_datetime(df_combined['timestamp'], utc=True, errors='coerce')
-                    df_combined.dropna(subset=['timestamp'], inplace=True)
-                    df_combined.sort_values(by='timestamp', ascending=True, inplace=True)
-                    df_combined.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
-                
-                # Ensure all base columns are present before saving
-                for col in BASE_COLUMNS_RAW:
-                    if col not in df_combined.columns:
-                        df_combined[col] = np.nan
-                
-                df_combined[BASE_COLUMNS_RAW].to_csv(raw_path, index=False)
-                logger.info(f"{log_ctx} Saved initial/updated {len(df_combined)} rows to {raw_path}")
-            elif num_lines_existing == 0: # Fetch failed and file was initially empty
-                logger.warning(f"{log_ctx} Initial history fetch failed and file was empty. {raw_path} remains empty (with headers).")
-                # File with headers was already created if it didn't exist.
-            else: # Fetch failed but there was existing data
-                 logger.warning(f"{log_ctx} Initial history fetch failed. Existing {num_lines_existing} rows in {raw_path} are preserved.")
-        else:
-            logger.info(f"{log_ctx} Sufficient data ({num_lines_existing} rows >= target {total_klines_to_fetch}) already present in {raw_path}.")
-
-    except Exception as e:
-        logger.error(f"{log_ctx} Error during live data initialization for {raw_path}: {e}", exc_info=True)
-
-
-def run_initialization(app_config_obj_or_dict: Union['AppConfig', Dict[str, Any]]):
-    """
-    Orchestrates the initialization of raw 1-minute live data files for all configured pairs.
-    """
-    logger.info("--- Running Live Data Initialization (REST API for 1-minute history) ---")
-
-    # Extract necessary configs
-    # This part needs to be robust whether a full AppConfig object or a dict (e.g. from JSON) is passed
-    if hasattr(app_config_obj_or_dict, 'live_config') and hasattr(app_config_obj_or_dict, 'global_config'): # Likely AppConfig object
-        live_fetch_config = app_config_obj_or_dict.live_config.live_fetch # type: ignore
-        global_settings = app_config_obj_or_dict.live_config.global_live_settings # type: ignore
-        paths_config = app_config_obj_or_dict.global_config.paths # type: ignore
-    elif isinstance(app_config_obj_or_dict, dict): # If it's a dict (e.g. loaded from JSON directly)
-        live_fetch_config_dict = app_config_obj_or_dict.get('live_fetch', {})
-        global_settings_dict = app_config_obj_or_dict.get('global_live_settings', {})
-        # Need to access paths from a nested global_config if AppConfig structure is mirrored in dict
-        paths_config_dict = app_config_obj_or_dict.get('global_config', {}).get('paths', {})
-        
-        # Create simple objects or access dict keys for attributes
-        class SimpleLiveFetch:
-            crypto_pairs = live_fetch_config_dict.get('crypto_pairs', [])
-            limit_init_history = live_fetch_config_dict.get('limit_init_history', 1000)
-        live_fetch_config = SimpleLiveFetch() # type: ignore
-
-        class SimpleGlobalSettings:
-            account_type = global_settings_dict.get('account_type', 'MARGIN')
-        global_settings = SimpleGlobalSettings() # type: ignore
-
-        class SimplePaths:
-            data_live_raw = paths_config_dict.get('data_live_raw', 'data/live/raw') # Default path
-        paths_config = SimplePaths() # type: ignore
-    else:
-        logger.critical("Invalid configuration object passed to run_initialization.")
-        return
-
-    pairs = getattr(live_fetch_config, 'crypto_pairs', [])
-    total_klines_to_fetch_init = getattr(live_fetch_config, 'limit_init_history', 1000)
-    account_type = getattr(global_settings, 'account_type', 'MARGIN')
-    
-    # Determine project root to correctly resolve data_live_raw path
-    # This assumes that if AppConfig is passed, its project_root is set.
-    # If a dict is passed, we need a way to get project_root.
-    project_root_path: Path
-    if hasattr(app_config_obj_or_dict, 'project_root'):
-        project_root_path = Path(app_config_obj_or_dict.project_root) # type: ignore
-    else: # Fallback if project_root is not in the passed config (e.g. simple dict)
+    df_existing = pd.DataFrame(columns=BASE_COLUMNS_RAW)
+    if raw_path.exists() and raw_path.stat().st_size > 0:
         try:
-            project_root_path = Path(__file__).resolve().parent.parent.parent # Assuming src/data/acquisition_live.py
-        except NameError:
-            project_root_path = Path(".").resolve() # Current working directory
-        logger.warning(f"project_root not found in config, using detected: {project_root_path}")
+            df_existing = pd.read_csv(raw_path)
+            if 'timestamp' in df_existing.columns:
+                df_existing['timestamp'] = pd.to_datetime(df_existing['timestamp'], errors='coerce', utc=True)
+                df_existing.dropna(subset=['timestamp'], inplace=True) # Important
+            else:
+                logger.warning(f"{log_ctx} Fichier existant {raw_path} sans colonne 'timestamp'. Traité comme vide.")
+                df_existing = pd.DataFrame(columns=BASE_COLUMNS_RAW)
+            logger.info(f"{log_ctx} Fichier existant chargé. Contient {len(df_existing)} lignes valides.")
+        except pd.errors.EmptyDataError:
+            logger.warning(f"{log_ctx} Fichier brut {raw_path} est vide. Récupération complète de l'historique.")
+        except Exception as e_read: # pylint: disable=broad-except
+            logger.error(f"{log_ctx} Erreur lors de la lecture du fichier brut existant {raw_path}: {e_read}. "
+                         "Tentative de récupération complète de l'historique.", exc_info=True)
+    else:
+        logger.info(f"{log_ctx} Fichier brut {raw_path} non trouvé ou vide. Récupération de l'historique.")
+        # S'assurer que le répertoire parent existe
+        try:
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e_mkdir:
+            logger.error(f"{log_ctx} Échec de la création du répertoire parent {raw_path.parent} : {e_mkdir}. Abandon.")
+            return
+
+    num_existing_valid_lines = len(df_existing)
+    klines_still_needed = total_klines_to_fetch - num_existing_valid_lines
+    logger.info(f"{log_ctx} Lignes valides existantes : {num_existing_valid_lines}. K-lines encore nécessaires : {klines_still_needed}")
+
+    if klines_still_needed > 0:
+        logger.info(f"{log_ctx} Récupération de {klines_still_needed} K-lines 1-minute historiques supplémentaires...")
+        
+        all_newly_fetched_klines_list: List[pd.DataFrame] = []
+        
+        # Déterminer le point de départ pour la récupération des données plus anciennes
+        # Si des données existent, on part du timestamp le plus ancien de ces données.
+        current_api_end_timestamp_ms: Optional[int] = None
+        if not df_existing.empty and 'timestamp' in df_existing.columns and df_existing['timestamp'].is_monotonic_increasing:
+            oldest_existing_ts: pd.Timestamp = df_existing['timestamp'].iloc[0]
+            current_api_end_timestamp_ms = int(oldest_existing_ts.timestamp() * 1000)
+            logger.debug(f"{log_ctx} Récupération des données antérieures à : {oldest_existing_ts} (TS ms: {current_api_end_timestamp_ms})")
+        else:
+            logger.debug(f"{log_ctx} Aucune donnée existante valide ou timestamp le plus ancien non déterminable. Récupération des données les plus récentes en premier, puis vers le passé.")
+            # Si pas de données, current_api_end_timestamp_ms reste None, get_binance_klines_rest prendra les plus récentes.
+
+        # Déterminer la limite de batch pour l'API
+        batch_limit_for_api: int
+        if account_type.upper() in ["SPOT", "MARGIN"]: batch_limit_for_api = API_BATCH_LIMIT_SPOT_MARGIN
+        elif account_type.upper() == "FUTURES_USDT": batch_limit_for_api = API_BATCH_LIMIT_FUTURES
+        elif account_type.upper() == "FUTURES_COIN": batch_limit_for_api = API_BATCH_LIMIT_FUTURES_COIN_M
+        else: batch_limit_for_api = API_BATCH_LIMIT_SPOT_MARGIN # Fallback
+
+        fetch_attempts_current_history_fill = 0
+        while klines_still_needed > 0 and fetch_attempts_current_history_fill < MAX_API_FETCH_RETRIES:
+            num_to_fetch_this_batch = min(klines_still_needed, batch_limit_for_api)
+            logger.info(f"{log_ctx} Tentative de récupération d'un batch de {num_to_fetch_this_batch} K-lines. "
+                        f"Fin avant (ms) : {current_api_end_timestamp_ms}. Restant à récupérer : {klines_still_needed}.")
+
+            df_batch_fetched = get_binance_klines_rest(
+                symbol=pair_upper,
+                limit=num_to_fetch_this_batch,
+                account_type=account_type,
+                end_timestamp_ms=current_api_end_timestamp_ms
+            )
+
+            if df_batch_fetched is not None and not df_batch_fetched.empty:
+                all_newly_fetched_klines_list.append(df_batch_fetched)
+                klines_still_needed -= len(df_batch_fetched)
+                
+                # Mettre à jour end_timestamp_ms pour le prochain batch (plus ancien)
+                # S'assurer que la colonne 'timestamp' est du bon type et triée
+                if not pd.api.types.is_datetime64_any_dtype(df_batch_fetched['timestamp']):
+                    df_batch_fetched['timestamp'] = pd.to_datetime(df_batch_fetched['timestamp'], errors='coerce', utc=True)
+                
+                df_batch_fetched.sort_values(by='timestamp', ascending=True, inplace=True) # Nécessaire pour prendre le .iloc[0] correct
+                
+                if df_batch_fetched.empty or df_batch_fetched['timestamp'].isnull().all():
+                    logger.warning(f"{log_ctx} Batch devenu vide ou timestamps invalides après conversion. Arrêt de la récupération pour ce cycle.")
+                    break
+                
+                oldest_ts_in_this_batch: pd.Timestamp = df_batch_fetched['timestamp'].iloc[0]
+                current_api_end_timestamp_ms = int(oldest_ts_in_this_batch.timestamp() * 1000)
+                # Pas besoin de soustraire 1ms ici, car endTime est exclusif.
+                # Si on veut les klines strictement AVANT ce timestamp, c'est correct.
+
+                if len(df_batch_fetched) < num_to_fetch_this_batch:
+                    logger.info(f"{log_ctx} L'API a retourné moins de K-lines ({len(df_batch_fetched)}) que demandé ({num_to_fetch_this_batch}). "
+                                "Supposition de la fin de l'historique disponible dans cette direction.")
+                    break # Fin de l'historique disponible
+                time.sleep(0.3) # Petit délai pour respecter les limites de taux API
+            else: # Échec de la récupération du batch ou batch vide
+                logger.warning(f"{log_ctx} Échec de la récupération d'un batch ou batch vide. Tentative {fetch_attempts_current_history_fill + 1}/{MAX_API_FETCH_RETRIES}.")
+                fetch_attempts_current_history_fill += 1
+                if fetch_attempts_current_history_fill < MAX_API_FETCH_RETRIES:
+                    logger.info(f"{log_ctx} Nouvelle tentative de récupération de l'historique dans {API_FETCH_RETRY_DELAY_SECONDS} secondes.")
+                    time.sleep(API_FETCH_RETRY_DELAY_SECONDS)
+                else:
+                    logger.error(f"{log_ctx} Nombre maximum de tentatives atteint pour la récupération des batches historiques.")
+                    break # Sortir de la boucle while
+        
+        if all_newly_fetched_klines_list:
+            df_newly_fetched_total = pd.concat(all_newly_fetched_klines_list, ignore_index=True)
+            
+            # Combiner avec les données existantes, trier, et supprimer les doublons
+            df_combined_final = pd.concat([df_existing, df_newly_fetched_total], ignore_index=True)
+            
+            if 'timestamp' in df_combined_final.columns: # Devrait toujours être vrai
+                # Re-convertir et nettoyer au cas où des types non-datetime seraient introduits par concat
+                if not pd.api.types.is_datetime64_any_dtype(df_combined_final['timestamp']):
+                    df_combined_final['timestamp'] = pd.to_datetime(df_combined_final['timestamp'], errors='coerce', utc=True)
+                df_combined_final.dropna(subset=['timestamp'], inplace=True)
+                df_combined_final.sort_values(by='timestamp', ascending=True, inplace=True)
+                df_combined_final.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+            
+            # S'assurer que toutes les colonnes BASE_COLUMNS_RAW sont présentes avant la sauvegarde
+            for col in BASE_COLUMNS_RAW:
+                if col not in df_combined_final.columns:
+                    df_combined_final[col] = np.nan
+            
+            # Sauvegarder le DataFrame combiné et nettoyé
+            try:
+                df_combined_final[BASE_COLUMNS_RAW].to_csv(raw_path, index=False, float_format='%.8f')
+                logger.info(f"{log_ctx} Fichier de données brutes initialisé/mis à jour avec {len(df_combined_final)} lignes : {raw_path}")
+            except Exception as e_save: # pylint: disable=broad-except
+                logger.error(f"{log_ctx} Erreur lors de la sauvegarde du fichier de données combinées {raw_path} : {e_save}", exc_info=True)
+
+        elif num_existing_valid_lines == 0: # Si la récupération a échoué et que le fichier était initialement vide
+            logger.warning(f"{log_ctx} La récupération de l'historique initial a échoué et le fichier était vide. "
+                           f"Le fichier {raw_path} reste vide (ou avec seulement les en-têtes s'il vient d'être créé).")
+            # Créer un fichier vide avec les en-têtes s'il n'existe pas ou est complètement vide
+            if not raw_path.exists() or raw_path.stat().st_size == 0:
+                 pd.DataFrame(columns=BASE_COLUMNS_RAW).to_csv(raw_path, index=False)
+        else: # Si la récupération a échoué mais qu'il y avait des données existantes
+             logger.warning(f"{log_ctx} La récupération de l'historique supplémentaire a échoué. "
+                            f"Les {num_existing_valid_lines} lignes existantes dans {raw_path} sont préservées.")
+    else: # klines_still_needed <= 0
+        logger.info(f"{log_ctx} Données suffisantes ({num_existing_valid_lines} lignes >= cible {total_klines_to_fetch}) "
+                    f"déjà présentes dans {raw_path}. Aucune récupération supplémentaire nécessaire.")
+
+    # Vérification finale du fichier après toutes les opérations
+    if raw_path.exists() and raw_path.stat().st_size > 0:
+        try:
+            df_final_check = pd.read_csv(raw_path)
+            logger.info(f"{log_ctx} Vérification finale : {raw_path} contient {len(df_final_check)} lignes.")
+        except Exception: # pylint: disable=broad-except
+            logger.error(f"{log_ctx} Échec de la lecture du fichier final {raw_path} pour vérification.")
+    elif not raw_path.exists():
+        logger.error(f"{log_ctx} Fichier final {raw_path} non trouvé après le processus d'initialisation.")
 
 
-    raw_dir_str = getattr(paths_config, 'data_live_raw', 'data/live/raw') # Default if not in paths_config
-    raw_dir = project_root_path / raw_dir_str # Resolve raw_dir relative to project_root
+def run_initialization(app_config_obj_or_dict: Union['AppConfig', Dict[str, Any]]) -> None:
+    """
+    Orchestre l'initialisation des fichiers de données brutes 1-minute pour toutes
+    les paires configurées dans `AppConfig.live_config.live_fetch.crypto_pairs`.
 
-    if not pairs:
-        logger.error("No crypto_pairs defined in live_fetch configuration. Cannot initialize.")
+    Args:
+        app_config_obj_or_dict (Union[AppConfig, Dict[str, Any]]): Soit une instance
+            complète de AppConfig, soit un dictionnaire la représentant (ex: chargé d'un JSON).
+    """
+    main_log_prefix = "[LiveInitOrchestrator]"
+    logger.info(f"{main_log_prefix} --- Démarrage de l'Initialisation des Données Live (API REST pour historique 1-minute) ---")
+
+    # Extraction robuste de la configuration nécessaire
+    live_fetch_cfg: Optional['LiveFetchConfig'] = None
+    global_live_settings_cfg: Optional['GlobalLiveSettings'] = None
+    paths_cfg: Optional['PathsConfig'] = None
+    project_root: Optional[str] = None
+
+    if hasattr(app_config_obj_or_dict, 'live_config') and \
+       hasattr(app_config_obj_or_dict, 'global_config') and \
+       hasattr(app_config_obj_or_dict, 'project_root'): # Probablement une instance AppConfig
+        
+        app_config_instance = cast('AppConfig', app_config_obj_or_dict)
+        live_fetch_cfg = app_config_instance.live_config.live_fetch
+        global_live_settings_cfg = app_config_instance.live_config.global_live_settings
+        paths_cfg = app_config_instance.global_config.paths
+        project_root = app_config_instance.project_root
+    elif isinstance(app_config_obj_or_dict, dict):
+        # Tentative d'extraire d'un dictionnaire
+        live_config_dict = app_config_obj_or_dict.get('live_config', {})
+        live_fetch_cfg_dict = live_config_dict.get('live_fetch', {})
+        global_live_settings_dict = live_config_dict.get('global_live_settings', {})
+        
+        global_config_dict = app_config_obj_or_dict.get('global_config', {})
+        paths_cfg_dict = global_config_dict.get('paths', {})
+        project_root = app_config_obj_or_dict.get('project_root')
+
+        # Créer des objets factices ou des adaptateurs si nécessaire pour accéder aux attributs
+        # Pour simplifier, on accède directement aux clés du dict, en supposant qu'elles existent
+        # ou en utilisant .get() avec des valeurs par défaut.
+        # Ceci est moins sûr que d'utiliser des dataclasses typées.
+        class _TempLiveFetchConfig:
+            crypto_pairs = live_fetch_cfg_dict.get('crypto_pairs', [])
+            limit_init_history = live_fetch_cfg_dict.get('limit_init_history', 2000)
+        live_fetch_cfg = cast('LiveFetchConfig', _TempLiveFetchConfig())
+
+        class _TempGlobalLiveSettings:
+            # account_type est dans GlobalLiveSettings dans definitions.py
+            # mais dans le JSON config_live.json, il est au même niveau que run_live_trading.
+            # La structure de AppConfig doit être respectée.
+            account_type = global_live_settings_dict.get('account_type', 'SPOT') # Ajuster si la structure diffère
+        global_live_settings_cfg = cast('GlobalLiveSettings', _TempGlobalLiveSettings())
+
+        class _TempPathsConfig:
+            data_live_raw = paths_cfg_dict.get('data_live_raw', 'data/live/raw')
+        paths_cfg = cast('PathsConfig', _TempPathsConfig())
+    
+    if not all([live_fetch_cfg, global_live_settings_cfg, paths_cfg]):
+        logger.critical(f"{main_log_prefix} Configuration essentielle manquante (live_fetch, global_live_settings, ou paths). Impossible de continuer.")
         return
 
-    for pair in pairs:
-        if not pair or not isinstance(pair, str):
-            logger.warning(f"Invalid pair found in configuration: {pair}. Skipping.")
+    if not project_root:
+        try:
+            project_root = str(Path(__file__).resolve().parent.parent.parent) # src/data -> src -> project_root
+            logger.warning(f"{main_log_prefix} project_root non trouvé dans la config, déduction : {project_root}")
+        except NameError: # __file__ non défini
+            project_root = str(Path(".").resolve())
+            logger.warning(f"{main_log_prefix} project_root non trouvé et __file__ non défini, utilisation du répertoire courant : {project_root}")
+    
+    project_root_path = Path(project_root)
+    raw_dir_path = project_root_path / paths_cfg.data_live_raw
+
+    pairs_to_init = live_fetch_cfg.crypto_pairs
+    total_klines_target = live_fetch_cfg.limit_init_history
+    # L'account_type pour l'API REST publique est moins critique que pour les ordres,
+    # mais il détermine l'URL de base (spot vs futures) et les limites de taux.
+    # On prend celui de global_live_settings qui devrait refléter le marché principal visé.
+    api_account_type = global_live_settings_cfg.account_type # type: ignore
+
+    if not pairs_to_init:
+        logger.error(f"{main_log_prefix} Aucune crypto_pairs définie dans live_fetch_config. Initialisation impossible.")
+        return
+
+    logger.info(f"{main_log_prefix} Paires à initialiser : {pairs_to_init}. "
+                f"Type de compte API pour fetch : {api_account_type}. "
+                f"Répertoire des données brutes live : {raw_dir_path}")
+
+    for pair_symbol in pairs_to_init:
+        if not pair_symbol or not isinstance(pair_symbol, str):
+            logger.warning(f"{main_log_prefix} Symbole de paire invalide trouvé dans la configuration : '{pair_symbol}'. Ignoré.")
             continue
             
-        # Standardized raw live data filename
-        raw_file_name = f"{pair.upper()}_1min_live_raw.csv"
-        raw_path_for_pair = raw_dir / raw_file_name
+        # Nom de fichier standardisé pour les données brutes live 1-minute
+        raw_file_name_for_pair = f"{pair_symbol.upper()}_1min_live_raw.csv"
+        full_raw_path_for_pair = raw_dir_path / raw_file_name_for_pair
         
-        logger.info(f"Initializing 1-minute live raw data for {pair.upper()} into {raw_path_for_pair}...")
+        logger.info(f"{main_log_prefix} Initialisation des données brutes 1-minute pour {pair_symbol.upper()} -> {full_raw_path_for_pair}...")
         try:
-            # The 'config_interval_context' for initialize_pair_data is implicitly "1min"
-            # as it deals with the fundamental 1-minute raw data file.
             initialize_pair_data(
-                pair=pair.upper(),
-                raw_path=raw_path_for_pair,
-                total_klines_to_fetch=total_klines_to_fetch_init,
-                account_type=account_type
+                pair=pair_symbol.upper(),
+                raw_path=full_raw_path_for_pair,
+                total_klines_to_fetch=total_klines_target,
+                account_type=api_account_type
             )
-        except Exception as e:
-            logger.error(f"Failed to initialize live raw data for {pair.upper()} (file: {raw_path_for_pair}): {e}", exc_info=True)
+        except Exception as e_init_pair: # pylint: disable=broad-except
+            logger.error(f"{main_log_prefix} Échec de l'initialisation des données brutes live pour {pair_symbol.upper()} "
+                         f"(fichier: {full_raw_path_for_pair}): {e_init_pair}", exc_info=True)
 
-    logger.info("--- Live Data Initialization (REST fetch) Complete ---")
+    logger.info(f"{main_log_prefix} --- Initialisation des Données Live (API REST) Terminée ---")
 
 
 if __name__ == '__main__':
-    # Example for direct testing of this module.
-    # In a real application, run_fetch_data_live.py would call run_initialization.
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s:%(lineno)d - %(levelname)s - %(message)s')
-    logger.info("Running acquisition_live.py directly for testing (REST API only)...")
+    # Configuration du logging pour exécution directe (tests)
+    logging.basicConfig(
+        level=logging.DEBUG, # Mettre à DEBUG pour voir plus de détails pendant les tests
+        format='%(asctime)s - %(name)s:%(lineno)d - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    logger.info("Exécution de src/data/acquisition_live.py directement pour tests (API REST uniquement)...")
 
-    # Create a mock configuration dictionary similar to what AppConfig would provide
-    # This requires paths to be relative to where this script might be run from if not project root.
-    # For robust testing, ensure paths are correctly set or use absolute paths.
-    
-    # Determine a base path for test data (e.g., in a temporary directory or a test_data subdir)
+    # Créer une configuration factice pour le test
+    # S'assurer que les chemins sont corrects par rapport à l'endroit où le test est lancé
     try:
-        _test_project_root = Path(__file__).resolve().parent.parent.parent
-    except NameError:
-        _test_project_root = Path(".").resolve()
+        _test_project_root_main = Path(__file__).resolve().parent.parent.parent
+    except NameError: # Si __file__ n'est pas défini (ex: REPL)
+        _test_project_root_main = Path(".").resolve()
 
-    _test_data_live_raw_path = _test_project_root / "test_temp_data" / "live" / "raw"
-    _test_data_live_raw_path.mkdir(parents=True, exist_ok=True)
+    _test_data_live_raw_path_main = _test_project_root_main / "temp_test_data_live" / "raw"
+    _test_data_live_raw_path_main.mkdir(parents=True, exist_ok=True) # Créer le répertoire de test
 
-    mock_app_config_dict = {
+    mock_app_config_dict_main = {
+        "project_root": str(_test_project_root_main),
         "global_config": {
             "paths": {
-                "data_live_raw": str(_test_data_live_raw_path.relative_to(_test_project_root)) # Path relative to project root
-            },
-            # Other global_config fields if needed by other parts, but not directly by run_initialization
+                "data_live_raw": str(_test_data_live_raw_path_main.relative_to(_test_project_root_main))
+            }
+            # D'autres champs de GlobalConfig peuvent être nécessaires si les fonctions internes les utilisent
         },
         "live_config": {
             "live_fetch": {
-                "crypto_pairs": ["BTCUSDT", "ETHUSDT"], # Example pairs
-                "intervals": ["1m"], # This is mainly for context in other parts, fetch is always 1m
-                "limit_init_history": 500, # Smaller number for quick test
-                # "limit_per_fetch": 100, # Not used by run_initialization directly
-                # "max_retries": 3,
-                # "retry_backoff": 1.5
+                "crypto_pairs": ["BTCUSDT", "ETHUSDT"], # Paires pour le test
+                "intervals": ["1m"], # Non directement utilisé par initialize_pair_data mais bon à avoir
+                "limit_init_history": 500, # Nombre plus petit pour un test rapide
             },
             "global_live_settings": {
-                "account_type": "SPOT" # Or MARGIN, FUTURES
+                "account_type": "SPOT" # Ou MARGIN, FUTURES_USDT, FUTURES_COIN selon l'API à tester
             }
-        },
-        "project_root": str(_test_project_root) # Crucial for resolving relative paths
-        # Other AppConfig fields like data_config, strategies_config, api_keys might be needed
-        # if the functions called by run_initialization depend on them.
-        # For this specific test of acquisition_live, these might be minimal.
+        }
+        # Les autres sections de AppConfig (data_config, strategies_config, etc.) ne sont pas
+        # directement utilisées par run_initialization ici, mais une AppConfig complète serait passée normalement.
     }
 
-    logger.info(f"Using test project root: {_test_project_root}")
-    logger.info(f"Test live raw data will be stored in: {_test_data_live_raw_path}")
+    logger.info(f"Utilisation de la racine de projet de test : {_test_project_root_main}")
+    logger.info(f"Les données brutes live de test seront stockées dans : {_test_data_live_raw_path_main}")
 
     try:
-        run_initialization(mock_app_config_dict) # type: ignore
-        logger.info("Test execution of run_initialization finished.")
-    except ImportError as e_imp:
-         logger.critical(f"Missing library for test: {e_imp}. Please install required packages (e.g., python-binance, requests).")
-    except Exception as main_err:
-         logger.critical(f"Critical error in test main execution: {main_err}", exc_info=True)
+        run_initialization(cast('AppConfig', mock_app_config_dict_main)) # cast pour le typage
+        logger.info("Exécution de test de run_initialization terminée.")
+    except ImportError as e_imp_test_main:
+         logger.critical(f"Bibliothèque manquante pour le test: {e_imp_test}. "
+                         "Veuillez installer les paquets requis (ex: requests, pandas, numpy).")
+    except Exception as main_err_test: # pylint: disable=broad-except
+         logger.critical(f"Erreur critique lors de l'exécution du test principal : {main_err_test}", exc_info=True)
 
+    # Optionnel : Nettoyage après test
+    # import shutil
+    # if _test_data_live_raw_path_main.parent.exists(): # Supprimer temp_test_data_live
+    #     logger.info(f"Nettoyage du répertoire de test : {_test_data_live_raw_path_main.parent}")
+    #     shutil.rmtree(_test_data_live_raw_path_main.parent)

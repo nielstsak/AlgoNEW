@@ -1,215 +1,237 @@
+# src/utils/logging_setup.py
+"""
+Ce module est responsable de la configuration du système de logging de l'application.
+Il utilise un objet LoggingConfig pour définir les paramètres des loggers,
+handlers, et formateurs.
+"""
 import logging
 import logging.handlers
 import sys
-import os
+import os # Importé pour une éventuelle utilisation, bien que Path soit préféré
 from pathlib import Path
 from typing import Dict, Optional, Any, List, Union, TYPE_CHECKING
 
-# Attempt to import python-json-logger
+# Tentative d'importation de python-json-logger pour le formatage JSON optionnel
 try:
     from pythonjsonlogger import jsonlogger
     JSON_LOGGER_AVAILABLE = True
-    logging.getLogger(__name__).debug("python-json-logger library found.")
+    # Ne pas logger ici au niveau du module, car le logging n'est pas encore configuré.
+    # Un logger spécifique à ce module sera créé plus bas.
 except ImportError:
     JSON_LOGGER_AVAILABLE = False
-    logging.getLogger(__name__).debug("python-json-logger library NOT found. JSON logging will be disabled.")
+    # De même, pas de log ici. L'information sera loguée par la fonction setup_logging.
 
 if TYPE_CHECKING:
-    # Assuming LoggingConfig and LiveLoggingConfig are defined in definitions.py
-    # and loader.py makes them available.
-    # For a standalone script, you might need to adjust this import
-    # or define placeholder classes if definitions.py is not directly accessible.
-    try:
-        from src.config.definitions import LoggingConfig, LiveLoggingConfig
-    except ImportError:
-        # Define dummy classes for type hinting if actual definitions are not available
-        class LoggingConfig:
-            level: str
-            format: str
-            log_to_file: bool
-            log_filename_global: str
-            log_levels_by_module: Optional[Dict[str, str]] = None
-            # Add other fields if they exist in your actual LoggingConfig
+    # Importation pour le type hinting seulement, pour éviter les dépendances circulaires
+    # au moment de l'exécution si definitions.py importe des éléments de utils.
+    # Le loader.py s'assure que LoggingConfig est disponible au moment de l'appel.
+    from src.config.definitions import LoggingConfig, LiveLoggingConfig
 
-        class LiveLoggingConfig(LoggingConfig):
-            log_filename_live: Optional[str] = None
-            # Add other fields if they exist in your actual LiveLoggingConfig
+# Logger spécifique pour ce module. Il sera configuré par la fonction setup_logging
+# ou utilisera la configuration par défaut de Python si setup_logging n'est pas appelée avant.
+module_logger = logging.getLogger(__name__)
 
-
-logger = logging.getLogger(__name__)
-
-# Global list to keep track of handlers managed by this setup function
-_handlers_managed_by_setup_logging: List[logging.Handler] = []
-
-# Constants for RotatingFileHandler, can be moved to config if needed
+# Constantes pour la rotation des fichiers de log
 LOG_FILE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 LOG_FILE_BACKUP_COUNT = 5
 
+# Variable globale pour suivre les handlers gérés par cette fonction setup_logging.
+# Cela aide à éviter d'ajouter des handlers en double si setup_logging est appelée plusieurs fois.
+_handlers_managed_by_this_setup: List[logging.Handler] = []
+
 class ContextFilter(logging.Filter):
     """
-    A logging filter to inject contextual data into log records.
+    Un filtre de logging pour injecter des données contextuelles supplémentaires
+    dans chaque enregistrement de log (LogRecord).
     """
-    def __init__(self, context_data_to_add: Optional[Dict[str, Any]] = None):
+    def __init__(self, context_data: Optional[Dict[str, Any]] = None):
+        """
+        Initialise le filtre avec les données contextuelles à ajouter.
+
+        Args:
+            context_data (Optional[Dict[str, Any]]): Un dictionnaire de données
+                contextuelles. Les clés de ce dictionnaire deviendront des attributs
+                des objets LogRecord.
+        """
         super().__init__()
-        self.context_data_to_add = context_data_to_add or {}
+        self.context_data = context_data if context_data is not None else {}
 
     def filter(self, record: logging.LogRecord) -> bool:
-        for key, value in self.context_data_to_add.items():
+        """
+        Modifie l'enregistrement de log pour y ajouter les données contextuelles.
+
+        Args:
+            record (logging.LogRecord): L'enregistrement de log à traiter.
+
+        Returns:
+            bool: Toujours True, car ce filtre ne supprime pas d'enregistrements.
+        """
+        for key, value in self.context_data.items():
             setattr(record, key, value)
         return True
 
 def setup_logging(
     log_config: Union['LoggingConfig', 'LiveLoggingConfig'],
-    log_dir: str,
-    log_filename: str,
+    log_dir: Path,
+    log_filename: Optional[str] = None, # Rendu optionnel, car LiveLoggingConfig peut avoir son propre nom
     root_level: int = logging.INFO,
     context_data: Optional[Dict[str, Any]] = None,
     use_json_format: bool = False
 ) -> None:
     """
-    Sets up application-wide logging with support for JSON format,
-    file rotation, per-module levels, and contextual data.
+    Configure le système de logging de l'application.
+
+    Cette fonction configure le logger racine avec des handlers pour la console
+    et, optionnellement, pour un fichier rotatif. Elle permet également de définir
+    des niveaux de log spécifiques par module et d'utiliser un format JSON pour les logs.
 
     Args:
-        log_config: The logging configuration object.
-        log_dir: Directory where log files will be saved.
-        log_filename: Base name for the log file.
-        root_level: Logging level for the root logger.
-        context_data: Optional dictionary of contextual data to add to all logs.
-        use_json_format: Flag to enable JSON formatted logs.
+        log_config (Union[LoggingConfig, LiveLoggingConfig]): L'objet de configuration
+            contenant les paramètres de logging (niveau, format, nom de fichier, etc.).
+        log_dir (Path): Le répertoire où les fichiers de log seront sauvegardés.
+        log_filename (Optional[str]): Le nom de base pour le fichier de log.
+            Si log_config est une LiveLoggingConfig et a log_filename_live, ce dernier sera utilisé.
+            Sinon, log_config.log_filename_global sera utilisé. Ce paramètre peut surcharger.
+        root_level (int): Le niveau de logging pour le logger racine. Par défaut logging.INFO.
+        context_data (Optional[Dict[str, Any]]): Un dictionnaire optionnel de données
+            contextuelles à injecter dans chaque enregistrement de log.
+        use_json_format (bool): Si True et si python-json-logger est disponible,
+            les logs seront formatés en JSON. Sinon, un format textuel sera utilisé.
     """
-    global _handlers_managed_by_setup_logging
-    logger.debug(f"Setting up logging. JSON format: {use_json_format}, Log dir: {log_dir}, File: {log_filename}")
+    global _handlers_managed_by_this_setup
+    # Utiliser le logger de ce module pour les messages de configuration du logging
+    # Il est important que ce logger soit configuré après le root logger pour hériter de ses handlers.
+    # Pour les messages initiaux de cette fonction, ils pourraient aller à une config par défaut si appelée avant.
 
-    try:
-        # --- 1. Clean up previously managed handlers ---
-        root_logger = logging.getLogger()
-        if _handlers_managed_by_setup_logging:
-            logger.debug(f"Removing {len(_handlers_managed_by_setup_logging)} previously managed handlers.")
-            for handler_instance in _handlers_managed_by_setup_logging:
-                if handler_instance in root_logger.handlers:
-                    root_logger.removeHandler(handler_instance)
-            _handlers_managed_by_setup_logging.clear()
-        else:
-            # If the list is empty, it's possible handlers were added outside this function's control.
-            # For a truly clean setup, one might consider removing ALL handlers from root_logger.handlers
-            # but this can be disruptive if other parts of the system expect their handlers to persist.
-            # For now, we only manage handlers added by this function.
+    # Message initial avant la reconfiguration potentielle du logger de ce module
+    initial_setup_message = (
+        f"Début de la configuration du logging. Log dir: {log_dir}, "
+        f"Fichier base: {log_filename or 'déduit de log_config'}, "
+        f"Format JSON demandé: {use_json_format}, "
+        f"JSON logger disponible: {JSON_LOGGER_AVAILABLE}."
+    )
+    # print(initial_setup_message) # Imprimer directement car le logger n'est pas encore configuré
+
+    # Nettoyer les handlers précédemment gérés par cette fonction
+    root_logger = logging.getLogger()
+    if _handlers_managed_by_this_setup:
+        # print(f"Nettoyage de {len(_handlers_managed_by_this_setup)} handlers précédemment gérés.")
+        for handler in _handlers_managed_by_this_setup:
+            if handler in root_logger.handlers: # Vérifier si le handler est toujours attaché
+                root_logger.removeHandler(handler)
+                handler.close() # Important pour fermer les fichiers
+        _handlers_managed_by_this_setup.clear()
+
+    root_logger.setLevel(root_level)
+
+    # Déterminer le nom de fichier de log final
+    final_log_filename: str
+    if log_filename: # Si un nom de fichier est explicitement passé, il a la priorité
+        final_log_filename = log_filename
+    elif hasattr(log_config, 'log_filename_live') and getattr(log_config, 'log_filename_live'):
+        final_log_filename = getattr(log_config, 'log_filename_live')
+    elif hasattr(log_config, 'log_filename_global') and getattr(log_config, 'log_filename_global'):
+        final_log_filename = getattr(log_config, 'log_filename_global')
+    else:
+        final_log_filename = "app_default.log" # Un fallback si aucun nom n'est trouvé
+        # print(f"WARN: Nom de fichier de log non trouvé dans log_config ou non fourni. Utilisation de '{final_log_filename}'.")
+
+
+    # Créer le formateur
+    actual_use_json = use_json_format and JSON_LOGGER_AVAILABLE
+    log_format_str = log_config.format if hasattr(log_config, 'format') and log_config.format else "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    formatter: logging.Formatter
+    if actual_use_json:
+        # Pour python-json-logger, le format string est une liste de champs standard.
+        # Les champs supplémentaires (du filtre de contexte) sont ajoutés automatiquement.
+        # Un format commun pourrait être :
+        json_format = "%(asctime)s %(levelname)s %(name)s %(module)s %(lineno)d %(message)s"
+        # Si context_data est { "run_id": "xyz" }, "run_id" sera ajouté au JSON.
+        formatter = jsonlogger.JsonFormatter(json_format)
+    else:
+        formatter = logging.Formatter(log_format_str)
+        if use_json_format and not JSON_LOGGER_AVAILABLE:
+            pass # Un message sera loggué plus tard par module_logger
+
+    # Créer le filtre de contexte si des données contextuelles sont fournies
+    current_context_filter: Optional[ContextFilter] = None
+    if context_data:
+        current_context_filter = ContextFilter(context_data)
+
+    # Configurer le StreamHandler pour la console
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler_level_str = log_config.level.upper() if hasattr(log_config, 'level') else "INFO"
+    console_handler.setLevel(getattr(logging, console_handler_level_str, logging.INFO))
+    if current_context_filter:
+        console_handler.addFilter(current_context_filter)
+    root_logger.addHandler(console_handler)
+    _handlers_managed_by_this_setup.append(console_handler)
+
+    # Configurer le RotatingFileHandler si log_to_file est True
+    if hasattr(log_config, 'log_to_file') and log_config.log_to_file:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file_path = log_dir / final_log_filename
+
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file_path,
+                maxBytes=LOG_FILE_MAX_BYTES,
+                backupCount=LOG_FILE_BACKUP_COUNT,
+                encoding='utf-8'
+            )
+            file_handler.setFormatter(formatter)
+            file_handler_level_str = log_config.level.upper() if hasattr(log_config, 'level') else "INFO"
+            file_handler.setLevel(getattr(logging, file_handler_level_str, logging.INFO))
+            if current_context_filter:
+                file_handler.addFilter(current_context_filter)
+            root_logger.addHandler(file_handler)
+            _handlers_managed_by_this_setup.append(file_handler)
+            # print(f"INFO: Logging vers fichier activé : {log_file_path}")
+        except OSError as e:
+            # print(f"ERROR: Échec de la création du répertoire de log ou du file handler : {e}")
+            # Le logger de ce module n'est pas encore prêt à être utilisé pour ce message.
+            # Il sera utilisé pour les messages suivants.
+            pass # Le message sera loggué par le logger de ce module plus bas.
+        except Exception as e_unexp:
+            # print(f"ERROR: Erreur inattendue lors de la configuration du file logging : {e_unexp}")
             pass
 
 
-        # --- 2. Configure Root Logger ---
-        root_logger.setLevel(root_level)
+    # Appliquer les niveaux de log par module
+    if hasattr(log_config, 'log_levels_by_module') and log_config.log_levels_by_module:
+        for module_name_key, level_val_str in log_config.log_levels_by_module.items():
+            module_specific_logger = logging.getLogger(module_name_key)
+            level_to_set = getattr(logging, level_val_str.upper(), None)
+            if level_to_set is not None:
+                module_specific_logger.setLevel(level_to_set)
+            else:
+                # print(f"WARN: Niveau de log invalide '{level_val_str}' pour le module '{module_name_key}'.")
+                pass # Sera loggué par module_logger
 
-        # --- 3. Create Formatter ---
-        formatter: logging.Formatter
-        log_level_str = getattr(log_config, 'level', 'INFO').upper() # General level for handlers
-        handler_log_level = getattr(logging, log_level_str, logging.INFO)
-
-        # Prepare format string for text logs, incorporating context keys if present
-        base_format_str = getattr(log_config, 'format', '%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-        if context_data:
-            # Example: Automatically create context string part
-            # This is a simple way; for complex needs, modify formatter's format record.
-            # For JsonFormatter, fields are added directly.
-            # For text, if you want context in the main message string:
-            # context_str_parts = [f"%({key})s" for key in context_data.keys()]
-            # context_format_part = " - " + " - ".join(context_str_parts) if context_str_parts else ""
-            # This would require context_data keys to be simple for % formatting.
-            # A better way for text is to ensure ContextFilter sets attributes, and format string uses them.
-            # E.g., if context_data={"run_id": "123"}, format string could be "%(asctime)s - %(run_id)s - %(message)s"
-            # The default format string from the prompt is:
-            # %(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s
-            # If context_data keys are 'run_id', 'strategy_name', a new format could be:
-            # '%(asctime)s - RID:%(run_id)s - SNAME:%(strategy_name)s - %(levelname)s - %(name)s - %(module)s:%(lineno)d - %(message)s'
-            # For this implementation, we assume the provided log_config.format might already include placeholders
-            # for context data that the ContextFilter will make available on the LogRecord.
-            pass
-
-
-        if use_json_format and JSON_LOGGER_AVAILABLE:
-            # Example JSON format string, customize as needed
-            # This includes standard fields. JsonFormatter automatically adds fields from 'extra' or context filter.
-            json_format_str = '%(asctime)s %(levelname)s %(name)s %(module)s %(lineno)d %(message)s'
-            # Add context keys to the format if you want them explicitly structured by the formatter
-            # Or rely on the filter to add them and JsonFormatter to pick them up.
-            # custom_attrs_format = " ".join([f"%({key})s" for key in (context_data or {}).keys()])
-            # if custom_attrs_format:
-            #    json_format_str += " " + custom_attrs_format
-            formatter = jsonlogger.JsonFormatter(json_format_str)
-            logger.info("Using JSON log format.")
+    # Maintenant que le logging est (re)configuré, on peut utiliser module_logger
+    module_logger.info(initial_setup_message) # Loguer le message initial avec la nouvelle config
+    if use_json_format and not JSON_LOGGER_AVAILABLE:
+        module_logger.warning("Format JSON demandé mais python-json-logger n'est pas disponible. Utilisation du format textuel.")
+    
+    if hasattr(log_config, 'log_to_file') and log_config.log_to_file:
+        log_file_path_check = log_dir / final_log_filename
+        if not any(isinstance(h, logging.FileHandler) and Path(h.baseFilename).resolve() == log_file_path_check.resolve() for h in _handlers_managed_by_this_setup):
+             module_logger.error(f"Échec de la configuration du file handler pour {log_file_path_check}. Vérifiez les permissions ou les erreurs précédentes.")
         else:
-            if use_json_format and not JSON_LOGGER_AVAILABLE:
-                logger.warning("JSON logging requested but python-json-logger is not available. Falling back to text format.")
-            formatter = logging.Formatter(base_format_str)
-            logger.info(f"Using text log format: {base_format_str}")
+             module_logger.info(f"Logging vers fichier configuré : {log_file_path_check}")
+    else:
+        module_logger.info("Logging vers fichier désactivé dans la configuration.")
 
-        # --- 4. Create Context Filter (if context_data is provided) ---
-        context_filter: Optional[ContextFilter] = None
-        if context_data:
-            context_filter = ContextFilter(context_data)
-            logger.debug(f"ContextFilter created with data: {context_data.keys()}")
+    if hasattr(log_config, 'log_levels_by_module') and log_config.log_levels_by_module:
+        for module_name_key, level_val_str in log_config.log_levels_by_module.items():
+            level_to_set = getattr(logging, level_val_str.upper(), None)
+            if level_to_set is None:
+                 module_logger.warning(f"Niveau de log invalide '{level_val_str}' spécifié pour le module '{module_name_key}'. Ignoré.")
+            else:
+                 module_logger.debug(f"Niveau de log pour le module '{module_name_key}' configuré à {level_val_str.upper()}.")
+    
+    module_logger.info(f"Configuration du logging terminée. Niveau racine: {logging.getLevelName(root_logger.level)}. "
+                       f"Nombre total de handlers gérés: {len(_handlers_managed_by_this_setup)}.")
 
-        # --- 5. Console Handler ---
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(handler_log_level)
-        console_handler.setFormatter(formatter)
-        if context_filter:
-            console_handler.addFilter(context_filter)
-        root_logger.addHandler(console_handler)
-        _handlers_managed_by_setup_logging.append(console_handler)
-        logger.debug(f"Console handler added with level {log_level_str}.")
-
-        # --- 6. File Handler (if log_to_file is True) ---
-        if getattr(log_config, 'log_to_file', False):
-            try:
-                log_dir_path = Path(log_dir)
-                log_dir_path.mkdir(parents=True, exist_ok=True)
-                log_file_path = log_dir_path / log_filename
-
-                file_handler = logging.handlers.RotatingFileHandler(
-                    log_file_path,
-                    maxBytes=LOG_FILE_MAX_BYTES,
-                    backupCount=LOG_FILE_BACKUP_COUNT,
-                    encoding='utf-8'
-                )
-                file_handler.setLevel(handler_log_level)
-                file_handler.setFormatter(formatter)
-                if context_filter:
-                    file_handler.addFilter(context_filter)
-                root_logger.addHandler(file_handler)
-                _handlers_managed_by_setup_logging.append(file_handler)
-                logger.info(f"File handler added. Logging to: {log_file_path} (Level: {log_level_str}, Rotation: {LOG_FILE_MAX_BYTES / (1024*1024):.1f}MB, {LOG_FILE_BACKUP_COUNT} backups)")
-            except OSError as e_os:
-                logger.error(f"Failed to create log directory or file handler for {log_filename} in {log_dir}: {e_os}")
-                logger.info("Logging to console only due to file handler OS error.")
-            except Exception as e_file:
-                logger.error(f"Unexpected error setting up file logging: {e_file}", exc_info=True)
-                logger.info("Logging to console only due to unexpected file handler error.")
-        else:
-            logger.info(f"File logging is disabled. Logging to console only at level {log_level_str}.")
-
-        # --- 7. Apply Per-Module Log Levels ---
-        log_levels_by_module = getattr(log_config, 'log_levels_by_module', None)
-        if isinstance(log_levels_by_module, dict):
-            for module_name, level_str in log_levels_by_module.items():
-                module_logger = logging.getLogger(module_name)
-                level_int = getattr(logging, level_str.upper(), None)
-                if level_int is not None:
-                    module_logger.setLevel(level_int)
-                    # Ensure propagation if you want these module logs to also go to root handlers
-                    # module_logger.propagate = True (usually true by default)
-                    logger.debug(f"Set log level for module '{module_name}' to {level_str.upper()} ({level_int}).")
-                else:
-                    logger.warning(f"Invalid log level string '{level_str}' for module '{module_name}'. Ignoring.")
-        
-        logger.info(f"Logging setup complete. Root level: {logging.getLevelName(root_level)}. Total managed handlers: {len(_handlers_managed_by_setup_logging)}.")
-
-    except AttributeError as e_attr:
-        # Fallback if log_config object doesn't have expected attributes
-        logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - FALLBACK_LOGGING_ATTR_ERR - %(message)s')
-        logger.error(f"Logging setup failed due to AttributeError (likely invalid log_config object): {e_attr}. Falling back to basic console logging.", exc_info=True)
-    except Exception as e_critical:
-        # General fallback for any other unexpected errors during setup
-        logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - FALLBACK_LOGGING_CRITICAL_ERR - %(message)s')
-        logger.critical(f"Critical error in logging setup: {e_critical}. Falling back to basic console logging.", exc_info=True)
