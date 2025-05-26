@@ -51,7 +51,7 @@
     "top_n_trials_to_report_oos": 2
   },
   "optuna_settings": {
-    "n_trials": 1,
+    "n_trials": 50,
     "storage": null,
     "n_jobs": 1,
     "objectives_names": ["Total Net PnL USDC", "Sharpe Ratio", "Max Drawdown Pct"],

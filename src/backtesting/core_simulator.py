@@ -21,14 +21,11 @@ try:
     from src.utils.simulation_elements.fees_simulator import FeeSimulator
     from src.utils.exchange_utils import get_precision_from_filter, get_filter_value, adjust_precision, adjust_quantity_to_step_size
 except ImportError as e:
-    # Ce log est un fallback, le logging principal est configuré ailleurs
     logging.basicConfig(level=logging.ERROR)
     logging.getLogger(__name__).critical(
         f"BacktestRunner: Erreur d'importation critique pour Slippage/FeeSimulator ou exchange_utils: {e}. "
         "Assurez-vous que ces modules existent dans src.utils.* et sont corrects."
     )
-    # Définir des placeholders pour permettre le chargement du module en cas d'erreur d'import
-    # Cela permet au reste du système de potentiellement identifier le problème sans crasher immédiatement.
     class SlippageSimulator: # type: ignore
         def __init__(self, **kwargs): pass
         def simulate_slippage(self, price: float, direction: int, **kwargs) -> float: return price
@@ -37,10 +34,12 @@ except ImportError as e:
         def calculate_fee(self, trade_value_quote: float) -> float: return 0.0
     def get_precision_from_filter(*args) -> Optional[int]: return 8 # type: ignore
     def get_filter_value(*args) -> Optional[float]: return 0.0 # type: ignore
-    def adjust_precision(value: float, precision: Optional[int], tick_size: Optional[float] = None, rounding_mode_str: str = "ROUND_HALF_UP") -> float: return round(value, precision or 8) # type: ignore
-    def adjust_quantity_to_step_size(quantity: float, symbol_info: Dict[str, Any], rounding_mode_str: str = "ROUND_FLOOR") -> float: return round(quantity, 8) # type: ignore
+    def adjust_precision(value: Optional[Union[float, str]], precision: Optional[int], rounding_mode_str: str = "ROUND_HALF_UP", tick_size: Optional[Union[float, str]] = None) -> Optional[float]: # Correction des types et ordre
+        if value is None: return None
+        return round(float(str(value)), precision or 8) 
+    def adjust_quantity_to_step_size(quantity: float, symbol_info: Dict[str, Any], rounding_mode_str: str = "ROUND_FLOOR") -> float: return round(quantity, 8) 
 
-    raise # Renvoyer l'erreur pour indiquer un problème critique
+    raise 
 
 logger = logging.getLogger(__name__)
 
@@ -56,16 +55,14 @@ class BacktestRunner:
                  initial_equity: float,
                  leverage: int,
                  symbol: str,
-                 pair_config: Dict[str, Any], # Infos de l'exchange (filtres, précisions)
+                 pair_config: Dict[str, Any], 
                  trading_fee_bps: float,
-                 slippage_config_dict: Dict[str, Any], # Dictionnaire de configuration du slippage
-                 is_futures: bool, # Actuellement non utilisé extensivement, mais conservé
-                 run_id: str, # ID du run WFO global ou de la tâche parente
-                 is_oos_simulation: bool = False, # True si c'est une simulation Out-of-Sample
+                 slippage_config_dict: Dict[str, Any], 
+                 is_futures: bool, 
+                 run_id: str, 
+                 is_oos_simulation: bool = False, 
                  verbosity: int = 1):
-        """
-        Initialise le BacktestRunner.
-        """
+        
         self.df_ohlcv = df_ohlcv_with_indicators.copy()
         self.strategy = strategy_instance
         self.initial_equity = float(initial_equity)
@@ -74,7 +71,7 @@ class BacktestRunner:
         self.symbol = symbol.upper()
         self.pair_config = pair_config
         self.is_futures = is_futures
-        self.run_id = run_id # Peut être l'ID du WFOManager ou un ID de fold spécifique
+        self.run_id = run_id 
         self.is_oos_simulation = is_oos_simulation
         self.verbosity = verbosity
 
@@ -90,7 +87,7 @@ class BacktestRunner:
         if self.df_ohlcv.index.tz is None:
             logger.warning(f"{self.log_prefix} L'index de df_ohlcv n'a pas de timezone. Conversion en UTC.")
             self.df_ohlcv.index = self.df_ohlcv.index.tz_localize('UTC') # type: ignore
-        elif self.df_ohlcv.index.tz.utcoffset(self.df_ohlcv.index[0]) != timezone.utc.utcoffset(None): # type: ignore
+        elif self.df_ohlcv.index.tz.utcoffset(self.df_ohlcv.index[0] if not self.df_ohlcv.empty else None) != timezone.utc.utcoffset(None): # type: ignore
              logger.warning(f"{self.log_prefix} L'index de df_ohlcv n'est pas en UTC (actuel: {self.df_ohlcv.index.tz}). Conversion en UTC.")
              self.df_ohlcv.index = self.df_ohlcv.index.tz_convert('UTC') # type: ignore
 
@@ -105,7 +102,7 @@ class BacktestRunner:
         self.quantity_precision: Optional[int] = get_precision_from_filter(self.pair_config, 'LOT_SIZE', 'stepSize')
         self.min_notional_filter: float = get_filter_value(self.pair_config, 'MIN_NOTIONAL', 'minNotional') or 0.0
         self.min_quantity_filter: float = get_filter_value(self.pair_config, 'LOT_SIZE', 'minQty') or 0.0
-        # Le tickSize et stepSize sont aussi utiles pour l'ajustement précis
+        
         self.price_tick_size: Optional[float] = get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize')
         self.quantity_step_size: Optional[float] = get_filter_value(self.pair_config, 'LOT_SIZE', 'stepSize')
 
@@ -117,19 +114,17 @@ class BacktestRunner:
                   f"QtyPrec={self.quantity_precision}, QtyStep={self.quantity_step_size}, "
                   f"MinNotional={self.min_notional_filter}, MinQty={self.min_quantity_filter}", level=2)
 
-        self._reset_position_state() # Initialise les variables d'état de la position
+        self._reset_position_state() 
         self.trades: List[Dict[str, Any]] = []
         self.equity_curve: List[Dict[str, Any]] = []
         if not self.df_ohlcv.empty:
              self.equity_curve.append({'timestamp': self.df_ohlcv.index.min(), 'equity': self.initial_equity, 'type': 'initial'})
-        else: # Si df_ohlcv est vide, utiliser l'heure actuelle pour le point initial
+        else: 
              self.equity_curve.append({'timestamp': pd.Timestamp.now(tz='UTC'), 'equity': self.initial_equity, 'type': 'initial'})
 
         self.daily_equity: Dict[Any, float] = {}
         self.oos_detailed_trades_log: List[Dict[str, Any]] = []
         
-        # La stratégie doit déjà avoir son contexte (précisions, etc.) défini par l'appelant
-        # (ObjectiveFunctionEvaluator) via strategy.set_backtest_context().
         self._log(f"BacktestRunner initialisé pour la stratégie '{self.strategy.strategy_name}'.", level=1)
 
     def _log(self, message: str, level: int = 1, is_error: bool = False) -> None:
@@ -159,8 +154,7 @@ class BacktestRunner:
 
     def _calculate_max_position_size_base(self, entry_price_estimate: float, capital_for_trade: float) -> float:
         """
-        Calcule la taille maximale de position en actif de base, basée sur le capital alloué
-        pour ce trade et le levier.
+        Calcule la taille maximale de position en actif de base.
         """
         if entry_price_estimate <= 1e-9:
             self._log(f"Prix d'entrée estimé ({entry_price_estimate}) trop bas. Max size = 0.", level=2)
@@ -169,8 +163,6 @@ class BacktestRunner:
         max_notional_value_quote = capital_for_trade * self.leverage
         max_size_base_raw = max_notional_value_quote / entry_price_estimate
         
-        # L'arrondi final au step_size est fait par _apply_exchange_filters.
-        # Ici, on retourne une valeur brute mais raisonnable.
         self._log(f"CalcMaxPosSize: CapitalForTrade={capital_for_trade:.2f}, Lev={self.leverage}, "
                   f"PrixEst={entry_price_estimate:.{self.price_precision or 8}f}, MaxNotional={max_notional_value_quote:.2f}, "
                   f"MaxSizeBaseRaw={max_size_base_raw:.8f}", level=2)
@@ -178,27 +170,23 @@ class BacktestRunner:
 
     def _apply_exchange_filters(self, quantity_base: float, price: float) -> float:
         """
-        Ajuste la quantité au stepSize et valide par rapport à minQty et minNotional.
-        Retourne 0.0 si les filtres ne sont pas respectés.
+        Ajuste la quantité et valide par rapport aux filtres.
         """
-        # 1. Ajuster au step_size (arrondi vers le bas par défaut pour les quantités)
         qty_adjusted_to_step = adjust_quantity_to_step_size(
             quantity_base,
-            self.pair_config, # Contient les filtres
-            rounding_mode_str="ROUND_FLOOR" # Prudent pour les quantités
+            self.pair_config, 
+            rounding_mode_str="ROUND_FLOOR" 
         )
 
-        if qty_adjusted_to_step <= 1e-9: # Seuil pour considérer comme nul
+        if qty_adjusted_to_step <= 1e-9: 
              self._log(f"Quantité {quantity_base:.8f} est devenue {qty_adjusted_to_step:.{self.quantity_precision or 8}f} "
                        f"après ajustement au stepSize. Considérée comme nulle.", level=2)
              return 0.0
 
-        # 2. Vérifier minQty
         if self.min_quantity_filter > 0 and qty_adjusted_to_step < self.min_quantity_filter:
             self._log(f"Filtre Échec: Quantité ajustée {qty_adjusted_to_step:.{self.quantity_precision or 8}f} < minQty requis {self.min_quantity_filter:.{self.quantity_precision or 8}f}.", level=2)
             return 0.0
 
-        # 3. Vérifier minNotional
         notional_value = qty_adjusted_to_step * price
         if self.min_notional_filter > 0 and notional_value < self.min_notional_filter:
             self._log(f"Filtre Échec: Valeur notionnelle {notional_value:.2f} (Qty: {qty_adjusted_to_step:.{self.quantity_precision or 8}f} @ Prix: {price:.{self.price_precision or 8}f}) "
@@ -211,92 +199,74 @@ class BacktestRunner:
     def _simulate_order_execution(self,
                                   timestamp: pd.Timestamp,
                                   current_bar_ohlc: pd.Series,
-                                  order_type_sim: str, # "MARKET_ENTRY", "LIMIT_ENTRY", "MARKET_EXIT", "SL_EXIT", "TP_EXIT"
-                                  signal_direction: int, # 1 pour achat/long, -1 pour vente/short (pour l'entrée)
-                                                         # ou direction de la position existante pour la sortie.
+                                  order_type_sim: str, 
+                                  signal_direction: int, 
                                   limit_price_target: Optional[float] = None,
                                   stop_price_trigger: Optional[float] = None,
                                   target_quantity_base_for_entry: Optional[float] = None
                                  ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
         Simule l'exécution d'un ordre pour la barre actuelle.
-
-        Args:
-            timestamp: Timestamp de la barre actuelle.
-            current_bar_ohlc: Séries Pandas contenant open, high, low, close de la barre.
-            order_type_sim: Type d'ordre à simuler.
-            signal_direction: Direction du signal (pour entrée) ou de la position (pour sortie).
-            limit_price_target: Prix limite pour les ordres LIMIT_ENTRY ou TP_EXIT.
-            stop_price_trigger: Prix de déclenchement pour les ordres SL_EXIT.
-            target_quantity_base_for_entry: Quantité cible pour un ordre d'entrée.
-
-        Returns:
-            Tuple[Optional[float], Optional[float], Optional[float]]:
-            (prix_execution_final, quantite_executee_base, frais_payes_quote)
-            Retourne (None, None, None) si l'ordre n'est pas exécuté.
         """
         exec_log_prefix = f"{self.log_prefix}[ExecSim][{timestamp.strftime('%Y-%m-%d %H:%M')}]"
         
         open_p = float(current_bar_ohlc['open'])
         high_p = float(current_bar_ohlc['high'])
         low_p = float(current_bar_ohlc['low'])
-        # close_p = float(current_bar_ohlc['close']) # Non utilisé directement pour le prix d'exécution ici
-
+        
         base_execution_price: Optional[float] = None
         is_entry_order = "ENTRY" in order_type_sim
 
         if order_type_sim == 'MARKET_ENTRY' or order_type_sim == 'MARKET_EXIT':
-            base_execution_price = open_p # Exécution au prix d'ouverture de la barre (supposition commune)
+            base_execution_price = open_p 
         elif order_type_sim == 'LIMIT_ENTRY' and limit_price_target is not None:
-            if signal_direction == 1: # Achat LIMIT
-                if low_p <= limit_price_target: # Le prix a atteint ou dépassé la limite à la baisse
-                    base_execution_price = min(open_p, limit_price_target) # Exécuté au meilleur des deux pour l'acheteur
-            else: # Vente LIMIT (signal_direction == -1)
-                if high_p >= limit_price_target: # Le prix a atteint ou dépassé la limite à la hausse
-                    base_execution_price = max(open_p, limit_price_target) # Exécuté au meilleur des deux pour le vendeur
+            if signal_direction == 1: 
+                if low_p <= limit_price_target: 
+                    base_execution_price = min(open_p, limit_price_target) 
+            else: 
+                if high_p >= limit_price_target: 
+                    base_execution_price = max(open_p, limit_price_target) 
         elif order_type_sim == 'SL_EXIT' and stop_price_trigger is not None:
-            # signal_direction ici est la direction de la position à clôturer
-            if signal_direction == 1: # SL sur un LONG (ordre de VENTE)
-                if low_p <= stop_price_trigger: # Le prix a baissé jusqu'au stop
-                    base_execution_price = min(open_p, stop_price_trigger) # Vendu au stop_price ou à l'open si pire
-            else: # SL sur un SHORT (ordre d'ACHAT) (signal_direction == -1)
-                if high_p >= stop_price_trigger: # Le prix a monté jusqu'au stop
-                    base_execution_price = max(open_p, stop_price_trigger) # Acheté au stop_price ou à l'open si pire
+            if signal_direction == 1: 
+                if low_p <= stop_price_trigger: 
+                    base_execution_price = min(open_p, stop_price_trigger) 
+            else: 
+                if high_p >= stop_price_trigger: 
+                    base_execution_price = max(open_p, stop_price_trigger) 
         elif order_type_sim == 'TP_EXIT' and limit_price_target is not None:
-            # signal_direction ici est la direction de la position à clôturer
-            if signal_direction == 1: # TP sur un LONG (ordre de VENTE)
-                if high_p >= limit_price_target: # Le prix a monté jusqu'au take profit
-                    base_execution_price = max(open_p, limit_price_target) # Vendu au limit_price ou à l'open si mieux
-            else: # TP sur un SHORT (ordre d'ACHAT) (signal_direction == -1)
-                if low_p <= limit_price_target: # Le prix a baissé jusqu'au take profit
-                    base_execution_price = min(open_p, limit_price_target) # Acheté au limit_price ou à l'open si mieux
+            if signal_direction == 1: 
+                if high_p >= limit_price_target: 
+                    base_execution_price = max(open_p, limit_price_target) 
+            else: 
+                if low_p <= limit_price_target: 
+                    base_execution_price = min(open_p, limit_price_target) 
         
         if base_execution_price is None:
             self._log(f"{exec_log_prefix}[{order_type_sim}] Non exécutable. Lmt:{limit_price_target}, Stp:{stop_price_trigger}, Dir:{signal_direction}, OHLC:[{open_p:.4f},{high_p:.4f},{low_p:.4f}]", level=2)
             return None, None, None
 
-        # Appliquer le slippage
-        # La direction pour le slippage est toujours défavorable par rapport à l'action de l'ordre.
-        # Si l'ordre est un ACHAT (entrée long ou sortie short), le prix slippé augmente.
-        # Si l'ordre est une VENTE (entrée short ou sortie long), le prix slippé baisse.
         slippage_impact_direction = 0
-        if (is_entry_order and signal_direction == 1) or (not is_entry_order and signal_direction == -1): # Ordre d'ACHAT
+        if (is_entry_order and signal_direction == 1) or (not is_entry_order and signal_direction == -1): 
             slippage_impact_direction = 1
-        elif (is_entry_order and signal_direction == -1) or (not is_entry_order and signal_direction == 1): # Ordre de VENTE
+        elif (is_entry_order and signal_direction == -1) or (not is_entry_order and signal_direction == 1): 
             slippage_impact_direction = -1
         
-        if slippage_impact_direction == 0: # Ne devrait pas arriver si signal_direction est toujours 1 ou -1
-            logger.warning(f"{exec_log_prefix}[{order_type_sim}] Direction de slippage indéterminée (signal_direction: {signal_direction}, is_entry: {is_entry_order}). Pas de slippage appliqué.")
-            slipped_price = base_execution_price
-        else:
+        slipped_price = base_execution_price
+        if slippage_impact_direction != 0:
             slipped_price = self.slippage_simulator.simulate_slippage(
                 price=base_execution_price,
                 direction=slippage_impact_direction,
-                order_book_depth_at_price=current_bar_ohlc.get('volume', 0), # Approximation
-                market_volatility_pct=(high_p - low_p) / low_p if low_p > 1e-9 else 0.0 # Approximation
+                order_book_depth_at_price=current_bar_ohlc.get('volume', 0), 
+                market_volatility_pct=(high_p - low_p) / low_p if low_p > 1e-9 else 0.0 
             )
         
-        final_executed_price = adjust_precision(slipped_price, self.price_precision, self.price_tick_size, "ROUND_HALF_UP")
+        final_executed_price = adjust_precision(
+            value=slipped_price, 
+            precision=self.price_precision, 
+            tick_size=self.price_tick_size, 
+            rounding_mode_str="ROUND_HALF_UP" 
+        )
+
         if final_executed_price is None:
             logger.error(f"{exec_log_prefix}[{order_type_sim}] Erreur d'ajustement de précision pour prix slippé {slipped_price}.")
             return None, None, None
@@ -310,11 +280,11 @@ class BacktestRunner:
             if executed_quantity_base <= 1e-9:
                 self._log(f"{exec_log_prefix}[{order_type_sim}] Quantité d'entrée {target_quantity_base_for_entry:.8f} nulle après filtres.", level=1)
                 return None, None, None
-        else: # Ordre de sortie
+        else: 
             if not self.position_open or self.position_size_base <= 1e-9:
                 self._log(f"{exec_log_prefix}[{order_type_sim}] Tentative de sortie mais pas de position valide.", level=2)
                 return None, None, None
-            executed_quantity_base = self.position_size_base # Sortir toute la position
+            executed_quantity_base = self.position_size_base 
 
         trade_value_quote = executed_quantity_base * final_executed_price
         fee_paid_quote = self.fee_simulator.calculate_fee(trade_value_quote)
@@ -337,7 +307,7 @@ class BacktestRunner:
                       f"Qty: {self.position_size_base:.{self.quantity_precision or 8}f}. Frais: {fee_paid_quote:.4f}. Equity: {self.current_equity:.2f}", level=1)
             if self.is_oos_simulation:
                 self.current_trade_cycle_id = str(uuid.uuid4())
-        else: # Sortie de position
+        else: 
             exit_price = final_executed_price
             pnl_gross_quote = (exit_price - self.entry_price) * self.position_size_base \
                 if self.trade_direction == 1 else (self.entry_price - exit_price) * self.position_size_base
@@ -417,7 +387,7 @@ class BacktestRunner:
             if last_recorded_daily_equity_date is None or current_date_normalized > last_recorded_daily_equity_date:
                 self.daily_equity[current_date_normalized] = self.current_equity
                 last_recorded_daily_equity_date = current_date_normalized
-            elif i == len(self.df_ohlcv) - 1: # Toujours enregistrer pour la dernière barre
+            elif i == len(self.df_ohlcv) - 1: 
                  self.daily_equity[current_date_normalized] = self.current_equity
 
             exit_executed_this_bar = False
@@ -434,7 +404,6 @@ class BacktestRunner:
                 
                 if exit_executed_this_bar: continue
 
-            # Slice de données incluant la barre actuelle pour la stratégie
             df_feed_for_strategy = self.df_ohlcv.iloc[:i+1]
             
             signal_decision = self.strategy.get_signal(
@@ -470,10 +439,7 @@ class BacktestRunner:
                     self._log(f"Quantité max possible {max_qty_base:.8f} trop petite. Pas d'entrée.", level=1)
                     continue
                 
-                # La stratégie ne retourne plus la quantité, elle est calculée ici.
-                # target_qty_for_entry est max_qty_base * (facteur de dimensionnement si la strat le spécifiait)
-                # Pour l'instant, on utilise 100% de ce que _calculate_max_position_size_base permet.
-                target_qty_for_entry = max_qty_base # La stratégie pourrait affiner cela via pos_size_pct
+                target_qty_for_entry = max_qty_base 
 
                 sim_entry_type = 'LIMIT_ENTRY' if sig_order_type == 'LIMIT' else 'MARKET_ENTRY'
                 exec_px_entry, exec_qty_entry, _ = self._simulate_order_execution(
@@ -487,7 +453,7 @@ class BacktestRunner:
                     self._log(f"SL/TP mis à jour après entrée: SL={self.current_sl_price}, TP={self.current_tp_price}", level=2)
                 else:
                     self._log(f"Ordre d'entrée non exécuté ou quantité nulle. Pas de position.", level=1)
-                    if self.is_oos_simulation: self._reset_position_state() # Effacer les logs OOS théoriques
+                    if self.is_oos_simulation: self._reset_position_state() 
 
         if not self.df_ohlcv.empty:
             final_date_norm = self.df_ohlcv.index[-1].normalize() # type: ignore
@@ -501,3 +467,4 @@ class BacktestRunner:
             equity_curve_df_final['timestamp'] = pd.to_datetime(equity_curve_df_final['timestamp'], errors='coerce', utc=True)
 
         return self.trades, equity_curve_df_final, self.daily_equity, self.oos_detailed_trades_log
+

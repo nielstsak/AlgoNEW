@@ -18,39 +18,23 @@ logger = logging.getLogger(__name__)
 class BbandsVolumeRsiStrategy(BaseStrategy):
     """
     Stratégie de trading combinant Bandes de Bollinger, Volume et RSI.
-
-    Conditions d'entrée :
-    - Long : Cassure de la bande supérieure de Bollinger, confirmée par un volume
-      supérieur à sa moyenne mobile et un RSI au-dessus d'un seuil de surachat.
-    - Short : Cassure de la bande inférieure de Bollinger, confirmée par un volume
-      supérieur à sa moyenne mobile et un RSI en dessous d'un seuil de survente.
-    Les sorties sont gérées par SL/TP basés sur l'ATR.
     """
 
     REQUIRED_PARAMS: List[str] = [
         'bbands_period', 'bbands_std_dev', 'indicateur_frequence_bbands',
-        'volume_ma_period', 'indicateur_frequence_volume', # Fréquence pour la source du volume et sa MA
+        'volume_ma_period', 'indicateur_frequence_volume', 
         'rsi_period', 'indicateur_frequence_rsi',
         'rsi_buy_breakout_threshold', 'rsi_sell_breakout_threshold',
         'atr_period_sl_tp', 'atr_base_frequency_sl_tp',
         'sl_atr_mult', 'tp_atr_mult',
         'capital_allocation_pct',
-        'order_type_preference'
-        # 'allow_shorting' pourrait être ajouté si la stratégie doit le gérer explicitement
+        'order_type_preference',
+        'margin_leverage' # Ajouté pour cohérence
     ]
 
     def __init__(self, strategy_name: str, symbol: str, params: Dict[str, Any]):
-        """
-        Initialise la stratégie BbandsVolumeRsiStrategy.
-
-        Args:
-            strategy_name (str): Nom de la stratégie.
-            symbol (str): Symbole de la paire de trading.
-            params (Dict[str, Any]): Paramètres spécifiques à cette instance.
-        """
         super().__init__(strategy_name, symbol, params)
 
-        # Noms des colonnes pour les indicateurs calculés
         self.bb_upper_col_strat: str = "BB_UPPER_strat"
         self.bb_middle_col_strat: str = "BB_MIDDLE_strat"
         self.bb_lower_col_strat: str = "BB_LOWER_strat"
@@ -60,19 +44,14 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         self.rsi_col_strat: str = "RSI_strat"
         self.atr_col_strat: str = "ATR_strat"
 
-        # Déterminer la colonne source pour le volume (brut, avant MA)
-        # Cette colonne doit exister dans le df_source_enriched fourni à IndicatorCalculator
         vol_freq_param = self.get_param('indicateur_frequence_volume')
         kline_prefix_vol_src = get_kline_prefix_effective(str(vol_freq_param))
-        self.volume_kline_col_strat: str = f"{kline_prefix_vol_src}_volume" if kline_prefix_vol_src else "volume"
+        self.volume_kline_col_source: str = f"{kline_prefix_vol_src}_volume" if kline_prefix_vol_src else "volume"
         
-        logger.info(f"{self.log_prefix} Colonne source de volume pour la stratégie (avant MA) : '{self.volume_kline_col_strat}'")
+        logger.info(f"{self.log_prefix} Colonne source de volume pour la MA de volume (stratégie) : '{self.volume_kline_col_source}'")
 
 
     def _validate_params(self) -> None:
-        """
-        Valide les paramètres spécifiques à BbandsVolumeRsiStrategy.
-        """
         missing_params = [p for p in self.REQUIRED_PARAMS if self.get_param(p) is None]
         if missing_params:
             raise ValueError(f"{self.log_prefix} Paramètres requis manquants : {', '.join(missing_params)}")
@@ -109,6 +88,10 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         if not (isinstance(cap_alloc, (int, float)) and 0 < cap_alloc <= 1.0):
             raise ValueError(f"{self.log_prefix} 'capital_allocation_pct' doit être entre 0 (exclusif) et 1 (inclusif).")
         
+        margin_lev = self.get_param('margin_leverage')
+        if not (isinstance(margin_lev, (int, float)) and margin_lev >= 1.0):
+            raise ValueError(f"{self.log_prefix} 'margin_leverage' ({margin_lev}) doit être >= 1.0.")
+
         order_type_pref_val = self.get_param('order_type_preference')
         if order_type_pref_val not in ["MARKET", "LIMIT"]:
             raise ValueError(f"{self.log_prefix} 'order_type_preference' doit être 'MARKET' ou 'LIMIT'.")
@@ -120,106 +103,108 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         logger.debug(f"{self.log_prefix} Validation des paramètres terminée avec succès.")
 
     def get_required_indicator_configs(self) -> List[Dict[str, Any]]:
-        """
-        Déclare les indicateurs requis par BbandsVolumeRsiStrategy.
-        """
-        # pandas-ta bbands retourne un DataFrame. IndicatorCalculator doit mapper les colonnes.
-        # Les clés dans 'output_column_map' sont les noms des colonnes retournées par ta.bbands
-        # (ex: BBL_length_std, BBM_length_std, etc.)
         bbands_params = {'length': int(self.params['bbands_period']), 'std': float(self.params['bbands_std_dev'])}
-        bbands_length = bbands_params['length']
-        bbands_std = bbands_params['std']
         
-        # Construire les noms de colonnes attendus de pandas-ta.bbands
-        # Ex: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0, BBB_20_2.0
-        # Note: Le format exact peut dépendre de la version de pandas-ta.
-        # Il est plus sûr si IndicatorCalculator a une logique pour trouver les colonnes par des sous-chaînes (BBL, BBM, BBU, BBB).
-        # Pour l'instant, on suppose que IndicatorCalculator peut gérer un mapping conceptuel.
-        bbands_output_map = {
-            f"BBL_{bbands_length}_{bbands_std}": self.bb_lower_col_strat,
-            f"BBM_{bbands_length}_{bbands_std}": self.bb_middle_col_strat,
-            f"BBU_{bbands_length}_{bbands_std}": self.bb_upper_col_strat,
-            f"BBB_{bbands_length}_{bbands_std}": self.bb_bandwidth_col_strat
-            # Si pandas-ta retourne des noms plus simples comme 'BBL', 'BBM', etc., ajuster ici.
-            # Alternativement, IndicatorCalculator peut avoir une logique de mapping plus intelligente.
-            # Pour ce prompt, on utilise une clé générique que IndicatorCalculator devra interpréter.
-            # 'LOWER': self.bb_lower_col_strat,
-            # 'MIDDLE': self.bb_middle_col_strat,
-            # 'UPPER': self.bb_upper_col_strat,
-            # 'BANDWIDTH': self.bb_bandwidth_col_strat
-        }
+        freq_bbands = str(self.params['indicateur_frequence_bbands'])
+        kline_prefix_bbands = get_kline_prefix_effective(freq_bbands)
+        source_col_close_bbands = f"{kline_prefix_bbands}_close" if kline_prefix_bbands else "close"
+        
+        freq_rsi = str(self.params['indicateur_frequence_rsi'])
+        kline_prefix_rsi = get_kline_prefix_effective(freq_rsi)
+        source_col_close_rsi = f"{kline_prefix_rsi}_close" if kline_prefix_rsi else "close"
 
+        freq_atr = str(self.params['atr_base_frequency_sl_tp'])
+        kline_prefix_atr = get_kline_prefix_effective(freq_atr)
+        source_col_high_atr = f"{kline_prefix_atr}_high" if kline_prefix_atr else "high"
+        source_col_low_atr = f"{kline_prefix_atr}_low" if kline_prefix_atr else "low"
+        source_col_close_atr = f"{kline_prefix_atr}_close" if kline_prefix_atr else "close"
 
         configs = [
             {
                 'indicator_name': 'bbands',
                 'params': bbands_params,
-                'source_kline_frequency_param_name': 'indicateur_frequence_bbands',
-                'output_column_map': { # Clés conceptuelles pour IndicatorCalculator
-                    'lower': self.bb_lower_col_strat,
-                    'middle': self.bb_middle_col_strat,
-                    'upper': self.bb_upper_col_strat,
-                    'bandwidth': self.bb_bandwidth_col_strat
+                'inputs': {'close': source_col_close_bbands},
+                'outputs': { 
+                    'lower': self.bb_lower_col_strat,   
+                    'middle': self.bb_middle_col_strat, 
+                    'upper': self.bb_upper_col_strat,   
+                    'bandwidth': self.bb_bandwidth_col_strat 
                 }
             },
             {
-                'indicator_name': 'sma', # Ou un autre type de MA si paramétrable
+                'indicator_name': 'sma', 
                 'params': {'length': int(self.params['volume_ma_period'])},
-                # La source est la colonne de volume (1-min ou agrégée) déterminée dans __init__
-                'source_column_name': self.volume_kline_col_strat,
-                # Pas besoin de 'source_kline_frequency_param_name' ici car 'source_column_name' est déjà spécifique.
-                'output_column_name': self.volume_ma_col_strat
+                'inputs': {'close': self.volume_kline_col_source}, 
+                'outputs': self.volume_ma_col_strat
             },
             {
                 'indicator_name': 'rsi',
                 'params': {'length': int(self.params['rsi_period'])},
-                'source_kline_frequency_param_name': 'indicateur_frequence_rsi',
-                'output_column_name': self.rsi_col_strat
+                'inputs': {'close': source_col_close_rsi},
+                'outputs': self.rsi_col_strat
             },
             {
                 'indicator_name': 'atr',
                 'params': {'length': int(self.params['atr_period_sl_tp'])},
-                'source_kline_frequency_param_name': 'atr_base_frequency_sl_tp',
-                'output_column_name': self.atr_col_strat
+                'inputs': { 
+                    'high': source_col_high_atr,
+                    'low': source_col_low_atr,
+                    'close': source_col_close_atr
+                },
+                'outputs': self.atr_col_strat
             }
         ]
-        logger.debug(f"{self.log_prefix} Configurations d'indicateurs requises : {configs}")
+        logger.debug(f"{self.log_prefix} Configurations d'indicateurs requises (standardisées) : {configs}")
         return configs
 
     def _calculate_indicators(self, data_feed: pd.DataFrame) -> pd.DataFrame:
         """
-        Vérifie la présence des colonnes d'indicateurs _strat attendues et de la colonne
-        de volume source.
+        Vérifie la présence des colonnes d'indicateurs _strat attendues (fournies par
+        IndicatorCalculator) et de la colonne source pour la MA de volume.
+        Applique ffill pour propager les valeurs.
         """
         df = data_feed.copy()
         expected_strat_cols = [
             self.bb_upper_col_strat, self.bb_middle_col_strat, self.bb_lower_col_strat,
             self.bb_bandwidth_col_strat, self.volume_ma_col_strat,
-            self.rsi_col_strat, self.atr_col_strat,
-            self.volume_kline_col_strat # Colonne source pour le volume (avant MA)
+            self.rsi_col_strat, self.atr_col_strat
         ]
+        # La colonne source pour la MA de volume doit aussi être présente dans data_feed
+        # car IndicatorCalculator l'utilise pour calculer self.volume_ma_col_strat,
+        # mais la stratégie elle-même utilise self.volume_kline_col_source pour la comparaison directe.
+        all_expected_cols_in_data_feed = expected_strat_cols + [self.volume_kline_col_source]
         
-        missing_cols_added_nan = False
-        for col_name in expected_strat_cols:
-            if col_name not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne indicateur/source attendue '{col_name}' manquante dans data_feed. Ajout avec NaN.")
-                df[col_name] = np.nan
-                missing_cols_added_nan = True
-        
-        base_ohlcv = ['open', 'high', 'low', 'close', 'volume'] # 'volume' ici est le volume 1-min de base
-        for col in base_ohlcv:
-            if col not in df.columns:
-                logger.error(f"{self.log_prefix} Colonne OHLCV de base '{col}' manquante dans data_feed.")
-                df[col] = np.nan # Pourrait causer des problèmes si utilisé directement par la logique de signal
-                missing_cols_added_nan = True
-        
-        if missing_cols_added_nan:
-             logger.debug(f"{self.log_prefix} Après vérification _calculate_indicators, colonnes : {df.columns.tolist()}")
+        # Vérifier les colonnes OHLCV de base
+        base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
+        missing_ohlcv = [col for col in base_ohlcv if col not in df.columns]
+        if missing_ohlcv:
+            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}."
+            logger.critical(msg)
+            raise ValueError(msg)
 
-        cols_to_ffill = [col for col in expected_strat_cols if col in df.columns and col.endswith('_strat')]
-        if cols_to_ffill:
-            df[cols_to_ffill] = df[cols_to_ffill].ffill()
-            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat : {cols_to_ffill}")
+        # Vérifier les colonnes d'indicateurs _strat et la source de volume
+        missing_cols = []
+        for col_name in all_expected_cols_in_data_feed:
+            if col_name not in df.columns:
+                logger.warning(f"{self.log_prefix} Colonne attendue '{col_name}' manquante dans data_feed. "
+                               "Elle sera ajoutée avec NaN, indiquant un problème en amont.")
+                df[col_name] = np.nan
+                missing_cols.append(col_name)
+        
+        if missing_cols:
+             logger.debug(f"{self.log_prefix} Après vérification _calculate_indicators, "
+                          f"colonnes manquantes ajoutées (NaN): {missing_cols}. "
+                          f"Colonnes actuelles: {df.columns.tolist()}")
+
+        # Appliquer ffill seulement aux colonnes _strat qui sont censées être des indicateurs
+        cols_to_ffill_present = [col for col in expected_strat_cols if col in df.columns]
+        if cols_to_ffill_present:
+            df[cols_to_ffill_present] = df[cols_to_ffill_present].ffill()
+            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat présentes : {cols_to_ffill_present}")
+        
+        # La colonne self.volume_kline_col_source ne doit pas être ffillée ici si elle représente un volume brut.
+        # Elle est déjà supposée être correcte en sortie de IndicatorCalculator (ou df_source_enriched).
+
         return df
 
     def _generate_signals(self,
@@ -236,20 +221,18 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         sl_price: Optional[float] = None
         tp_price: Optional[float] = None
 
-        if len(data_with_indicators) < 2: # Besoin d'au moins 2 barres pour comparer actuel et précédent
+        if len(data_with_indicators) < 2: 
             logger.debug(f"{self.log_prefix} Pas assez de données ({len(data_with_indicators)}) pour générer des signaux.")
             return 0, self.get_param("order_type_preference"), None, None, None, self.get_param('capital_allocation_pct')
 
         latest_row = data_with_indicators.iloc[-1]
         previous_row = data_with_indicators.iloc[-2]
 
-        # Récupérer les valeurs des indicateurs et du prix
         close_curr = latest_row.get('close')
         bb_upper_curr = latest_row.get(self.bb_upper_col_strat)
         bb_lower_curr = latest_row.get(self.bb_lower_col_strat)
-        # self.volume_kline_col_strat est le nom de la colonne volume source (ex: 'volume' ou 'Kline_5min_volume')
-        volume_kline_curr = latest_row.get(self.volume_kline_col_strat)
-        volume_ma_curr = latest_row.get(self.volume_ma_col_strat)
+        volume_kline_curr = latest_row.get(self.volume_kline_col_source) # Volume brut de la kline source
+        volume_ma_curr = latest_row.get(self.volume_ma_col_strat) # MA du volume
         rsi_curr = latest_row.get(self.rsi_col_strat)
         atr_curr = latest_row.get(self.atr_col_strat)
         
@@ -266,28 +249,24 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
             logger.debug(f"{self.log_prefix} Valeurs d'indicateur/prix manquantes (NaN) à {latest_row.name}. Détails: {nan_details}. Signal HOLD.")
             return 0, self.get_param("order_type_preference"), None, None, None, self.get_param('capital_allocation_pct')
 
-        # Paramètres de la stratégie
         sl_atr_mult = float(self.get_param('sl_atr_mult'))
         tp_atr_mult = float(self.get_param('tp_atr_mult'))
         rsi_buy_thresh = float(self.get_param('rsi_buy_breakout_threshold'))
         rsi_sell_thresh = float(self.get_param('rsi_sell_breakout_threshold'))
-        allow_shorting = self.get_param('allow_shorting', False) # Supposer un paramètre pour la vente à découvert
+        allow_shorting = self.get_param('allow_shorting', False) 
 
-        # Conditions d'entrée Long
         long_bb_breakout = close_curr > bb_upper_curr and close_prev <= bb_upper_prev # type: ignore
         long_volume_confirm = volume_kline_curr > volume_ma_curr # type: ignore
         long_rsi_confirm = rsi_curr > rsi_buy_thresh # type: ignore
         entry_long_triggered = long_bb_breakout and long_volume_confirm and long_rsi_confirm
 
-        # Conditions d'entrée Short
         entry_short_triggered = False
         if allow_shorting:
             short_bb_breakout = close_curr < bb_lower_curr and close_prev >= bb_lower_prev # type: ignore
-            short_volume_confirm = volume_kline_curr > volume_ma_curr # type: ignore # Volume élevé pour les deux directions
+            short_volume_confirm = volume_kline_curr > volume_ma_curr # type: ignore 
             short_rsi_confirm = rsi_curr < rsi_sell_thresh # type: ignore
             entry_short_triggered = short_bb_breakout and short_volume_confirm and short_rsi_confirm
         
-        # Logique de signal
         if not current_position_open:
             if entry_long_triggered:
                 signal_type = 1
@@ -295,19 +274,14 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
                     sl_price = close_curr - (sl_atr_mult * atr_curr) # type: ignore
                     tp_price = close_curr + (tp_atr_mult * atr_curr) # type: ignore
                 logger.info(f"{self.log_prefix} Signal BUY @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
-            elif entry_short_triggered: # Seulement si allow_shorting est vrai
+            elif entry_short_triggered: 
                 signal_type = -1
                 if atr_curr > 0: # type: ignore
                     sl_price = close_curr + (sl_atr_mult * atr_curr) # type: ignore
                     tp_price = close_curr - (tp_atr_mult * atr_curr) # type: ignore
                 logger.info(f"{self.log_prefix} Signal SELL @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
-        else: # Position ouverte, chercher des signaux de sortie (non définis explicitement par cette stratégie, SL/TP gèrent)
-            # Si on voulait ajouter des sorties basées sur des conditions inverses :
-            # if current_position_direction == 1 and entry_short_triggered: # Sortir Long si signal Short
-            #     signal_type = 2
-            # elif current_position_direction == -1 and entry_long_triggered: # Sortir Short si signal Long
-            #     signal_type = 2
-            pass # Les sorties sont gérées par SL/TP dans le simulateur
+        else: 
+            pass 
 
         order_type_preference = str(self.get_param("order_type_preference", "MARKET"))
         if signal_type != 0 and order_type_preference == "LIMIT":
@@ -323,9 +297,6 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
                                available_capital: float,
                                symbol_info: Dict[str, Any]
                                ) -> Optional[Tuple[Dict[str, Any], Dict[str, float]]]:
-        """
-        Génère une requête d'ordre d'ENTRÉE pour le trading en direct.
-        """
         if current_position != 0:
             logger.debug(f"{self.log_prefix} [Live] Position déjà ouverte (état: {current_position}). Pas de nouvelle requête d'ordre d'entrée.")
             return None
@@ -346,7 +317,7 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         entry_price_theoretical: float
         if order_type == "LIMIT" and limit_price_sugg is not None:
             entry_price_theoretical = limit_price_sugg
-        else: # Pour MARKET, utiliser le close comme estimation
+        else: 
             entry_price_theoretical = float(latest_bar.get('close', 0.0))
             if entry_price_theoretical <= 0: entry_price_theoretical = float(latest_bar.get('open', 0.0))
         
@@ -375,7 +346,7 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         entry_price_for_order_str: Optional[str] = None
         if order_type == "LIMIT" and limit_price_sugg is not None:
             from src.utils.exchange_utils import adjust_precision, get_filter_value 
-            adjusted_limit_price = adjust_precision(limit_price_sugg, self.price_precision, get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize'))
+            adjusted_limit_price = adjust_precision(limit_price_sugg, self.price_precision, tick_size=get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize'))
             if adjusted_limit_price is None: return None
             entry_price_for_order_str = f"{adjusted_limit_price:.{self.price_precision}f}"
         
@@ -394,4 +365,3 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         
         logger.info(f"{self.log_prefix} [Live] Requête d'ordre d'entrée générée : {entry_order_params}. SL/TP bruts : {sl_tp_raw_prices_dict}")
         return entry_order_params, sl_tp_raw_prices_dict
-

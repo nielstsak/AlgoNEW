@@ -27,8 +27,8 @@ except ImportError:
     )
     # Définir des placeholders si les imports échouent pour permettre au reste de se charger
     def get_precision_from_filter(pair_config: Dict, filter_type: str, key: str) -> Optional[int]: return 8
-    def adjust_precision(value: float, precision: Optional[int], tick_size: Optional[float] = None) -> float: return round(value, precision or 8)
-    def adjust_quantity_to_step_size(quantity: float, symbol_info: Dict, qty_precision: Optional[int]) -> float: return round(quantity, qty_precision or 8)
+    def adjust_precision(value: float, precision: Optional[int], tick_size: Optional[float] = None, rounding_mode_str: str = "ROUND_HALF_UP") -> float: return round(value, precision or 8) # Ajout de rounding_mode_str
+    def adjust_quantity_to_step_size(quantity: float, symbol_info: Dict, rounding_mode_str: str = "ROUND_FLOOR") -> float: return round(quantity, 8) # Changement de qty_precision à rounding_mode_str pour correspondre à l'usage
     def get_filter_value(symbol_info: Dict, filter_type: str, key: str) -> Optional[float]: return None
 
 
@@ -61,6 +61,10 @@ class BaseStrategy(ABC):
         self.initial_equity: float = 0.0
         self.price_precision: Optional[int] = None
         self.quantity_precision: Optional[int] = None
+        
+        # Initialisation des attributs base_asset et quote_asset
+        self.base_asset: str = ""
+        self.quote_asset: str = ""
         
         # Le type de compte peut être utile pour certaines logiques de stratégie (ex: MARGIN vs SPOT)
         # Il sera défini dans set_backtest_context si fourni par le simulateur,
@@ -113,6 +117,8 @@ class BaseStrategy(ABC):
         self.account_type = account_type
 
         if self.pair_config:
+            self.base_asset = self.pair_config.get('baseAsset', '')
+            self.quote_asset = self.pair_config.get('quoteAsset', '')
             self.price_precision = get_precision_from_filter(self.pair_config, 'PRICE_FILTER', 'tickSize')
             self.quantity_precision = get_precision_from_filter(self.pair_config, 'LOT_SIZE', 'stepSize')
             
@@ -122,10 +128,10 @@ class BaseStrategy(ABC):
             if self.quantity_precision is None:
                  logger.warning(f"{self.log_prefix} Quantity precision (stepSize) non trouvée dans pair_config pour LOT_SIZE. Utilisation d'une valeur par défaut ou la stratégie pourrait échouer.")
                  # self.quantity_precision = 8
-            logger.debug(f"{self.log_prefix} Contexte de backtest défini. Price Precision: {self.price_precision}, Quantity Precision: {self.quantity_precision}, Leverage: {self.leverage}")
+            logger.debug(f"{self.log_prefix} Contexte de backtest défini. Base: {self.base_asset}, Quote: {self.quote_asset}, Price Precision: {self.price_precision}, Quantity Precision: {self.quantity_precision}, Leverage: {self.leverage}")
         else:
-            logger.error(f"{self.log_prefix} pair_config non fourni à set_backtest_context. Les précisions ne peuvent pas être déterminées.")
-            # Les précisions resteront None, ce qui pourrait causer des problèmes plus tard.
+            logger.error(f"{self.log_prefix} pair_config non fourni à set_backtest_context. Les précisions et assets ne peuvent pas être déterminées.")
+            # Les précisions et assets resteront à leurs valeurs initiales (None ou ""), ce qui pourrait causer des problèmes plus tard.
 
     @abstractmethod
     def _validate_params(self) -> None:
@@ -151,15 +157,6 @@ class BaseStrategy(ABC):
         Returns:
             pd.DataFrame: Le DataFrame prêt pour la génération de signaux.
         """
-        # Les classes filles doivent vérifier la présence des colonnes _strat dont elles ont besoin
-        # et potentiellement appliquer un ffill.
-        # Exemple:
-        # required_strat_cols = ['EMA_FAST_strat', 'RSI_strat']
-        # missing_cols = [col for col in required_strat_cols if col not in data_feed.columns]
-        # if missing_cols:
-        #     logger.error(f"{self.log_prefix} Colonnes indicateur _strat manquantes: {missing_cols}")
-        #     # Gérer l'erreur, peut-être retourner un DataFrame vide ou lever une exception
-        # data_feed[required_strat_cols] = data_feed[required_strat_cols].ffill()
         pass
 
     @abstractmethod
@@ -384,7 +381,7 @@ class BaseStrategy(ABC):
         
         # Ajuster la quantité au stepSize et à la précision
         # adjust_quantity_to_step_size gère l'arrondi vers le bas au multiple de step_size.
-        adjusted_quantity_base = adjust_quantity_to_step_size(quantity_base_raw, symbol_info, qty_precision)
+        adjusted_quantity_base = adjust_quantity_to_step_size(quantity_base_raw, symbol_info) # rounding_mode_str par défaut est ROUND_FLOOR
         
         if adjusted_quantity_base is None or adjusted_quantity_base <= 1e-9: # 1e-9 pour éviter les floats très petits
             logger.warning(f"{calc_log_prefix} Quantité ajustée ({adjusted_quantity_base}) est nulle ou négative après application de step_size/précision. "
@@ -532,25 +529,8 @@ class BaseStrategy(ABC):
         {
             'indicator_name': 'EMA', # Nom de l'indicateur (ex: 'EMA', 'RSI', 'BBANDS')
             'params': {'length': self.params['ema_period']}, # Paramètres de l'indicateur
-            'source_column': 'close', # Colonne source (ex: 'open', 'high', 'low', 'close', 'volume')
-            # Fréquence des klines source pour cet indicateur, tirée des hyperparamètres
-            'source_kline_frequency_param': self.params.get('indicateur_frequence_ema_rapide'),
-            # Suffixe pour la colonne de sortie (ex: 'EMA_FAST_strat')
-            'output_column_suffix': 'FAST_strat'
-        }
-        Ou pour des indicateurs plus complexes retournant un DataFrame (comme BBANDS):
-        {
-            'indicator_name': 'BBANDS',
-            'params': {'length': self.params['bb_period'], 'std': self.params['bb_std']},
-            'source_column': 'close',
-            'source_kline_frequency_param': self.params.get('indicateur_frequence_bbands'),
-            'output_column_map': { # Map des colonnes du DataFrame de l'indicateur aux suffixes _strat
-                'BBL_length_std': 'LOWER_strat', # ex: BBL_20_2 -> BB_LOWER_strat
-                'BBM_length_std': 'MIDDLE_strat',
-                'BBU_length_std': 'UPPER_strat',
-                'BBB_length_std': 'BANDWIDTH_strat',
-                # 'BBP_length_std': 'PERCENT_strat' # Non utilisé, exemple
-            }
+            'inputs': {'close': 'source_column_name_in_df_enriched'}, # Map des entrées pandas-ta vers les colonnes sources
+            'outputs': 'EMA_FAST_strat' # Nom de la colonne de sortie pour une Series, ou dict pour un DataFrame
         }
 
         Returns:
@@ -585,4 +565,3 @@ class BaseStrategy(ABC):
                 - Ou None si aucun ordre d'entrée n'est généré.
         """
         pass
-

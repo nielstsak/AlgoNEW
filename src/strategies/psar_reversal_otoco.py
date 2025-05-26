@@ -12,8 +12,7 @@ import numpy as np
 import pandas as pd
 
 from src.strategies.base import BaseStrategy
-# Les utilitaires d'exchange_utils sont accessibles via les méthodes de BaseStrategy
-# ou directement si nécessaire pour des logiques très spécifiques non couvertes.
+from src.data.data_utils import get_kline_prefix_effective # Import pour déterminer les colonnes sources
 
 logger = logging.getLogger(__name__)
 
@@ -26,43 +25,26 @@ class PsarReversalOtocoStrategy(BaseStrategy):
     """
 
     REQUIRED_PARAMS: List[str] = [
-        'psar_step',  # Aussi connu comme 'af' ou 'acceleration factor'
-        'psar_max_step', # Aussi connu comme 'max_af'
+        'psar_step', 
+        'psar_max_step', 
         'indicateur_frequence_psar',
         'atr_period_sl_tp',
         'atr_base_frequency_sl_tp',
         'sl_atr_mult',
         'tp_atr_mult',
         'capital_allocation_pct',
-        'order_type_preference'
+        'order_type_preference',
+        'margin_leverage' 
     ]
 
     def __init__(self, strategy_name: str, symbol: str, params: Dict[str, Any]):
-        """
-        Initialise la stratégie PsarReversalOtocoStrategy.
-
-        Args:
-            strategy_name (str): Nom de la stratégie (clé de configuration).
-            symbol (str): Symbole de la paire de trading (ex: BTCUSDT).
-            params (Dict[str, Any]): Paramètres spécifiques à cette instance de stratégie.
-        """
         super().__init__(strategy_name, symbol, params)
-        # self.log_prefix est déjà défini dans BaseStrategy
-
-        # Noms des colonnes pour les indicateurs calculés
-        self.psarl_col_strat: str = "PSARl_strat" # PSAR long (support)
-        self.psars_col_strat: str = "PSARs_strat" # PSAR short (resistance)
-        # Note: pandas-ta.psar retourne un DataFrame avec des colonnes comme PSARl_<step>_<max_step>
-        # IndicatorCalculator devra mapper cela correctement.
+        self.psarl_col_strat: str = "PSARl_strat" 
+        self.psars_col_strat: str = "PSARs_strat" 
         self.atr_col_strat: str = "ATR_strat"
         
-        # logger.info(f"{self.log_prefix} Stratégie PsarReversalOtocoStrategy initialisée.")
 
     def _validate_params(self) -> None:
-        """
-        Valide les paramètres spécifiques à PsarReversalOtocoStrategy.
-        Lève une ValueError si un paramètre est invalide.
-        """
         missing_params = [p for p in self.REQUIRED_PARAMS if self.get_param(p) is None]
         if missing_params:
             raise ValueError(f"{self.log_prefix} Paramètres requis manquants : {', '.join(missing_params)}")
@@ -90,6 +72,10 @@ class PsarReversalOtocoStrategy(BaseStrategy):
         cap_alloc = self.get_param('capital_allocation_pct')
         if not (isinstance(cap_alloc, (int, float)) and 0 < cap_alloc <= 1.0):
             raise ValueError(f"{self.log_prefix} 'capital_allocation_pct' ({cap_alloc}) doit être entre 0 (exclusif) et 1 (inclusif).")
+        
+        margin_lev = self.get_param('margin_leverage')
+        if not (isinstance(margin_lev, (int, float)) and margin_lev >= 1.0):
+            raise ValueError(f"{self.log_prefix} 'margin_leverage' ({margin_lev}) doit être >= 1.0.")
 
         order_type_pref_val = self.get_param('order_type_preference')
         if order_type_pref_val not in ["MARKET", "LIMIT"]:
@@ -103,71 +89,83 @@ class PsarReversalOtocoStrategy(BaseStrategy):
         logger.debug(f"{self.log_prefix} Validation des paramètres terminée avec succès.")
 
     def get_required_indicator_configs(self) -> List[Dict[str, Any]]:
-        """
-        Déclare les indicateurs requis par PsarReversalOtocoStrategy.
-        """
-        # pandas-ta psar utilise 'af' pour step et 'max_af' pour max_step.
-        # Il retourne un DataFrame. IndicatorCalculator devra mapper les colonnes.
-        # Les clés dans 'output_column_map' sont des identifiants conceptuels
-        # que IndicatorCalculator utilisera pour trouver les bonnes colonnes dans le
-        # DataFrame retourné par ta.psar (ex: la colonne contenant 'psarl' pour 'long_stop').
+        freq_psar_param = str(self.params['indicateur_frequence_psar'])
+        kline_prefix_psar = get_kline_prefix_effective(freq_psar_param)
+        source_col_high_psar = f"{kline_prefix_psar}_high" if kline_prefix_psar else "high"
+        source_col_low_psar = f"{kline_prefix_psar}_low" if kline_prefix_psar else "low"
+        source_col_close_psar = f"{kline_prefix_psar}_close" if kline_prefix_psar else "close"
+
+        freq_atr_param = str(self.params['atr_base_frequency_sl_tp'])
+        kline_prefix_atr = get_kline_prefix_effective(freq_atr_param)
+        source_col_high_atr = f"{kline_prefix_atr}_high" if kline_prefix_atr else "high"
+        source_col_low_atr = f"{kline_prefix_atr}_low" if kline_prefix_atr else "low"
+        source_col_close_atr = f"{kline_prefix_atr}_close" if kline_prefix_atr else "close"
+
         configs = [
             {
                 'indicator_name': 'psar',
                 'params': {
-                    'af': self.params['psar_step'],
-                    'max_af': self.params['psar_max_step']
+                    'af': self.params['psar_step'], 
+                    'max_af': self.params['psar_max_step'] 
                 },
-                'source_kline_frequency_param_name': 'indicateur_frequence_psar',
-                # Pour PSAR, 'inputs' attendues par pandas-ta sont 'high', 'low', 'close'.
-                # IndicatorCalculator utilisera la fréquence pour trouver les bonnes colonnes sources.
-                'output_column_map': {
-                    'PSARl': self.psarl_col_strat, # Clé conceptuelle, mappée à la colonne réelle par IndicatorCalculator
-                    'PSARs': self.psars_col_strat
-                    # Si IndicatorCalculator a besoin des noms exacts que pandas-ta retourne (ex: PSARl_0.02_0.2),
-                    # alors ces noms devraient être construits ici ou la logique de mapping dans
-                    # IndicatorCalculator doit être robuste.
-                    # Pour l'instant, on suppose que IndicatorCalculator peut gérer ce mapping.
+                'inputs': { 
+                    'high': source_col_high_psar,
+                    'low': source_col_low_psar,
+                    'close': source_col_close_psar 
+                },
+                'outputs': { 
+                    'long': self.psarl_col_strat,  
+                    'short': self.psars_col_strat, 
                 }
             },
             {
                 'indicator_name': 'atr',
                 'params': {'length': int(self.params['atr_period_sl_tp'])},
-                'source_kline_frequency_param_name': 'atr_base_frequency_sl_tp',
-                'output_column_name': self.atr_col_strat
+                'inputs': { 
+                    'high': source_col_high_atr,
+                    'low': source_col_low_atr,
+                    'close': source_col_close_atr
+                },
+                'outputs': self.atr_col_strat
             }
         ]
-        logger.debug(f"{self.log_prefix} Configurations d'indicateurs requises : {configs}")
+        logger.debug(f"{self.log_prefix} Configurations d'indicateurs requises (standardisées) : {configs}")
         return configs
 
     def _calculate_indicators(self, data_feed: pd.DataFrame) -> pd.DataFrame:
         """
-        Vérifie la présence des colonnes d'indicateurs _strat attendues.
+        Vérifie la présence des colonnes d'indicateurs _strat attendues (fournies par
+        IndicatorCalculator). Applique ffill pour propager les valeurs.
         """
         df = data_feed.copy()
         expected_strat_cols = [self.psarl_col_strat, self.psars_col_strat, self.atr_col_strat]
         
-        missing_cols_added_nan = False
+        # Vérifier les colonnes OHLCV de base
+        base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
+        missing_ohlcv = [col for col in base_ohlcv if col not in df.columns]
+        if missing_ohlcv:
+            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}."
+            logger.critical(msg)
+            raise ValueError(msg)
+        
+        missing_strat_cols = []
         for col_name in expected_strat_cols:
             if col_name not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante dans data_feed. Ajout avec NaN.")
+                logger.warning(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante dans data_feed. "
+                               "Elle sera ajoutée avec NaN, indiquant un problème en amont.")
                 df[col_name] = np.nan
-                missing_cols_added_nan = True
+                missing_strat_cols.append(col_name)
         
-        base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
-        for col in base_ohlcv:
-            if col not in df.columns:
-                logger.error(f"{self.log_prefix} Colonne OHLCV de base '{col}' manquante dans data_feed.")
-                df[col] = np.nan
-                missing_cols_added_nan = True
-        
-        if missing_cols_added_nan:
-             logger.debug(f"{self.log_prefix} Après vérification _calculate_indicators, colonnes : {df.columns.tolist()}")
+        if missing_strat_cols:
+             logger.debug(f"{self.log_prefix} Après vérification _calculate_indicators, "
+                          f"colonnes manquantes ajoutées (NaN): {missing_strat_cols}. "
+                          f"Colonnes actuelles: {df.columns.tolist()}")
 
-        cols_to_ffill = [col for col in expected_strat_cols if col in df.columns]
-        if cols_to_ffill:
-            df[cols_to_ffill] = df[cols_to_ffill].ffill()
-            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat : {cols_to_ffill}")
+        cols_to_ffill_present = [col for col in expected_strat_cols if col in df.columns]
+        if cols_to_ffill_present:
+            df[cols_to_ffill_present] = df[cols_to_ffill_present].ffill()
+            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat présentes : {cols_to_ffill_present}")
+        
         return df
 
     def _generate_signals(self,
@@ -176,33 +174,26 @@ class PsarReversalOtocoStrategy(BaseStrategy):
                           current_position_direction: int,
                           current_entry_price: float
                          ) -> Tuple[int, Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
-        """
-        Génère les signaux de trading pour la stratégie de renversement PSAR.
-        """
         signal_type: int = 0
         limit_price: Optional[float] = None
         sl_price: Optional[float] = None
         tp_price: Optional[float] = None
 
-        if len(data_with_indicators) < 2: # Besoin d'au moins 2 barres pour la logique de renversement
+        if len(data_with_indicators) < 2: 
             logger.debug(f"{self.log_prefix} Pas assez de données ({len(data_with_indicators)}) pour générer des signaux.")
             return 0, self.get_param("order_type_preference"), None, None, None, self.get_param('capital_allocation_pct')
 
         latest_row = data_with_indicators.iloc[-1]
         previous_row = data_with_indicators.iloc[-2]
 
-        # Récupérer les valeurs des indicateurs et du prix
         close_curr = latest_row.get('close')
-        psarl_curr = latest_row.get(self.psarl_col_strat) # PSAR Long (support)
-        psars_curr = latest_row.get(self.psars_col_strat) # PSAR Short (résistance)
+        psarl_curr = latest_row.get(self.psarl_col_strat) 
+        psars_curr = latest_row.get(self.psars_col_strat) 
         atr_curr = latest_row.get(self.atr_col_strat)
         
         psarl_prev = previous_row.get(self.psarl_col_strat)
         psars_prev = previous_row.get(self.psars_col_strat)
 
-        # Vérifier les valeurs essentielles
-        # Pour PSAR, une des deux valeurs (psarl, psars) est NaN et l'autre a une valeur.
-        # Le signal de renversement se produit lorsque la valeur non-NaN change de colonne.
         if pd.isna(close_curr) or pd.isna(atr_curr) or \
            (pd.isna(psarl_curr) and pd.isna(psars_curr)) or \
            (pd.isna(psarl_prev) and pd.isna(psars_prev)):
@@ -210,11 +201,8 @@ class PsarReversalOtocoStrategy(BaseStrategy):
             logger.debug(f"{self.log_prefix} Valeurs d'indicateur ou de prix manquantes (NaN) à {latest_row.name}. Détails: {nan_details}. Signal HOLD.")
             return 0, self.get_param("order_type_preference"), None, None, None, self.get_param('capital_allocation_pct')
 
-        # Logique de renversement PSAR
-        # Entrée Long: PSAR était au-dessus (PSARs actif) et croise en dessous (PSARl devient actif)
         entry_long_triggered = pd.notna(psars_prev) and pd.isna(psarl_prev) and \
                                pd.notna(psarl_curr) and pd.isna(psars_curr)
-        # Entrée Short: PSAR était en dessous (PSARl actif) et croise au-dessus (PSARs devient actif)
         entry_short_triggered = pd.notna(psarl_prev) and pd.isna(psars_prev) and \
                                 pd.notna(psars_curr) and pd.isna(psarl_curr)
 
@@ -223,28 +211,28 @@ class PsarReversalOtocoStrategy(BaseStrategy):
 
         if not current_position_open:
             if entry_long_triggered:
-                signal_type = 1 # Signal d'achat (LONG)
+                signal_type = 1 
                 if atr_curr > 0: # type: ignore
                     sl_price = close_curr - (sl_atr_mult * atr_curr) # type: ignore
                     tp_price = close_curr + (tp_atr_mult * atr_curr) # type: ignore
                 logger.info(f"{self.log_prefix} Signal BUY (PSAR Long) @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
             elif entry_short_triggered:
-                signal_type = -1 # Signal de vente (SHORT)
+                signal_type = -1 
                 if atr_curr > 0: # type: ignore
                     sl_price = close_curr + (sl_atr_mult * atr_curr) # type: ignore
                     tp_price = close_curr - (tp_atr_mult * atr_curr) # type: ignore
                 logger.info(f"{self.log_prefix} Signal SELL (PSAR Short) @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
-        else: # Position ouverte
-            if current_position_direction == 1 and entry_short_triggered: # En Long, et signal de renversement Short
-                signal_type = 2 # Signal de sortie de position
+        else: 
+            if current_position_direction == 1 and entry_short_triggered: 
+                signal_type = 2 
                 logger.info(f"{self.log_prefix} Signal EXIT LONG (PSAR Short triggered) @ {close_curr:.4f}")
-            elif current_position_direction == -1 and entry_long_triggered: # En Short, et signal de renversement Long
-                signal_type = 2 # Signal de sortie de position
+            elif current_position_direction == -1 and entry_long_triggered: 
+                signal_type = 2 
                 logger.info(f"{self.log_prefix} Signal EXIT SHORT (PSAR Long triggered) @ {close_curr:.4f}")
         
         order_type_preference = str(self.get_param("order_type_preference", "MARKET"))
         if signal_type != 0 and order_type_preference == "LIMIT":
-            limit_price = float(close_curr) # Suggérer le prix de clôture actuel pour l'ordre limite
+            limit_price = float(close_curr) 
 
         position_size_pct = float(self.get_param('capital_allocation_pct', 1.0))
 
@@ -256,9 +244,6 @@ class PsarReversalOtocoStrategy(BaseStrategy):
                                available_capital: float,
                                symbol_info: Dict[str, Any]
                                ) -> Optional[Tuple[Dict[str, Any], Dict[str, float]]]:
-        """
-        Génère une requête d'ordre d'ENTRÉE pour le trading en direct.
-        """
         if current_position != 0:
             logger.debug(f"{self.log_prefix} [Live] Position déjà ouverte (état: {current_position}). Pas de nouvelle requête d'ordre d'entrée.")
             return None
@@ -307,8 +292,8 @@ class PsarReversalOtocoStrategy(BaseStrategy):
 
         entry_price_for_order_str: Optional[str] = None
         if order_type == "LIMIT" and limit_price_sugg is not None:
-            from src.utils.exchange_utils import adjust_precision, get_filter_value # Import local pour éviter dépendance circulaire au niveau module
-            adjusted_limit_price = adjust_precision(limit_price_sugg, self.price_precision, get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize'))
+            from src.utils.exchange_utils import adjust_precision, get_filter_value 
+            adjusted_limit_price = adjust_precision(limit_price_sugg, self.price_precision, tick_size=get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize'))
             if adjusted_limit_price is None: return None
             entry_price_for_order_str = f"{adjusted_limit_price:.{self.price_precision}f}"
         
@@ -327,4 +312,3 @@ class PsarReversalOtocoStrategy(BaseStrategy):
         
         logger.info(f"{self.log_prefix} [Live] Requête d'ordre d'entrée générée : {entry_order_params}. SL/TP bruts : {sl_tp_raw_prices_dict}")
         return entry_order_params, sl_tp_raw_prices_dict
-

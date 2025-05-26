@@ -26,7 +26,7 @@ class MaCrossoverStrategy(BaseStrategy):
         'atr_base_frequency_sl_tp',
         'capital_allocation_pct',
         'order_type_preference',
-        'margin_leverage' # Ajouté car utilisé dans les paramètres par défaut
+        'margin_leverage' 
     ]
 
     def __init__(self, strategy_name: str, symbol: str, params: Dict[str, Any]):
@@ -34,15 +34,13 @@ class MaCrossoverStrategy(BaseStrategy):
         self.fast_ma_col_strat: str = "MA_FAST_strat"
         self.slow_ma_col_strat: str = "MA_SLOW_strat"
         self.atr_col_strat: str = "ATR_strat"
-        # Initialisation des attributs après validation des paramètres
         self._initialize_strategy_attributes()
 
 
     def _initialize_strategy_attributes(self) -> None:
         """Initialise les attributs spécifiques après la validation des paramètres."""
-        # Cette méthode peut être appelée après _validate_params si certains attributs
-        # dépendent de la validité des paramètres.
-        # Pour l'instant, les noms de colonnes sont fixes.
+        # Actuellement vide, peut être utilisé pour des initialisations complexes
+        # basées sur les paramètres validés.
         pass
 
     def _validate_params(self) -> None:
@@ -102,7 +100,7 @@ class MaCrossoverStrategy(BaseStrategy):
     def get_required_indicator_configs(self) -> List[Dict[str, Any]]:
         """
         Déclare les indicateurs requis par MaCrossoverStrategy et leurs configurations,
-        en incluant la clé 'inputs' pour IndicatorCalculator.
+        en utilisant la nouvelle structure standardisée.
         """
         # Fréquence pour la MA rapide
         freq_ma_rapide_param = str(self.params['indicateur_frequence_ma_rapide'])
@@ -126,7 +124,7 @@ class MaCrossoverStrategy(BaseStrategy):
                 'indicator_name': str(self.params['ma_type']).lower(),
                 'params': {'length': int(self.params['fast_ma_period'])},
                 'inputs': {'close': source_col_close_ma_rapide},
-                'outputs': self.fast_ma_col_strat # 'outputs' est le nom attendu par IndicatorCalculator
+                'outputs': self.fast_ma_col_strat
             },
             {
                 'indicator_name': str(self.params['ma_type']).lower(),
@@ -137,7 +135,7 @@ class MaCrossoverStrategy(BaseStrategy):
             {
                 'indicator_name': 'atr',
                 'params': {'length': int(self.params['atr_period_sl_tp'])},
-                'inputs': { # pandas-ta.atr attend high, low, close
+                'inputs': { 
                     'high': source_col_high_atr,
                     'low': source_col_low_atr,
                     'close': source_col_close_atr
@@ -145,39 +143,49 @@ class MaCrossoverStrategy(BaseStrategy):
                 'outputs': self.atr_col_strat
             }
         ]
-        logger.debug(f"{self.log_prefix} Configurations d'indicateurs requises : {configs}")
+        logger.debug(f"{self.log_prefix} Configurations d'indicateurs requises (standardisées) : {configs}")
         return configs
 
     def _calculate_indicators(self, data_feed: pd.DataFrame) -> pd.DataFrame:
         """
-        Vérifie la présence des colonnes d'indicateurs `_strat` attendues.
-        Le calcul effectif est fait par IndicatorCalculator.
-        Cette méthode applique un ffill pour propager les valeurs.
+        Vérifie la présence des colonnes d'indicateurs `_strat` attendues, fournies
+        par IndicatorCalculator. Applique un ffill pour propager les valeurs et s'assurer
+        qu'il n'y a pas de NaNs qui interrompraient la logique de signal (sauf au début).
         """
         df = data_feed.copy()
         expected_strat_cols = [self.fast_ma_col_strat, self.slow_ma_col_strat, self.atr_col_strat]
         
-        missing_cols_added_nan = False
+        # Vérifier la présence des colonnes OHLCV de base (critique)
+        base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
+        missing_ohlcv = [col for col in base_ohlcv if col not in df.columns]
+        if missing_ohlcv:
+            # Lever une exception ou logger une erreur fatale, car la stratégie ne peut pas fonctionner sans.
+            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}. " \
+                  "Ces colonnes sont essentielles pour la logique de signal."
+            logger.critical(msg)
+            raise ValueError(msg)
+
+        # Vérifier les colonnes d'indicateurs _strat attendues
+        missing_strat_cols = []
         for col_name in expected_strat_cols:
             if col_name not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante dans data_feed. Ajout avec NaN.")
+                logger.warning(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante dans data_feed. "
+                               "Elle sera ajoutée avec NaN, mais cela indique un problème en amont (IndicatorCalculator).")
                 df[col_name] = np.nan
-                missing_cols_added_nan = True
+                missing_strat_cols.append(col_name)
         
-        base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
-        for col in base_ohlcv:
-            if col not in df.columns:
-                logger.error(f"{self.log_prefix} Colonne OHLCV de base '{col}' manquante dans data_feed. Ceci est critique.")
-                df[col] = np.nan
-                missing_cols_added_nan = True
+        if missing_strat_cols:
+             logger.debug(f"{self.log_prefix} Après vérification des colonnes _calculate_indicators, "
+                          f"colonnes manquantes ajoutées (NaN): {missing_strat_cols}. "
+                          f"Colonnes actuelles: {df.columns.tolist()}")
 
-        if missing_cols_added_nan:
-             logger.debug(f"{self.log_prefix} Après vérification des colonnes _calculate_indicators, colonnes actuelles: {df.columns.tolist()}")
-
-        cols_to_ffill = [col for col in expected_strat_cols if col in df.columns]
-        if cols_to_ffill:
-            df[cols_to_ffill] = df[cols_to_ffill].ffill()
-            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat : {cols_to_ffill}")
+        # Appliquer ffill seulement aux colonnes _strat qui existent (ou viennent d'être ajoutées avec NaN)
+        cols_to_ffill_present = [col for col in expected_strat_cols if col in df.columns]
+        if cols_to_ffill_present:
+            df[cols_to_ffill_present] = df[cols_to_ffill_present].ffill()
+            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat présentes : {cols_to_ffill_present}")
+        else:
+            logger.debug(f"{self.log_prefix} Aucune colonne _strat à ffill (soit toutes manquantes et ajoutées, soit la liste était vide).")
 
         return df
 
@@ -225,9 +233,15 @@ class MaCrossoverStrategy(BaseStrategy):
                     sl_price = close_price_curr - (atr_value_curr * sl_multiplier) # type: ignore
                     tp_price = close_price_curr + (atr_value_curr * tp_multiplier) # type: ignore
                 logger.info(f"{self.log_prefix} Signal BUY @ {close_price_curr:.4f}. SL={sl_price}, TP={tp_price}")
-            elif bearish_crossover: # Shorting n'est pas explicitement géré par cette stratégie simple
-                # Pour un système plus complet, on ajouterait un paramètre 'allow_shorting'
-                # et on générerait un signal -1 ici. Pour l'instant, on ignore ce cas pour l'entrée.
+            elif bearish_crossover: 
+                # Gérer le shorting si activé (non explicitement dans les params de cette strat simple)
+                # if self.get_param('allow_shorting', False):
+                #     signal_type = -1
+                #     if atr_value_curr > 0:
+                #         sl_price = close_price_curr + (atr_value_curr * sl_multiplier)
+                #         tp_price = close_price_curr - (atr_value_curr * tp_multiplier)
+                #     logger.info(f"{self.log_prefix} Signal SELL (SHORT) @ {close_price_curr:.4f}. SL={sl_price}, TP={tp_price}")
+                # else:
                 logger.debug(f"{self.log_prefix} Croisement baissier détecté, mais pas de position ouverte et shorting non implémenté pour entrée. Signal HOLD.")
                 pass
         else: 
@@ -264,14 +278,10 @@ class MaCrossoverStrategy(BaseStrategy):
         signal, order_type, limit_price_sugg, sl_price_raw, tp_price_raw, pos_size_pct = \
             self._generate_signals(data_with_indicators, False, 0, 0.0)
 
-        if signal not in [1, -1]: # Uniquement signaux d'entrée Long ou Short (si shorting était implémenté)
+        if signal not in [1, -1]: 
             logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée (1 ou -1) généré. Signal: {signal}")
             return None
         
-        # if signal == -1 and not self.get_param('allow_shorting', False): # Si on ajoutait allow_shorting
-        #     logger.debug(f"{self.log_prefix} [Live] Signal Short (-1) mais shorting non permis. Pas d'ordre.")
-        #     return None
-
         latest_bar = data_with_indicators.iloc[-1]
         entry_price_theoretical: float
         if order_type == "LIMIT" and limit_price_sugg is not None:
@@ -284,7 +294,7 @@ class MaCrossoverStrategy(BaseStrategy):
             logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique invalide ({entry_price_theoretical}).")
             return None
 
-        if self.quantity_precision is None or self.pair_config is None: # pair_config est symbol_info
+        if self.quantity_precision is None or self.pair_config is None: 
             logger.error(f"{self.log_prefix} [Live] Contexte (précisions, pair_config) non défini via set_backtest_context.")
             return None
             
@@ -312,7 +322,7 @@ class MaCrossoverStrategy(BaseStrategy):
         
         quantity_str_formatted = f"{quantity_base:.{self.quantity_precision}f}"
         entry_order_params = self._build_entry_params_formatted(
-            side="BUY" if signal == 1 else "SELL", # Adapter si shorting
+            side="BUY" if signal == 1 else "SELL", 
             quantity_str=quantity_str_formatted,
             order_type=str(order_type),
             entry_price_str=entry_price_for_order_str

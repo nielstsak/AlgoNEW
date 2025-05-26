@@ -12,7 +12,8 @@ import importlib
 import uuid # Pour les logs OOS détaillés si besoin
 from typing import Any, Dict, Optional, Tuple, List, Type, Union, TYPE_CHECKING, cast
 from datetime import timezone # Pour s'assurer que les timestamps sont UTC
-import os # Ajouté pour os.sep et la manipulation de chemin
+import os 
+from pathlib import Path # Ajouté pour une manipulation de chemin plus robuste
 
 import numpy as np
 import pandas as pd
@@ -141,10 +142,15 @@ class ObjectiveFunctionEvaluator:
                     params_for_trial[param_name] = trial.suggest_float(param_name, low_f, high_f, step=step_f, log=p_detail.log_scale)
                 elif p_detail.type == 'categorical' and p_detail.choices:
                     params_for_trial[param_name] = trial.suggest_categorical(param_name, p_detail.choices)
-                else:
-                    params_for_trial[param_name] = p_detail.default if p_detail.default is not None else p_detail.low
+                else: # Fallback si le type n'est pas géré ou si la config est invalide
+                    params_for_trial[param_name] = p_detail.default if p_detail.default is not None else (p_detail.low if p_detail.low is not None else None)
+                    if params_for_trial[param_name] is None and p_detail.choices: # Fallback pour catégoriel mal configuré
+                        params_for_trial[param_name] = p_detail.choices[0]
+                    logger.warning(f"{log_prefix_suggest} Type de paramètre '{p_detail.type}' non géré pour '{param_name}' ou configuration ParamDetail invalide. Utilisation de fallback: {params_for_trial[param_name]}")
+
             except Exception as e_sug:
                 logger.error(f"{log_prefix_suggest} Erreur suggestion paramètre '{param_name}': {e_sug}", exc_info=True)
+                # Fallback en cas d'erreur de suggestion
                 if p_detail.default is not None: params_for_trial[param_name] = p_detail.default
                 elif p_detail.type == 'categorical' and p_detail.choices: params_for_trial[param_name] = p_detail.choices[0]
                 else: raise optuna.exceptions.TrialPruned(f"Échec suggestion pour {param_name}")
@@ -197,6 +203,64 @@ class ObjectiveFunctionEvaluator:
         logger.info(f"{log_prefix_prep} Préparation des données avec indicateurs terminée. Shape final: {df_final_for_simulation.shape}")
         return df_final_for_simulation
 
+    def _resolve_module_import_path(self, script_reference_from_config: str) -> str:
+        """
+        Résout le chemin du script de stratégie en un chemin d'importation Python valide.
+        """
+        log_prefix_import = f"{self.log_prefix}[ResolveImportPath]"
+        
+        if not self.app_config.project_root:
+            logger.error(f"{log_prefix_import} project_root non défini dans AppConfig. "
+                         "Impossible de résoudre le chemin d'import de manière robuste.")
+            # Fallback sur l'ancienne méthode, moins robuste
+            return script_reference_from_config.replace('.py', '').replace(os.sep, '.')
+
+        project_root_path = Path(self.app_config.project_root).resolve()
+        script_path_rel_to_config = Path(script_reference_from_config) # Ex: "src/strategies/my_strat.py"
+
+        # Construire le chemin absolu du script
+        # Si script_path_rel_to_config est déjà absolu, project_root_path ne sera pas préfixé.
+        script_path_abs = (project_root_path / script_path_rel_to_config).resolve()
+        logger.debug(f"{log_prefix_import} Chemin absolu du script de stratégie : {script_path_abs}")
+
+        # Tenter de rendre le chemin relatif à un répertoire parent qui est dans sys.path
+        # ou à la racine du projet, pour former un chemin d'import Python.
+        
+        # Cas 1: Le script est sous 'src' et 'src' est un package racine pour les imports
+        try:
+            # Trouver le dossier 'src' dans le chemin absolu du script
+            src_dir_in_path_parts = [part for part in script_path_abs.parents if part.name == 'src']
+            if src_dir_in_path_parts:
+                src_dir_base = src_dir_in_path_parts[0] # Le 'src' le plus proche du fichier
+                # Le chemin d'import commence à partir du parent de 'src' si 'src' lui-même fait partie du module
+                # ou à partir de 'src' si le parent de 'src' est la racine d'importation.
+                # Généralement, si on a project_root/src/strategies, l'import est src.strategies...
+                # Donc, on rend relatif au parent de 'src' (qui est project_root)
+                module_rel_path_obj = script_path_abs.relative_to(src_dir_base.parent).with_suffix('')
+                module_import_str = '.'.join(module_rel_path_obj.parts)
+                logger.debug(f"{log_prefix_import} Chemin d'import (via 'src' parent) : {module_import_str}")
+                return module_import_str
+        except ValueError: # Si .relative_to échoue
+            logger.debug(f"{log_prefix_import} Échec de la résolution relative au parent de 'src'. Tentative par rapport à project_root.")
+            pass # Tenter la méthode suivante
+
+        # Cas 2: Le script est sous project_root (mais peut-être pas directement sous 'src')
+        try:
+            module_rel_path_obj = script_path_abs.relative_to(project_root_path).with_suffix('')
+            module_import_str = '.'.join(module_rel_path_obj.parts)
+            logger.debug(f"{log_prefix_import} Chemin d'import (via project_root) : {module_import_str}")
+            return module_import_str
+        except ValueError:
+            logger.warning(f"{log_prefix_import} Échec de la résolution relative à project_root. "
+                           f"Script path: {script_path_abs}, Project root: {project_root_path}")
+            pass
+
+        # Cas 3: Fallback sur l'ancienne méthode (remplacement de séparateurs)
+        # Cela suppose que script_reference_from_config est déjà un chemin de type "src/..."
+        logger.warning(f"{log_prefix_import} Utilisation de la méthode de fallback pour le chemin d'import (remplacement de séparateurs).")
+        return script_reference_from_config.replace('.py', '').replace(os.sep, '.')
+
+
     def __call__(self, trial: optuna.Trial) -> Union[float, Tuple[float, ...]]:
         start_time_trial = time.time()
         trial_log_id: str
@@ -214,7 +278,7 @@ class ObjectiveFunctionEvaluator:
 
         current_trial_params: Dict[str, Any]
         if self.is_oos_eval:
-            current_trial_params = trial.params
+            current_trial_params = trial.params # Les params sont fixés par enqueue_trial pour OOS
             logger.info(f"{current_log_prefix} Évaluation OOS avec params fixes (de IS trial {self.is_trial_number_for_oos_log}): {current_trial_params}")
         else: 
             try:
@@ -232,23 +296,20 @@ class ObjectiveFunctionEvaluator:
 
         StrategyClassImpl: Type['BaseStrategy']
         try:
-            # Correction pour l'importation : transformer le chemin de fichier en chemin de module
-            # Exemple: "src/strategies/ma_crossover_strategy.py" -> "src.strategies.ma_crossover_strategy"
-            module_path_py = self.strategy_script_reference.replace('.py', '').replace('/', '.').replace('\\', '.')
+            module_import_path = self._resolve_module_import_path(self.strategy_script_reference)
+            logger.debug(f"{current_log_prefix} Tentative d'import du module de stratégie : '{module_import_path}' pour la classe '{self.strategy_class_name}'.")
             
-            logger.debug(f"{current_log_prefix} Tentative d'import du module de stratégie : '{module_path_py}' pour la classe '{self.strategy_class_name}'.")
-            
-            module = importlib.import_module(module_path_py)
+            module = importlib.import_module(module_import_path)
             StrategyClassImpl = getattr(module, self.strategy_class_name)
             if not issubclass(StrategyClassImpl, BaseStrategy):
                 raise TypeError(f"{self.strategy_class_name} n'est pas une sous-classe de BaseStrategy.")
-            logger.debug(f"{current_log_prefix} Classe de stratégie '{self.strategy_class_name}' chargée depuis '{module_path_py}'.")
+            logger.debug(f"{current_log_prefix} Classe de stratégie '{self.strategy_class_name}' chargée depuis '{module_import_path}'.")
         except ModuleNotFoundError as e_mnfe:
-            logger.error(f"{current_log_prefix} ModuleNotFoundError lors du chargement de la stratégie '{module_path_py if 'module_path_py' in locals() else self.strategy_script_reference}': {e_mnfe}. Vérifiez PYTHONPATH et la structure du projet.", exc_info=True)
+            logger.error(f"{current_log_prefix} ModuleNotFoundError lors du chargement de la stratégie '{module_import_path if 'module_import_path' in locals() else self.strategy_script_reference}': {e_mnfe}. Vérifiez PYTHONPATH et la structure du projet.", exc_info=True)
             trial.set_user_attr("failure_reason", f"ModuleNotFoundError: {e_mnfe}")
             return self._get_worst_objective_values(f"ModuleNotFoundError: {e_mnfe}")
         except Exception as e_load_strat:
-            logger.error(f"{current_log_prefix} Échec chargement classe stratégie {self.strategy_class_name} depuis {self.strategy_script_reference} (module tenté: {module_path_py if 'module_path_py' in locals() else 'non_defini'}): {e_load_strat}", exc_info=True)
+            logger.error(f"{current_log_prefix} Échec chargement classe stratégie {self.strategy_class_name} depuis {self.strategy_script_reference} (module tenté: {module_import_path if 'module_import_path' in locals() else 'non_defini'}): {e_load_strat}", exc_info=True)
             trial.set_user_attr("failure_reason", f"Échec chargement classe strat: {str(e_load_strat)[:100]}")
             return self._get_worst_objective_values(f"Échec chargement classe strat: {e_load_strat}")
 
@@ -405,4 +466,3 @@ class ObjectiveFunctionEvaluator:
 
         worst_values = tuple([-1e12 if d.lower() == "maximize" else 1e12 for d in obj_dirs])
         return worst_values if len(worst_values) > 1 else worst_values[0]
-
