@@ -9,7 +9,7 @@ du gestionnaire WFO pour une combinaison stratégie/paire/contexte donnée.
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional # Ajout de Optional
+from typing import Any, Dict, Optional, cast # Ajout de Optional
 
 # Imports de l'application
 # Assurer que le PYTHONPATH est correctement configuré si ce module est exécuté
