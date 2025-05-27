@@ -10,9 +10,9 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Type, TYPE_CHECKING, cast
 
-import pandas as pd
-import numpy as np # Pour np.isfinite
-import optuna
+import pandas as pd # Assurer l'import pour Pylance
+import numpy as np 
+import optuna # Assurer l'import pour Pylance
 
 if TYPE_CHECKING:
     from src.config.loader import AppConfig
@@ -66,11 +66,11 @@ class OOSValidator:
         self.log_prefix = f"[{self.strategy_name}/{self.pair_symbol}/{self.context_label}][Run:{self.run_id}][{fold_name_from_study}][OOSValidator]"
 
         self.wfo_settings: 'WfoSettings' = self.app_config.global_config.wfo_settings
-        self.strategy_config_obj_dict: Optional[Dict[str, Any]] = None # Sera le dict de StrategyParamsConfig
+        self.strategy_config_obj_dict: Optional[Dict[str, Any]] = None 
         
         strategy_params_config_dataclass = self.app_config.strategies_config.strategies.get(self.strategy_name)
         if strategy_params_config_dataclass:
-            import dataclasses
+            import dataclasses 
             self.strategy_config_obj_dict = dataclasses.asdict(strategy_params_config_dataclass)
         
         if not self.strategy_config_obj_dict:
@@ -82,15 +82,15 @@ class OOSValidator:
 
     def _save_optuna_study_summary(self, fold_output_dir: Path) -> None:
         """Sauvegarde un résumé de l'étude Optuna IS et le DataFrame des essais."""
-        fold_name = fold_output_dir.name # ex: "fold_0"
+        fold_name = fold_output_dir.name 
         logger.info(f"{self.log_prefix}[{fold_name}] Sauvegarde du résumé de l'étude Optuna IS...")
         fold_output_dir.mkdir(parents=True, exist_ok=True)
 
         best_trial_for_summary: Optional[optuna.trial.FrozenTrial] = None
-        if self.study_is.best_trials: # Pour multi-objectif, best_trials est une liste non-dominée
-            best_trial_for_summary = self.study_is.best_trials[0] # Prendre le premier comme représentatif
+        if self.study_is.best_trials: 
+            best_trial_for_summary = self.study_is.best_trials[0] 
             logger.debug(f"{self.log_prefix}[{fold_name}] Étude multi-objectifs, utilisation du premier de 'best_trials' pour le résumé.")
-        elif self.study_is.best_trial: # Pour mono-objectif
+        elif hasattr(self.study_is, 'best_trial') and self.study_is.best_trial: 
              best_trial_for_summary = self.study_is.best_trial
              logger.debug(f"{self.log_prefix}[{fold_name}] Étude mono-objectif, utilisation de 'best_trial' pour le résumé.")
         else:
@@ -104,7 +104,7 @@ class OOSValidator:
             "best_trial_is_number": best_trial_for_summary.number if best_trial_for_summary else None,
             "best_trial_is_values": best_trial_for_summary.values if best_trial_for_summary else None,
             "best_trial_is_params": best_trial_for_summary.params if best_trial_for_summary else None,
-            "pareto_front_trials_is_count": len(self.study_is.best_trials) # Nombre d'essais sur le front de Pareto
+            "pareto_front_trials_is_count": len(self.study_is.best_trials) 
         }
         summary_filepath = fold_output_dir / f"optuna_study_summary_{fold_name}.json"
         
@@ -119,7 +119,7 @@ class OOSValidator:
             trials_filepath = fold_output_dir / f"optuna_trials_dataframe_{fold_name}.csv"
             trials_df.to_csv(trials_filepath, index=False)
             logger.info(f"{self.log_prefix}[{fold_name}] DataFrame des essais Optuna IS sauvegardé : {trials_filepath}")
-        except Exception as e_df: # Peut échouer si aucun essai, etc.
+        except Exception as e_df: 
             logger.error(f"{self.log_prefix}[{fold_name}] Impossible de sauvegarder le DataFrame des essais Optuna IS : {e_df}", exc_info=True)
 
     def _get_best_is_trials_for_oos(self) -> List[Dict[str, Any]]:
@@ -142,15 +142,13 @@ class OOSValidator:
             return []
 
         trials_to_consider_for_oos: List[optuna.trial.FrozenTrial]
-        if len(self.study_is.directions) > 1: # Multi-objectif
-            # Filtrer les essais du front de Pareto pour s'assurer qu'ils sont bien 'completed_valid_trials'
+        if len(self.study_is.directions) > 1: 
             pareto_front_trial_numbers = {t.number for t in self.study_is.best_trials}
             trials_to_consider_for_oos = [t for t in completed_valid_trials if t.number in pareto_front_trial_numbers]
             
-            if not trials_to_consider_for_oos: # Si aucun essai du front de Pareto n'est valide
+            if not trials_to_consider_for_oos: 
                 logger.warning(f"{self.log_prefix}[{fold_name}] Aucun essai valide trouvé sur le front de Pareto. "
                                "Utilisation de tous les essais valides triés par le premier objectif.")
-                # Fallback: trier tous les essais valides par le premier objectif
                 primary_direction = self.study_is.directions[0]
                 trials_to_consider_for_oos = sorted(
                     completed_valid_trials,
@@ -160,7 +158,7 @@ class OOSValidator:
             else:
                  logger.info(f"{self.log_prefix}[{fold_name}] Étude multi-objectifs. {len(trials_to_consider_for_oos)} essai(s) valide(s) sur le front de Pareto considéré(s).")
 
-        else: # Mono-objectif
+        else: 
             direction = self.study_is.directions[0]
             trials_to_consider_for_oos = sorted(
                 completed_valid_trials,
@@ -172,12 +170,12 @@ class OOSValidator:
         top_n_for_oos_validation = self.wfo_settings.top_n_trials_for_oos_validation
         selected_is_trials_info: List[Dict[str, Any]] = []
         for trial_obj in trials_to_consider_for_oos[:top_n_for_oos_validation]:
-            if not trial_obj.params: # Vérifier si les params sont vides
+            if not trial_obj.params: 
                 logger.warning(f"{self.log_prefix}[{fold_name}] Essai IS numéro {trial_obj.number} a des paramètres vides. Ignoré pour OOS.")
                 continue
             selected_is_trials_info.append({
                 "trial_number": trial_obj.number,
-                "params": trial_obj.params, # Ce sont les paramètres IS à utiliser pour OOS
+                "params": trial_obj.params, 
                 "is_values": trial_obj.values
             })
         
@@ -188,46 +186,38 @@ class OOSValidator:
                                       is_trial_info: Dict[str, Any],
                                       objective_evaluator_oos_instance: 'ObjectiveFunctionEvaluator'
                                      ) -> Optional[Dict[str, Any]]:
+        """
+        Exécute une simulation OOS pour un trial IS spécifique.
+        """
         is_trial_number = is_trial_info["trial_number"]
-        is_trial_params = is_trial_info.get("params") # Utiliser .get() pour éviter KeyError
+        is_trial_params = is_trial_info["params"] # Doit être non-vide, vérifié par _get_best_is_trials_for_oos
         fold_name = self.study_is.study_name.split('_')[-2] if self.study_is.study_name and '_fold_' in self.study_is.study_name else "unknown_fold"
         oos_log_prefix = f"{self.log_prefix}[{fold_name}][OOS_for_IS_Trial:{is_trial_number}]"
-
-        if not is_trial_params: # Vérification ajoutée
-            logger.error(f"{oos_log_prefix} Paramètres IS (is_trial_params) vides ou non fournis pour le trial {is_trial_number}. "
-                         "Simulation OOS impossible pour cet essai.")
-            return {"error": "Paramètres IS vides ou manquants.", "oos_metrics": None, "oos_detailed_log": None}
-
         logger.info(f"{oos_log_prefix} Démarrage simulation OOS avec params : {is_trial_params}")
 
-        # Création d'une étude Optuna temporaire en mémoire pour exécuter un seul essai OOS
-        # Cela permet de réutiliser la logique de ObjectiveFunctionEvaluator.__call__
         oos_temp_study_name = f"oos_eval_{self.study_is.study_name}_is_trial_{is_trial_number}"
         oos_study_temp = optuna.create_study(
-            study_name=oos_temp_study_name, storage=None, # storage=None pour une étude en mémoire
-            directions=self.study_is.directions, # Utiliser les mêmes directions que l'étude IS
-            sampler=optuna.samplers.RandomSampler(), # Sampler simple car on n'optimise pas
-            pruner=optuna.pruners.NopPruner() # Pas d'élagage pour une seule évaluation
+            study_name=oos_temp_study_name, 
+            storage=None, 
+            directions=self.study_is.directions,
+            sampler=optuna.samplers.RandomSampler(), 
+            pruner=optuna.pruners.NopPruner()
         )
 
         try:
-            # Mettre en file d'attente l'essai avec les paramètres IS
             oos_study_temp.enqueue_trial(
-                is_trial_params, # Les paramètres de l'essai IS
-                user_attrs={ # Attributs utilisateur pour tracer l'origine
+                is_trial_params,  
+                user_attrs={
                     "is_oos_validation_run": True,
                     "source_is_trial_number": is_trial_number,
                     "source_is_trial_values": is_trial_info.get("is_values")
                 }
             )
             
-            # Mettre à jour l'évaluateur avec le numéro de trial IS pour le logging OOS
             objective_evaluator_oos_instance.is_trial_number_for_oos_log = is_trial_number
             
-            # Exécuter un seul "trial" (qui est en fait l'évaluation OOS avec les params IS)
             oos_study_temp.optimize(objective_evaluator_oos_instance, n_trials=1, catch=(Exception,))
             
-            # Récupérer les résultats du dernier (et unique) essai exécuté
             last_trial_run = oos_study_temp.trials[-1]
             
             if last_trial_run.state != optuna.trial.TrialState.COMPLETE:
@@ -237,7 +227,6 @@ class OOSValidator:
                 logger.error(f"{oos_log_prefix} {error_msg}")
                 return {"error": error_msg, "oos_metrics": None, "oos_detailed_log": None}
 
-            # Accéder aux résultats stockés par ObjectiveFunctionEvaluator
             if objective_evaluator_oos_instance.last_backtest_results and \
                objective_evaluator_oos_instance.last_backtest_results.get("metrics"):
                 oos_metrics = objective_evaluator_oos_instance.last_backtest_results["metrics"]
@@ -249,7 +238,7 @@ class OOSValidator:
                 return {"error": "Aucune métrique de backtest trouvée après OOS.", "oos_metrics": None, "oos_detailed_log": None}
 
         except optuna.exceptions.TrialPruned as e_pruned:
-            logger.warning(f"{oos_log_prefix} Simulation OOS élaguée (inattendu pour un essai enqueued) : {e_pruned}")
+            logger.warning(f"{oos_log_prefix} Simulation OOS élaguée : {e_pruned}")
             return {"error": f"Élagué: {e_pruned}", "oos_metrics": None, "oos_detailed_log": None}
         except Exception as e_sim_oos:
             logger.error(f"{oos_log_prefix} Erreur durant la simulation OOS : {e_sim_oos}", exc_info=True)
@@ -267,13 +256,12 @@ class OOSValidator:
         self._save_optuna_study_summary(fold_output_dir)
         best_is_trials_list = self._get_best_is_trials_for_oos()
 
-        if not best_is_trials_list: # Aucun essai IS valide à tester en OOS
+        if not best_is_trials_list: 
             logger.warning(f"{fold_log_prefix} Aucun meilleur essai IS trouvé pour validation OOS (ou leurs params sont vides).")
-            # Tenter un fallback sur le "best_trial" global de l'étude IS s'il existe (même si c'est une étude multi-obj, on prend le premier de best_trials)
             best_is_trial_for_fallback: Optional[optuna.trial.FrozenTrial] = None
-            if self.study_is.best_trials: # Pour multi-objectif, c'est une liste
+            if self.study_is.best_trials: 
                 best_is_trial_for_fallback = self.study_is.best_trials[0]
-            elif self.study_is.best_trial: # Pour mono-objectif
+            elif hasattr(self.study_is, 'best_trial') and self.study_is.best_trial: 
                 best_is_trial_for_fallback = self.study_is.best_trial
             
             if best_is_trial_for_fallback and best_is_trial_for_fallback.state == optuna.trial.TrialState.COMPLETE and best_is_trial_for_fallback.params:
@@ -285,7 +273,7 @@ class OOSValidator:
 
         if df_oos_fold_data.empty:
             logger.warning(f"{fold_log_prefix} Données OOS vides pour le fold. Validation OOS sautée. Fallback sur meilleurs params IS.")
-            best_is_trial_fallback_oos_empty = best_is_trials_list[0] # Prendre le premier de la liste des meilleurs IS
+            best_is_trial_fallback_oos_empty = best_is_trials_list[0] 
             return best_is_trial_fallback_oos_empty["params"], {"is_metrics": best_is_trial_fallback_oos_empty.get("is_values"), "oos_status": "SKIPPED_EMPTY_OOS_DATA_FALLBACK_TO_BEST_IS"}
 
         if not self.strategy_config_obj_dict or \
@@ -296,7 +284,7 @@ class OOSValidator:
 
         objective_evaluator_for_oos_runs = self.objective_evaluator_class(
             strategy_name=self.strategy_name,
-            strategy_config_dict=cast(Dict[str,Any], self.strategy_config_obj_dict), # Assurer que c'est un dict
+            strategy_config_dict=cast(Dict[str,Any], self.strategy_config_obj_dict), 
             df_enriched_slice=df_oos_fold_data.copy(),
             optuna_objectives_config={
                 'objectives_names': self.app_config.global_config.optuna_settings.objectives_names,
@@ -309,7 +297,6 @@ class OOSValidator:
         
         oos_validation_results_list: List[Dict[str, Any]] = []
         for is_trial_to_validate in best_is_trials_list:
-            # is_trial_to_validate["params"] est déjà vérifié comme non-vide dans _get_best_is_trials_for_oos
             oos_run_res = self._run_oos_simulation_for_trial(
                 is_trial_info=is_trial_to_validate,
                 objective_evaluator_oos_instance=objective_evaluator_for_oos_runs
@@ -325,8 +312,6 @@ class OOSValidator:
             oos_validation_results_list.append(current_oos_summary)
 
         metric_to_sort_oos_by = self.wfo_settings.metric_to_optimize
-        # Déterminer la direction de tri basée sur la première direction de l'étude IS
-        # (ou une logique plus fine si les objectifs OOS sont différents des objectifs IS)
         sort_direction_is_maximize = self.study_is.directions[0] == optuna.study.StudyDirection.MAXIMIZE
 
         def get_oos_metric_for_sort(oos_res: Dict[str, Any]) -> Any:
@@ -336,7 +321,7 @@ class OOSValidator:
             return val
 
         sorted_oos_results = sorted(
-            [res for res in oos_validation_results_list if res.get("oos_metrics") is not None], # Seulement ceux avec des métriques OOS
+            [res for res in oos_validation_results_list if res.get("oos_metrics") is not None], 
             key=get_oos_metric_for_sort,
             reverse=sort_direction_is_maximize
         )
@@ -370,13 +355,13 @@ class OOSValidator:
             best_oos_run_for_fold = final_oos_results_to_save[0]
             final_selected_params = best_oos_run_for_fold.get("is_trial_params")
             final_representative_metrics = best_oos_run_for_fold.get("oos_metrics")
-            if final_representative_metrics: # Assurer que c'est un dictionnaire
+            if final_representative_metrics: 
                 final_representative_metrics["selection_basis"] = "BEST_OOS_PERFORMANCE"
                 final_representative_metrics["source_is_trial_number"] = best_oos_run_for_fold.get("is_trial_number")
             logger.info(f"{fold_log_prefix} Meilleurs params (basés sur OOS) : {final_selected_params}. Métriques OOS: {final_representative_metrics.get(metric_to_sort_oos_by) if final_representative_metrics else 'N/A'}")
         else:
             logger.warning(f"{fold_log_prefix} Validation OOS n'a produit aucun résultat rapportable. Fallback sur meilleurs params IS.")
-            if best_is_trials_list: # best_is_trials_list contient des dicts avec "params" et "is_values"
+            if best_is_trials_list: 
                 fallback_is_trial_info = best_is_trials_list[0]
                 final_selected_params = fallback_is_trial_info["params"]
                 final_representative_metrics = {
@@ -385,8 +370,7 @@ class OOSValidator:
                     "is_metrics_for_selected_trial": fallback_is_trial_info.get("is_values"), 
                     "source_is_trial_number": fallback_is_trial_info.get("trial_number")
                 }
-            else: # Ce cas ne devrait pas être atteint si _get_best_is_trials_for_oos a retourné une liste non vide
+            else: 
                 final_representative_metrics = {"status_oos": "FAILED_NO_IS_OR_OOS_RESULTS"}
 
         return final_selected_params, final_representative_metrics
-

@@ -9,10 +9,11 @@ import logging
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
-import pandas as pd
+import pandas as pd # Assurer l'import pour Pylance
 
 from src.strategies.base import BaseStrategy
-from src.data.data_utils import get_kline_prefix_effective # Import pour déterminer les colonnes sources
+from src.data.data_utils import get_kline_prefix_effective 
+from src.utils.exchange_utils import adjust_precision, get_filter_value
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ class PsarReversalOtocoStrategy(BaseStrategy):
     """
     Stratégie de renversement du Parabolic SAR.
     Génère des signaux d'achat lorsque le PSAR passe de dessus à dessous le prix,
-    et des signaux de vente lorsque le PSAR passe de dessous à dessus le prix.
+    et des signaux de vente (sortie de long) lorsque le PSAR passe de dessous à dessus le prix.
     Le SL et le TP sont basés sur l'ATR.
     """
 
@@ -55,7 +56,7 @@ class PsarReversalOtocoStrategy(BaseStrategy):
             raise ValueError(f"{self.log_prefix} 'psar_step' ({psar_step}) doit être un nombre positif.")
         if not (isinstance(psar_max_step, (int, float)) and psar_max_step > 0):
             raise ValueError(f"{self.log_prefix} 'psar_max_step' ({psar_max_step}) doit être un nombre positif.")
-        if psar_step >= psar_max_step:
+        if psar_step >= psar_max_step: # type: ignore
             raise ValueError(f"{self.log_prefix} 'psar_step' ({psar_step}) doit être inférieur à 'psar_max_step' ({psar_max_step}).")
 
         atr_p = self.get_param('atr_period_sl_tp')
@@ -105,8 +106,8 @@ class PsarReversalOtocoStrategy(BaseStrategy):
             {
                 'indicator_name': 'psar',
                 'params': {
-                    'af': self.params['psar_step'], 
-                    'max_af': self.params['psar_max_step'] 
+                    'af': float(self.params['psar_step']), 
+                    'max_af': float(self.params['psar_max_step']) 
                 },
                 'inputs': { 
                     'high': source_col_high_psar,
@@ -133,38 +134,32 @@ class PsarReversalOtocoStrategy(BaseStrategy):
         return configs
 
     def _calculate_indicators(self, data_feed: pd.DataFrame) -> pd.DataFrame:
-        """
-        Vérifie la présence des colonnes d'indicateurs _strat attendues (fournies par
-        IndicatorCalculator). Applique ffill pour propager les valeurs.
-        """
         df = data_feed.copy()
         expected_strat_cols = [self.psarl_col_strat, self.psars_col_strat, self.atr_col_strat]
         
-        # Vérifier les colonnes OHLCV de base
         base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
-        missing_ohlcv = [col for col in base_ohlcv if col not in df.columns]
-        if missing_ohlcv:
-            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}."
+        if missing_ohlcv := [col for col in base_ohlcv if col not in df.columns]: # Sourcery: Use named expression
+            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}. Essentielles."
             logger.critical(msg)
             raise ValueError(msg)
         
-        missing_strat_cols = []
-        for col_name in expected_strat_cols:
-            if col_name not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante dans data_feed. "
-                               "Elle sera ajoutée avec NaN, indiquant un problème en amont.")
+        if missing_strat_cols_initially := [ # Sourcery: Use named expression
+            col_name
+            for col_name in expected_strat_cols
+            if col_name not in df.columns
+        ]:
+            for col_name in missing_strat_cols_initially:
+                logger.warning(f"{self.log_prefix} Colonne indicateur attendue '{col_name}' manquante. Ajout avec NaN.")
                 df[col_name] = np.nan
-                missing_strat_cols.append(col_name)
-        
-        if missing_strat_cols:
-             logger.debug(f"{self.log_prefix} Après vérification _calculate_indicators, "
-                          f"colonnes manquantes ajoutées (NaN): {missing_strat_cols}. "
+            logger.debug(f"{self.log_prefix} Après vérification _calculate_indicators, colonnes manquantes ajoutées (NaN): {missing_strat_cols_initially}. "
                           f"Colonnes actuelles: {df.columns.tolist()}")
 
         cols_to_ffill_present = [col for col in expected_strat_cols if col in df.columns]
         if cols_to_ffill_present:
+            # Sourcery: Use named expression
+            if needs_ffill_check := df[cols_to_ffill_present].isnull().values.any():
+                logger.debug(f"{self.log_prefix} Application de ffill aux colonnes _strat: {cols_to_ffill_present}")
             df[cols_to_ffill_present] = df[cols_to_ffill_present].ffill()
-            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat présentes : {cols_to_ffill_present}")
         
         return df
 
@@ -203,7 +198,7 @@ class PsarReversalOtocoStrategy(BaseStrategy):
 
         entry_long_triggered = pd.notna(psars_prev) and pd.isna(psarl_prev) and \
                                pd.notna(psarl_curr) and pd.isna(psars_curr)
-        entry_short_triggered = pd.notna(psarl_prev) and pd.isna(psars_prev) and \
+        entry_short_or_exit_long_triggered = pd.notna(psarl_prev) and pd.isna(psars_prev) and \
                                 pd.notna(psars_curr) and pd.isna(psarl_curr)
 
         sl_atr_mult = float(self.get_param('sl_atr_mult'))
@@ -215,24 +210,16 @@ class PsarReversalOtocoStrategy(BaseStrategy):
                 if atr_curr > 0: # type: ignore
                     sl_price = close_curr - (sl_atr_mult * atr_curr) # type: ignore
                     tp_price = close_curr + (tp_atr_mult * atr_curr) # type: ignore
-                logger.info(f"{self.log_prefix} Signal BUY (PSAR Long) @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
-            elif entry_short_triggered:
-                signal_type = -1 
-                if atr_curr > 0: # type: ignore
-                    sl_price = close_curr + (sl_atr_mult * atr_curr) # type: ignore
-                    tp_price = close_curr - (tp_atr_mult * atr_curr) # type: ignore
-                logger.info(f"{self.log_prefix} Signal SELL (PSAR Short) @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
-        else: 
-            if current_position_direction == 1 and entry_short_triggered: 
-                signal_type = 2 
-                logger.info(f"{self.log_prefix} Signal EXIT LONG (PSAR Short triggered) @ {close_curr:.4f}")
-            elif current_position_direction == -1 and entry_long_triggered: 
-                signal_type = 2 
-                logger.info(f"{self.log_prefix} Signal EXIT SHORT (PSAR Long triggered) @ {close_curr:.4f}")
+                # Sourcery: Replace if-expression with `or`
+                logger.info(f"{self.log_prefix} Signal BUY (PSAR Long) @ {close_curr:.4f}. SL={sl_price}, TP={tp_price or 'N/A'}")
+            # Pas d'entrée SHORT pour cette stratégie sans 'allow_shorting'
+        elif current_position_direction == 1 and entry_short_or_exit_long_triggered: 
+            signal_type = 2 
+            logger.info(f"{self.log_prefix} Signal EXIT LONG (PSAR a renversé vers le bas) @ {close_curr:.4f}")
         
         order_type_preference = str(self.get_param("order_type_preference", "MARKET"))
         if signal_type != 0 and order_type_preference == "LIMIT":
-            limit_price = float(close_curr) 
+            limit_price = float(close_curr) # type: ignore
 
         position_size_pct = float(self.get_param('capital_allocation_pct', 1.0))
 
@@ -240,9 +227,9 @@ class PsarReversalOtocoStrategy(BaseStrategy):
 
     def generate_order_request(self,
                                data: pd.DataFrame,
-                               current_position: int,
-                               available_capital: float,
-                               symbol_info: Dict[str, Any]
+                               current_position: int, 
+                               available_capital: float, 
+                               symbol_info: Dict[str, Any] 
                                ) -> Optional[Tuple[Dict[str, Any], Dict[str, float]]]:
         if current_position != 0:
             logger.debug(f"{self.log_prefix} [Live] Position déjà ouverte (état: {current_position}). Pas de nouvelle requête d'ordre d'entrée.")
@@ -254,36 +241,37 @@ class PsarReversalOtocoStrategy(BaseStrategy):
             return None
 
         signal, order_type, limit_price_sugg, sl_price_raw, tp_price_raw, pos_size_pct = \
-            self._generate_signals(data_with_indicators, False, 0, 0.0)
+            self._generate_signals(data_with_indicators, False, 0, 0.0) 
 
-        if signal not in [1, -1]:
-            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée (1 ou -1) généré. Signal: {signal}")
+        if signal != 1: 
+            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée LONG (1) généré. Signal actuel: {signal}")
             return None
 
         latest_bar = data_with_indicators.iloc[-1]
-        entry_price_theoretical: float
-        if order_type == "LIMIT" and limit_price_sugg is not None:
-            entry_price_theoretical = limit_price_sugg
-        else:
-            entry_price_theoretical = float(latest_bar.get('close', 0.0))
-            if entry_price_theoretical <= 0: entry_price_theoretical = float(latest_bar.get('open', 0.0))
+        entry_price_theoretical: float = limit_price_sugg if order_type == "LIMIT" and limit_price_sugg is not None else float(latest_bar.get('close', 0.0))
+        
+        if entry_price_theoretical <= 0: 
+            entry_price_theoretical = float(latest_bar.get('open', 0.0))
         
         if pd.isna(entry_price_theoretical) or entry_price_theoretical <= 0:
-            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique invalide ({entry_price_theoretical}).")
+            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique pour calcul de quantité invalide ({entry_price_theoretical}).")
             return None
 
         if self.quantity_precision is None or self.pair_config is None:
-            logger.error(f"{self.log_prefix} [Live] Contexte de backtest (précisions, pair_config) non défini.")
+            logger.error(f"{self.log_prefix} [Live] Contexte (précisions, pair_config) non défini via set_backtest_context.")
             return None
             
         quantity_base = self._calculate_quantity(
-            entry_price=entry_price_theoretical, available_capital=available_capital,
-            qty_precision=self.quantity_precision, symbol_info=self.pair_config,
-            symbol=self.symbol, position_size_pct=pos_size_pct
+            entry_price=entry_price_theoretical,
+            available_capital=available_capital,
+            qty_precision=self.quantity_precision,
+            symbol_info=self.pair_config,
+            symbol=self.symbol,
+            position_size_pct=pos_size_pct
         )
 
         if quantity_base is None or quantity_base <= 1e-9:
-            logger.warning(f"{self.log_prefix} [Live] Quantité calculée nulle ou invalide ({quantity_base}).")
+            logger.warning(f"{self.log_prefix} [Live] Quantité calculée nulle ou invalide ({quantity_base}). Pas d'ordre.")
             return None
 
         if self.price_precision is None:
@@ -292,14 +280,16 @@ class PsarReversalOtocoStrategy(BaseStrategy):
 
         entry_price_for_order_str: Optional[str] = None
         if order_type == "LIMIT" and limit_price_sugg is not None:
-            from src.utils.exchange_utils import adjust_precision, get_filter_value 
-            adjusted_limit_price = adjust_precision(limit_price_sugg, self.price_precision, tick_size=get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize'))
-            if adjusted_limit_price is None: return None
+            tick_size_price = get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize')
+            if (adjusted_limit_price := adjust_precision( # Sourcery: Use named expression
+                limit_price_sugg, self.price_precision, tick_size=tick_size_price
+            )) is None: 
+                return None
             entry_price_for_order_str = f"{adjusted_limit_price:.{self.price_precision}f}"
         
         quantity_str_formatted = f"{quantity_base:.{self.quantity_precision}f}"
         entry_order_params = self._build_entry_params_formatted(
-            side="BUY" if signal == 1 else "SELL",
+            side="BUY", 
             quantity_str=quantity_str_formatted,
             order_type=str(order_type),
             entry_price_str=entry_price_for_order_str

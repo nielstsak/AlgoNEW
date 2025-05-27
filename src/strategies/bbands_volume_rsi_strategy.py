@@ -8,10 +8,12 @@ import logging
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
-import pandas as pd
+import pandas as pd # Assurer l'import pour Pylance
 
 from src.strategies.base import BaseStrategy
-from src.data.data_utils import get_kline_prefix_effective # Pour déterminer la colonne source du volume
+from src.data.data_utils import get_kline_prefix_effective 
+from src.utils.exchange_utils import adjust_precision, get_filter_value
+
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,8 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         'sl_atr_mult', 'tp_atr_mult',
         'capital_allocation_pct',
         'order_type_preference',
-        'margin_leverage' # Ajouté pour cohérence
+        'margin_leverage', 
+        'allow_shorting' 
     ]
 
     def __init__(self, strategy_name: str, symbol: str, params: Dict[str, Any]):
@@ -45,48 +48,53 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         self.atr_col_strat: str = "ATR_strat"
 
         vol_freq_param = self.get_param('indicateur_frequence_volume')
-        kline_prefix_vol_src = get_kline_prefix_effective(str(vol_freq_param))
-        self.volume_kline_col_source: str = f"{kline_prefix_vol_src}_volume" if kline_prefix_vol_src else "volume"
+        if not isinstance(vol_freq_param, str): 
+            logger.error(f"{self.log_prefix} 'indicateur_frequence_volume' doit être une chaîne. Reçu: {vol_freq_param}")
+            self.volume_kline_col_source: str = "volume" 
+        else:
+            kline_prefix_vol_src = get_kline_prefix_effective(vol_freq_param)
+            self.volume_kline_col_source: str = f"{kline_prefix_vol_src}_volume" if kline_prefix_vol_src else "volume"
         
         logger.info(f"{self.log_prefix} Colonne source de volume pour la MA de volume (stratégie) : '{self.volume_kline_col_source}'")
 
 
     def _validate_params(self) -> None:
+        """Valide les paramètres spécifiques à BbandsVolumeRsiStrategy."""
         missing_params = [p for p in self.REQUIRED_PARAMS if self.get_param(p) is None]
         if missing_params:
             raise ValueError(f"{self.log_prefix} Paramètres requis manquants : {', '.join(missing_params)}")
 
         if not (isinstance(self.get_param('bbands_period'), int) and self.get_param('bbands_period') > 0):
-            raise ValueError(f"{self.log_prefix} 'bbands_period' doit être un entier positif.")
+            raise ValueError(f"{self.log_prefix} 'bbands_period' ({self.get_param('bbands_period')}) doit être un entier positif.")
         if not (isinstance(self.get_param('bbands_std_dev'), (int,float)) and self.get_param('bbands_std_dev') > 0):
-            raise ValueError(f"{self.log_prefix} 'bbands_std_dev' doit être un nombre positif.")
+            raise ValueError(f"{self.log_prefix} 'bbands_std_dev' ({self.get_param('bbands_std_dev')}) doit être un nombre positif.")
         if not (isinstance(self.get_param('volume_ma_period'), int) and self.get_param('volume_ma_period') > 0):
-            raise ValueError(f"{self.log_prefix} 'volume_ma_period' doit être un entier positif.")
+            raise ValueError(f"{self.log_prefix} 'volume_ma_period' ({self.get_param('volume_ma_period')}) doit être un entier positif.")
         if not (isinstance(self.get_param('rsi_period'), int) and self.get_param('rsi_period') > 0):
-            raise ValueError(f"{self.log_prefix} 'rsi_period' doit être un entier positif.")
+            raise ValueError(f"{self.log_prefix} 'rsi_period' ({self.get_param('rsi_period')}) doit être un entier positif.")
         
         rsi_buy_thresh = self.get_param('rsi_buy_breakout_threshold')
         rsi_sell_thresh = self.get_param('rsi_sell_breakout_threshold')
         if not (isinstance(rsi_buy_thresh, (int,float)) and 50 < rsi_buy_thresh < 100):
-            raise ValueError(f"{self.log_prefix} 'rsi_buy_breakout_threshold' ({rsi_buy_thresh}) doit être entre 50 et 100.")
+            raise ValueError(f"{self.log_prefix} 'rsi_buy_breakout_threshold' ({rsi_buy_thresh}) doit être entre 50 (exclusif) et 100 (exclusif).")
         if not (isinstance(rsi_sell_thresh, (int,float)) and 0 < rsi_sell_thresh < 50):
-            raise ValueError(f"{self.log_prefix} 'rsi_sell_breakout_threshold' ({rsi_sell_thresh}) doit être entre 0 et 50.")
-        if rsi_sell_thresh >= rsi_buy_thresh:
-            raise ValueError(f"{self.log_prefix} 'rsi_sell_breakout_threshold' ({rsi_sell_thresh}) doit être inférieur à 'rsi_buy_breakout_threshold' ({rsi_buy_thresh}).")
+            raise ValueError(f"{self.log_prefix} 'rsi_sell_breakout_threshold' ({rsi_sell_thresh}) doit être entre 0 (exclusif) et 50 (exclusif).")
+        if rsi_sell_thresh >= rsi_buy_thresh: # type: ignore
+            raise ValueError(f"{self.log_prefix} 'rsi_sell_breakout_threshold' ({rsi_sell_thresh}) doit être strictement inférieur à 'rsi_buy_breakout_threshold' ({rsi_buy_thresh}).")
 
         atr_p = self.get_param('atr_period_sl_tp')
         if not (isinstance(atr_p, int) and atr_p > 0):
-            raise ValueError(f"{self.log_prefix} 'atr_period_sl_tp' doit être un entier positif.")
+            raise ValueError(f"{self.log_prefix} 'atr_period_sl_tp' ({atr_p}) doit être un entier positif.")
         sl_mult = self.get_param('sl_atr_mult')
         tp_mult = self.get_param('tp_atr_mult')
         if not (isinstance(sl_mult, (int, float)) and sl_mult > 0):
-            raise ValueError(f"{self.log_prefix} 'sl_atr_mult' doit être un nombre positif.")
+            raise ValueError(f"{self.log_prefix} 'sl_atr_mult' ({sl_mult}) doit être un nombre positif.")
         if not (isinstance(tp_mult, (int, float)) and tp_mult > 0):
-            raise ValueError(f"{self.log_prefix} 'tp_atr_mult' doit être un nombre positif.")
+            raise ValueError(f"{self.log_prefix} 'tp_atr_mult' ({tp_mult}) doit être un nombre positif.")
 
         cap_alloc = self.get_param('capital_allocation_pct')
         if not (isinstance(cap_alloc, (int, float)) and 0 < cap_alloc <= 1.0):
-            raise ValueError(f"{self.log_prefix} 'capital_allocation_pct' doit être entre 0 (exclusif) et 1 (inclusif).")
+            raise ValueError(f"{self.log_prefix} 'capital_allocation_pct' ({cap_alloc}) doit être entre 0 (exclusif) et 1 (inclusif).")
         
         margin_lev = self.get_param('margin_leverage')
         if not (isinstance(margin_lev, (int, float)) and margin_lev >= 1.0):
@@ -94,12 +102,15 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
 
         order_type_pref_val = self.get_param('order_type_preference')
         if order_type_pref_val not in ["MARKET", "LIMIT"]:
-            raise ValueError(f"{self.log_prefix} 'order_type_preference' doit être 'MARKET' ou 'LIMIT'.")
+            raise ValueError(f"{self.log_prefix} 'order_type_preference' ({order_type_pref_val}) doit être 'MARKET' ou 'LIMIT'.")
+
+        if not isinstance(self.get_param('allow_shorting'), bool):
+            raise ValueError(f"{self.log_prefix} 'allow_shorting' ({self.get_param('allow_shorting')}) doit être un booléen (true/false).")
 
         for freq_param_name in ['indicateur_frequence_bbands', 'indicateur_frequence_volume', 'indicateur_frequence_rsi', 'atr_base_frequency_sl_tp']:
             freq_val = self.get_param(freq_param_name)
             if not isinstance(freq_val, str) or not freq_val.strip():
-                raise ValueError(f"{self.log_prefix} Paramètre de fréquence '{freq_param_name}' doit être une chaîne non vide.")
+                raise ValueError(f"{self.log_prefix} Paramètre de fréquence '{freq_param_name}' ({freq_val}) doit être une chaîne de caractères non vide.")
         logger.debug(f"{self.log_prefix} Validation des paramètres terminée avec succès.")
 
     def get_required_indicator_configs(self) -> List[Dict[str, Any]]:
@@ -158,53 +169,41 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         return configs
 
     def _calculate_indicators(self, data_feed: pd.DataFrame) -> pd.DataFrame:
-        """
-        Vérifie la présence des colonnes d'indicateurs _strat attendues (fournies par
-        IndicatorCalculator) et de la colonne source pour la MA de volume.
-        Applique ffill pour propager les valeurs.
-        """
         df = data_feed.copy()
         expected_strat_cols = [
             self.bb_upper_col_strat, self.bb_middle_col_strat, self.bb_lower_col_strat,
             self.bb_bandwidth_col_strat, self.volume_ma_col_strat,
             self.rsi_col_strat, self.atr_col_strat
         ]
-        # La colonne source pour la MA de volume doit aussi être présente dans data_feed
-        # car IndicatorCalculator l'utilise pour calculer self.volume_ma_col_strat,
-        # mais la stratégie elle-même utilise self.volume_kline_col_source pour la comparaison directe.
         all_expected_cols_in_data_feed = expected_strat_cols + [self.volume_kline_col_source]
         
-        # Vérifier les colonnes OHLCV de base
         base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
-        missing_ohlcv = [col for col in base_ohlcv if col not in df.columns]
-        if missing_ohlcv:
-            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}."
+        # Sourcery: Use named expression (walrus operator)
+        if missing_ohlcv := [col for col in base_ohlcv if col not in df.columns]:
+            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}. Ces colonnes sont essentielles."
             logger.critical(msg)
             raise ValueError(msg)
 
-        # Vérifier les colonnes d'indicateurs _strat et la source de volume
-        missing_cols = []
+        missing_cols_in_feed = []
         for col_name in all_expected_cols_in_data_feed:
             if col_name not in df.columns:
                 logger.warning(f"{self.log_prefix} Colonne attendue '{col_name}' manquante dans data_feed. "
                                "Elle sera ajoutée avec NaN, indiquant un problème en amont.")
                 df[col_name] = np.nan
-                missing_cols.append(col_name)
+                missing_cols_in_feed.append(col_name)
         
-        if missing_cols:
-             logger.debug(f"{self.log_prefix} Après vérification _calculate_indicators, "
-                          f"colonnes manquantes ajoutées (NaN): {missing_cols}. "
-                          f"Colonnes actuelles: {df.columns.tolist()}")
+        if missing_cols_in_feed:
+             logger.debug(f"{self.log_prefix} Après vérification des colonnes dans _calculate_indicators, "
+                          f"colonnes manquantes ajoutées (avec NaN): {missing_cols_in_feed}. "
+                          f"Colonnes actuelles dans le DataFrame de travail: {df.columns.tolist()}")
 
-        # Appliquer ffill seulement aux colonnes _strat qui sont censées être des indicateurs
-        cols_to_ffill_present = [col for col in expected_strat_cols if col in df.columns]
-        if cols_to_ffill_present:
-            df[cols_to_ffill_present] = df[cols_to_ffill_present].ffill()
-            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat présentes : {cols_to_ffill_present}")
+        cols_to_ffill_present_in_df = [col for col in expected_strat_cols if col in df.columns]
+        if cols_to_ffill_present_in_df:
+            # Sourcery: Use named expression (walrus operator)
+            if needs_ffill_check := df[cols_to_ffill_present_in_df].isnull().values.any():
+                logger.debug(f"{self.log_prefix} Application de ffill aux colonnes _strat: {cols_to_ffill_present_in_df}")
+            df[cols_to_ffill_present_in_df] = df[cols_to_ffill_present_in_df].ffill()
         
-        # La colonne self.volume_kline_col_source ne doit pas être ffillée ici si elle représente un volume brut.
-        # Elle est déjà supposée être correcte en sortie de IndicatorCalculator (ou df_source_enriched).
-
         return df
 
     def _generate_signals(self,
@@ -213,10 +212,7 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
                           current_position_direction: int,
                           current_entry_price: float
                          ) -> Tuple[int, Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
-        """
-        Génère les signaux de trading pour la stratégie BbandsVolumeRsiStrategy.
-        """
-        signal_type: int = 0
+        signal_type: int = 0 
         limit_price: Optional[float] = None
         sl_price: Optional[float] = None
         tp_price: Optional[float] = None
@@ -231,8 +227,8 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         close_curr = latest_row.get('close')
         bb_upper_curr = latest_row.get(self.bb_upper_col_strat)
         bb_lower_curr = latest_row.get(self.bb_lower_col_strat)
-        volume_kline_curr = latest_row.get(self.volume_kline_col_source) # Volume brut de la kline source
-        volume_ma_curr = latest_row.get(self.volume_ma_col_strat) # MA du volume
+        volume_kline_curr = latest_row.get(self.volume_kline_col_source) 
+        volume_ma_curr = latest_row.get(self.volume_ma_col_strat) 
         rsi_curr = latest_row.get(self.rsi_col_strat)
         atr_curr = latest_row.get(self.atr_col_strat)
         
@@ -253,39 +249,48 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
         tp_atr_mult = float(self.get_param('tp_atr_mult'))
         rsi_buy_thresh = float(self.get_param('rsi_buy_breakout_threshold'))
         rsi_sell_thresh = float(self.get_param('rsi_sell_breakout_threshold'))
-        allow_shorting = self.get_param('allow_shorting', False) 
+        allow_shorting = bool(self.get_param('allow_shorting', False)) 
 
-        long_bb_breakout = close_curr > bb_upper_curr and close_prev <= bb_upper_prev # type: ignore
-        long_volume_confirm = volume_kline_curr > volume_ma_curr # type: ignore
-        long_rsi_confirm = rsi_curr > rsi_buy_thresh # type: ignore
+        long_bb_breakout = (close_curr > bb_upper_curr) and (close_prev <= bb_upper_prev) # type: ignore
+        long_volume_confirm = (volume_kline_curr > volume_ma_curr) # type: ignore
+        long_rsi_confirm = (rsi_curr > rsi_buy_thresh) # type: ignore
         entry_long_triggered = long_bb_breakout and long_volume_confirm and long_rsi_confirm
 
         entry_short_triggered = False
         if allow_shorting:
-            short_bb_breakout = close_curr < bb_lower_curr and close_prev >= bb_lower_prev # type: ignore
-            short_volume_confirm = volume_kline_curr > volume_ma_curr # type: ignore 
-            short_rsi_confirm = rsi_curr < rsi_sell_thresh # type: ignore
+            short_bb_breakout = (close_curr < bb_lower_curr) and (close_prev >= bb_lower_prev) # type: ignore
+            short_volume_confirm = (volume_kline_curr > volume_ma_curr) # type: ignore 
+            short_rsi_confirm = (rsi_curr < rsi_sell_thresh) # type: ignore
             entry_short_triggered = short_bb_breakout and short_volume_confirm and short_rsi_confirm
         
-        if not current_position_open:
-            if entry_long_triggered:
-                signal_type = 1
-                if atr_curr > 0: # type: ignore
-                    sl_price = close_curr - (sl_atr_mult * atr_curr) # type: ignore
-                    tp_price = close_curr + (tp_atr_mult * atr_curr) # type: ignore
-                logger.info(f"{self.log_prefix} Signal BUY @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
-            elif entry_short_triggered: 
-                signal_type = -1
-                if atr_curr > 0: # type: ignore
-                    sl_price = close_curr + (sl_atr_mult * atr_curr) # type: ignore
-                    tp_price = close_curr - (tp_atr_mult * atr_curr) # type: ignore
-                logger.info(f"{self.log_prefix} Signal SELL @ {close_curr:.4f}. SL={sl_price}, TP={tp_price}")
-        else: 
-            pass 
-
+        # Sourcery: Swap if/else branches, Merge else clause's nested if statement into elif
+        if current_position_open:
+            if current_position_direction == 1 and entry_short_triggered:
+                signal_type = 2
+                logger.info(f"{self.log_prefix} Signal EXIT LONG (signal SHORT opposé) @ {close_curr:.4f}")
+            elif current_position_direction == -1 and entry_long_triggered:
+                signal_type = 2
+                logger.info(f"{self.log_prefix} Signal EXIT SHORT (signal LONG opposé) @ {close_curr:.4f}")
+            else:
+                logger.debug(
+                    f"{self.log_prefix} Position ouverte ({'LONG' if current_position_direction == 1 else 'SHORT'}). Aucun signal de sortie actif. Attente SL/TP."
+                )
+        elif entry_long_triggered:
+            signal_type = 1
+            if atr_curr > 0: # type: ignore
+                sl_price = close_curr - (sl_atr_mult * atr_curr) # type: ignore
+                tp_price = close_curr + (tp_atr_mult * atr_curr) # type: ignore
+            logger.info(f"{self.log_prefix} Signal BUY @ {close_curr:.4f}. SL={sl_price}, TP={tp_price or 'N/A'}") # Sourcery: or-if-exp-identity
+        elif entry_short_triggered: 
+            signal_type = -1
+            if atr_curr > 0: # type: ignore
+                sl_price = close_curr + (sl_atr_mult * atr_curr) # type: ignore
+                tp_price = close_curr - (tp_atr_mult * atr_curr) # type: ignore
+            logger.info(f"{self.log_prefix} Signal SELL @ {close_curr:.4f}. SL={sl_price}, TP={tp_price or 'N/A'}") # Sourcery: or-if-exp-identity
+        
         order_type_preference = str(self.get_param("order_type_preference", "MARKET"))
         if signal_type != 0 and order_type_preference == "LIMIT":
-            limit_price = float(close_curr)
+            limit_price = float(close_curr) # type: ignore
 
         position_size_pct = float(self.get_param('capital_allocation_pct', 1.0))
 
@@ -293,50 +298,57 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
 
     def generate_order_request(self,
                                data: pd.DataFrame,
-                               current_position: int,
-                               available_capital: float,
-                               symbol_info: Dict[str, Any]
+                               current_position: int, 
+                               available_capital: float, 
+                               symbol_info: Dict[str, Any] 
                                ) -> Optional[Tuple[Dict[str, Any], Dict[str, float]]]:
         if current_position != 0:
             logger.debug(f"{self.log_prefix} [Live] Position déjà ouverte (état: {current_position}). Pas de nouvelle requête d'ordre d'entrée.")
             return None
 
-        data_with_indicators = self._calculate_indicators(data.copy())
+        data_with_indicators = self._calculate_indicators(data.copy()) 
+        
         if data_with_indicators.empty or len(data_with_indicators) < 2:
             logger.warning(f"{self.log_prefix} [Live] Données insuffisantes après _calculate_indicators pour generate_order_request.")
             return None
 
         signal, order_type, limit_price_sugg, sl_price_raw, tp_price_raw, pos_size_pct = \
-            self._generate_signals(data_with_indicators, False, 0, 0.0)
+            self._generate_signals(data_with_indicators, False, 0, 0.0) 
 
         if signal not in [1, -1]:
-            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée (1 ou -1) généré. Signal: {signal}")
+            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée (1 ou -1) généré. Signal actuel: {signal}")
+            return None
+
+        if signal == -1 and not bool(self.get_param('allow_shorting', False)):
+            logger.debug(f"{self.log_prefix} [Live] Signal Short (-1) généré, mais 'allow_shorting' est False. Pas d'ordre.")
             return None
 
         latest_bar = data_with_indicators.iloc[-1]
-        entry_price_theoretical: float
-        if order_type == "LIMIT" and limit_price_sugg is not None:
-            entry_price_theoretical = limit_price_sugg
-        else: 
-            entry_price_theoretical = float(latest_bar.get('close', 0.0))
-            if entry_price_theoretical <= 0: entry_price_theoretical = float(latest_bar.get('open', 0.0))
+        # Sourcery: Replace if-expression with `or`
+        entry_price_theoretical: float = limit_price_sugg if order_type == "LIMIT" and limit_price_sugg is not None else float(latest_bar.get('close', 0.0))
+        
+        if entry_price_theoretical <= 0: 
+            entry_price_theoretical = float(latest_bar.get('open', 0.0))
         
         if pd.isna(entry_price_theoretical) or entry_price_theoretical <= 0:
-            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique invalide ({entry_price_theoretical}).")
+            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique pour calcul de quantité invalide ({entry_price_theoretical}).")
             return None
 
         if self.quantity_precision is None or self.pair_config is None:
-            logger.error(f"{self.log_prefix} [Live] Contexte de backtest (précisions, pair_config) non défini.")
+            logger.error(f"{self.log_prefix} [Live] Contexte (précisions, pair_config) non défini via set_backtest_context.")
             return None
             
         quantity_base = self._calculate_quantity(
-            entry_price=entry_price_theoretical, available_capital=available_capital,
-            qty_precision=self.quantity_precision, symbol_info=self.pair_config,
-            symbol=self.symbol, position_size_pct=pos_size_pct
+            entry_price=entry_price_theoretical,
+            available_capital=available_capital,
+            qty_precision=self.quantity_precision,
+            symbol_info=self.pair_config,
+            symbol=self.symbol,
+            position_size_pct=pos_size_pct
         )
 
         if quantity_base is None or quantity_base <= 1e-9:
-            logger.warning(f"{self.log_prefix} [Live] Quantité calculée nulle ou invalide ({quantity_base}).")
+            logger.warning(f"{self.log_prefix} [Live] Quantité calculée nulle ou invalide ({quantity_base}). Pas d'ordre.")
             return None
 
         if self.price_precision is None:
@@ -345,9 +357,12 @@ class BbandsVolumeRsiStrategy(BaseStrategy):
 
         entry_price_for_order_str: Optional[str] = None
         if order_type == "LIMIT" and limit_price_sugg is not None:
-            from src.utils.exchange_utils import adjust_precision, get_filter_value 
-            adjusted_limit_price = adjust_precision(limit_price_sugg, self.price_precision, tick_size=get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize'))
-            if adjusted_limit_price is None: return None
+            tick_size_price = get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize')
+            # Sourcery: Use named expression (walrus operator)
+            if (adjusted_limit_price := adjust_precision(
+                limit_price_sugg, self.price_precision, tick_size=tick_size_price
+            )) is None:
+                return None
             entry_price_for_order_str = f"{adjusted_limit_price:.{self.price_precision}f}"
         
         quantity_str_formatted = f"{quantity_base:.{self.quantity_precision}f}"

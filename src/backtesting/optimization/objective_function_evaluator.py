@@ -13,11 +13,11 @@ import uuid # Pour les logs OOS détaillés si besoin
 from typing import Any, Dict, Optional, Tuple, List, Type, Union, TYPE_CHECKING, cast
 from datetime import timezone # Pour s'assurer que les timestamps sont UTC
 import os 
-from pathlib import Path # Ajouté pour une manipulation de chemin plus robuste
+from pathlib import Path 
 
 import numpy as np
-import pandas as pd
-import optuna
+import pandas as pd # Assurer l'import pour Pylance
+import optuna # Assurer l'import pour Pylance
 
 if TYPE_CHECKING:
     from src.config.loader import AppConfig
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 # Imports depuis l'application
 try:
-    from src.config.definitions import ParamDetail, SimulationDefaults
+    from src.config.definitions import ParamDetail, SimulationDefaults 
     from src.backtesting.core_simulator import BacktestRunner
     from src.backtesting.performance_analyzer import calculate_performance_metrics_from_inputs
     from src.strategies.base import BaseStrategy
@@ -89,6 +89,7 @@ class ObjectiveFunctionEvaluator:
             for param_key, param_value_dict in raw_params_space.items():
                 if isinstance(param_value_dict, dict):
                     try:
+                        from src.config.definitions import ParamDetail 
                         self.params_space_details[param_key] = ParamDetail(**param_value_dict)
                     except Exception as e_pd_create:
                         logger.error(f"{self.log_prefix} Erreur lors de la création de ParamDetail pour '{param_key}' avec données {param_value_dict}: {e_pd_create}")
@@ -106,7 +107,7 @@ class ObjectiveFunctionEvaluator:
             raise ValueError(msg)
         if self.df_enriched_slice.index.tz is None:
             self.df_enriched_slice.index = self.df_enriched_slice.index.tz_localize('UTC') # type: ignore
-        elif self.df_enriched_slice.index.tz.utcoffset(None) != timezone.utc.utcoffset(None):
+        elif str(self.df_enriched_slice.index.tz).upper() != 'UTC':
             self.df_enriched_slice.index = self.df_enriched_slice.index.tz_convert('UTC') # type: ignore
 
         if not self.df_enriched_slice.index.is_monotonic_increasing:
@@ -133,24 +134,25 @@ class ObjectiveFunctionEvaluator:
                 if p_detail.type == 'int':
                     low = int(p_detail.low) if p_detail.low is not None else 0
                     high = int(p_detail.high) if p_detail.high is not None else low + 1
+                    if low > high: high = low 
                     step = int(p_detail.step or 1)
                     params_for_trial[param_name] = trial.suggest_int(param_name, low, high, step=step)
                 elif p_detail.type == 'float':
                     low_f = float(p_detail.low) if p_detail.low is not None else 0.0
                     high_f = float(p_detail.high) if p_detail.high is not None else low_f + 1.0
+                    if low_f > high_f: high_f = low_f 
                     step_f = float(p_detail.step) if p_detail.step is not None else None
                     params_for_trial[param_name] = trial.suggest_float(param_name, low_f, high_f, step=step_f, log=p_detail.log_scale)
                 elif p_detail.type == 'categorical' and p_detail.choices:
                     params_for_trial[param_name] = trial.suggest_categorical(param_name, p_detail.choices)
-                else: # Fallback si le type n'est pas géré ou si la config est invalide
+                else: 
                     params_for_trial[param_name] = p_detail.default if p_detail.default is not None else (p_detail.low if p_detail.low is not None else None)
-                    if params_for_trial[param_name] is None and p_detail.choices: # Fallback pour catégoriel mal configuré
+                    if params_for_trial[param_name] is None and p_detail.choices: 
                         params_for_trial[param_name] = p_detail.choices[0]
                     logger.warning(f"{log_prefix_suggest} Type de paramètre '{p_detail.type}' non géré pour '{param_name}' ou configuration ParamDetail invalide. Utilisation de fallback: {params_for_trial[param_name]}")
 
             except Exception as e_sug:
                 logger.error(f"{log_prefix_suggest} Erreur suggestion paramètre '{param_name}': {e_sug}", exc_info=True)
-                # Fallback en cas d'erreur de suggestion
                 if p_detail.default is not None: params_for_trial[param_name] = p_detail.default
                 elif p_detail.type == 'categorical' and p_detail.choices: params_for_trial[param_name] = p_detail.choices[0]
                 else: raise optuna.exceptions.TrialPruned(f"Échec suggestion pour {param_name}")
@@ -159,8 +161,8 @@ class ObjectiveFunctionEvaluator:
         return params_for_trial
 
     def _prepare_data_with_dynamic_indicators(self,
-                                              strategy_instance_for_trial: 'BaseStrategy',
-                                              trial_number_for_log: Optional[Union[int, str]] = None
+                                              strategy_instance_for_trial: 'BaseStrategy', # Renommé pour clarté
+                                              trial_number_for_log: Optional[Union[int, str]] = None 
                                              ) -> pd.DataFrame:
         current_eval_id = trial_number_for_log if trial_number_for_log is not None else "N/A"
         log_prefix_prep = f"{self.log_prefix}[EvalID:{current_eval_id}][PrepDataIndicators]"
@@ -192,73 +194,38 @@ class ObjectiveFunctionEvaluator:
             raise ValueError("calculate_indicators_for_trial a retourné un DataFrame vide.")
         
         try:
+            # Correction: Utiliser strategy_instance_for_trial ici
             df_final_for_simulation = strategy_instance_for_trial._calculate_indicators(df_for_simulation)
         except Exception as e_strat_calc:
-            logger.error(f"{log_prefix_prep} Erreur strategy_instance._calculate_indicators(): {e_strat_calc}", exc_info=True)
-            raise ValueError(f"Erreur strategy_instance._calculate_indicators: {e_strat_calc}")
+            logger.error(f"{log_prefix_prep} Erreur strategy_instance_for_trial._calculate_indicators(): {e_strat_calc}", exc_info=True)
+            raise ValueError(f"Erreur strategy_instance_for_trial._calculate_indicators: {e_strat_calc}")
         
         if df_final_for_simulation.empty:
-            raise ValueError("strategy_instance._calculate_indicators() a retourné un DataFrame vide.")
+            raise ValueError("strategy_instance_for_trial._calculate_indicators() a retourné un DataFrame vide.")
 
         logger.info(f"{log_prefix_prep} Préparation des données avec indicateurs terminée. Shape final: {df_final_for_simulation.shape}")
         return df_final_for_simulation
 
     def _resolve_module_import_path(self, script_reference_from_config: str) -> str:
-        """
-        Résout le chemin du script de stratégie en un chemin d'importation Python valide.
-        """
         log_prefix_import = f"{self.log_prefix}[ResolveImportPath]"
         
-        if not self.app_config.project_root:
-            logger.error(f"{log_prefix_import} project_root non défini dans AppConfig. "
-                         "Impossible de résoudre le chemin d'import de manière robuste.")
-            # Fallback sur l'ancienne méthode, moins robuste
-            return script_reference_from_config.replace('.py', '').replace(os.sep, '.')
-
-        project_root_path = Path(self.app_config.project_root).resolve()
-        script_path_rel_to_config = Path(script_reference_from_config) # Ex: "src/strategies/my_strat.py"
-
-        # Construire le chemin absolu du script
-        # Si script_path_rel_to_config est déjà absolu, project_root_path ne sera pas préfixé.
-        script_path_abs = (project_root_path / script_path_rel_to_config).resolve()
-        logger.debug(f"{log_prefix_import} Chemin absolu du script de stratégie : {script_path_abs}")
-
-        # Tenter de rendre le chemin relatif à un répertoire parent qui est dans sys.path
-        # ou à la racine du projet, pour former un chemin d'import Python.
+        module_path_standardized = script_reference_from_config.replace('\\', '/')
+        # Sourcery: Replace a conditional string slice with a call to `str.removesuffix`
+        module_path_standardized = module_path_standardized.removesuffix('.py')
         
-        # Cas 1: Le script est sous 'src' et 'src' est un package racine pour les imports
-        try:
-            # Trouver le dossier 'src' dans le chemin absolu du script
-            src_dir_in_path_parts = [part for part in script_path_abs.parents if part.name == 'src']
-            if src_dir_in_path_parts:
-                src_dir_base = src_dir_in_path_parts[0] # Le 'src' le plus proche du fichier
-                # Le chemin d'import commence à partir du parent de 'src' si 'src' lui-même fait partie du module
-                # ou à partir de 'src' si le parent de 'src' est la racine d'importation.
-                # Généralement, si on a project_root/src/strategies, l'import est src.strategies...
-                # Donc, on rend relatif au parent de 'src' (qui est project_root)
-                module_rel_path_obj = script_path_abs.relative_to(src_dir_base.parent).with_suffix('')
-                module_import_str = '.'.join(module_rel_path_obj.parts)
-                logger.debug(f"{log_prefix_import} Chemin d'import (via 'src' parent) : {module_import_str}")
-                return module_import_str
-        except ValueError: # Si .relative_to échoue
-            logger.debug(f"{log_prefix_import} Échec de la résolution relative au parent de 'src'. Tentative par rapport à project_root.")
-            pass # Tenter la méthode suivante
+        parts = module_path_standardized.split('/')
+        # Sourcery: Reintroduce else, Swap if/else branches
+        if parts and parts[0] != 'src':
+            module_import_str = module_path_standardized.replace('/', '.')
+            if not module_import_str.startswith('src.') and 'src.' in module_import_str:
+                module_import_str = f"src.{module_import_str.split('src.', 1)[-1]}"
+            elif not module_import_str.startswith('src.'): 
+                 logger.warning(f"{log_prefix_import} Chemin d'import '{module_import_str}' ne commence pas par 'src.'.")
+        else:
+            module_import_str = '.'.join(parts)
 
-        # Cas 2: Le script est sous project_root (mais peut-être pas directement sous 'src')
-        try:
-            module_rel_path_obj = script_path_abs.relative_to(project_root_path).with_suffix('')
-            module_import_str = '.'.join(module_rel_path_obj.parts)
-            logger.debug(f"{log_prefix_import} Chemin d'import (via project_root) : {module_import_str}")
-            return module_import_str
-        except ValueError:
-            logger.warning(f"{log_prefix_import} Échec de la résolution relative à project_root. "
-                           f"Script path: {script_path_abs}, Project root: {project_root_path}")
-            pass
-
-        # Cas 3: Fallback sur l'ancienne méthode (remplacement de séparateurs)
-        # Cela suppose que script_reference_from_config est déjà un chemin de type "src/..."
-        logger.warning(f"{log_prefix_import} Utilisation de la méthode de fallback pour le chemin d'import (remplacement de séparateurs).")
-        return script_reference_from_config.replace('.py', '').replace(os.sep, '.')
+        logger.debug(f"{log_prefix_import} Chemin d'import résolu : '{module_import_str}' depuis '{script_reference_from_config}'.")
+        return module_import_str
 
 
     def __call__(self, trial: optuna.Trial) -> Union[float, Tuple[float, ...]]:
@@ -278,21 +245,26 @@ class ObjectiveFunctionEvaluator:
 
         current_trial_params: Dict[str, Any]
         if self.is_oos_eval:
-            current_trial_params = trial.params # Les params sont fixés par enqueue_trial pour OOS
+            current_trial_params = trial.params.copy() if trial.params else {}
+            if not current_trial_params:
+                logger.error(f"{current_log_prefix} Évaluation OOS mais aucun paramètre trouvé dans trial.params.")
+                trial.set_user_attr("failure_reason", "OOS: Aucun paramètre enqueued dans le trial.")
+                raise optuna.exceptions.TrialPruned("OOS: Aucun paramètre enqueued.")
             logger.info(f"{current_log_prefix} Évaluation OOS avec params fixes (de IS trial {self.is_trial_number_for_oos_log}): {current_trial_params}")
         else: 
             try:
-                current_trial_params = self._suggest_params(trial)
-                if not current_trial_params:
+                # Sourcery: Use named expression (walrus operator)
+                if not (current_trial_params := self._suggest_params(trial)):
                     logger.error(f"{current_log_prefix} Aucun paramètre suggéré. Élagueage.")
-                    trial.set_user_attr("failure_reason", "Aucun paramètre suggéré")
-                    raise optuna.exceptions.TrialPruned("Aucun paramètre suggéré.")
+                    trial.set_user_attr("failure_reason", "Aucun paramètre suggéré (IS).")
+                    raise optuna.exceptions.TrialPruned("Aucun paramètre suggéré (IS).")
                 logger.info(f"{current_log_prefix} Paramètres IS suggérés : {current_trial_params}")
-            except optuna.exceptions.TrialPruned: raise
+            except optuna.exceptions.TrialPruned: 
+                raise
             except Exception as e_suggest:
-                logger.error(f"{current_log_prefix} Erreur suggestion params : {e_suggest}", exc_info=True)
-                trial.set_user_attr("failure_reason", f"Erreur suggestion params: {str(e_suggest)[:100]}")
-                raise optuna.exceptions.TrialPruned(f"Erreur suggestion params: {e_suggest}")
+                logger.error(f"{current_log_prefix} Erreur lors de la suggestion des paramètres IS : {e_suggest}", exc_info=True)
+                trial.set_user_attr("failure_reason", f"Erreur suggestion params (IS): {str(e_suggest)[:100]}")
+                return self._get_worst_objective_values(f"Erreur suggestion params (IS): {e_suggest}")
 
         StrategyClassImpl: Type['BaseStrategy']
         try:
@@ -302,44 +274,47 @@ class ObjectiveFunctionEvaluator:
             module = importlib.import_module(module_import_path)
             StrategyClassImpl = getattr(module, self.strategy_class_name)
             if not issubclass(StrategyClassImpl, BaseStrategy):
-                raise TypeError(f"{self.strategy_class_name} n'est pas une sous-classe de BaseStrategy.")
-            logger.debug(f"{current_log_prefix} Classe de stratégie '{self.strategy_class_name}' chargée depuis '{module_import_path}'.")
+                raise TypeError(f"La classe '{self.strategy_class_name}' dans '{module_import_path}' n'hérite pas de BaseStrategy.")
+            logger.debug(f"{current_log_prefix} Classe de stratégie '{self.strategy_class_name}' chargée avec succès depuis '{module_import_path}'.")
         except ModuleNotFoundError as e_mnfe:
             logger.error(f"{current_log_prefix} ModuleNotFoundError lors du chargement de la stratégie '{module_import_path if 'module_import_path' in locals() else self.strategy_script_reference}': {e_mnfe}. Vérifiez PYTHONPATH et la structure du projet.", exc_info=True)
             trial.set_user_attr("failure_reason", f"ModuleNotFoundError: {e_mnfe}")
             return self._get_worst_objective_values(f"ModuleNotFoundError: {e_mnfe}")
-        except Exception as e_load_strat:
-            logger.error(f"{current_log_prefix} Échec chargement classe stratégie {self.strategy_class_name} depuis {self.strategy_script_reference} (module tenté: {module_import_path if 'module_import_path' in locals() else 'non_defini'}): {e_load_strat}", exc_info=True)
+        except Exception as e_load_strat: 
+            logger.error(f"{current_log_prefix} Échec du chargement de la classe de stratégie {self.strategy_class_name} depuis {self.strategy_script_reference} (module tenté: {module_import_path if 'module_import_path' in locals() else 'non_defini'}): {e_load_strat}", exc_info=True)
             trial.set_user_attr("failure_reason", f"Échec chargement classe strat: {str(e_load_strat)[:100]}")
             return self._get_worst_objective_values(f"Échec chargement classe strat: {e_load_strat}")
 
+        strategy_instance_for_eval: 'BaseStrategy' # Déclaration pour que Pylance la connaisse
         try:
             strategy_instance_for_eval = StrategyClassImpl(
                 strategy_name=self.strategy_name_key,
                 symbol=self.pair_symbol,
                 params=current_trial_params
             )
-        except ValueError as e_strat_init_val:
-            logger.warning(f"{current_log_prefix} Erreur validation params instanciation stratégie: {e_strat_init_val}. Élagueage.")
+        except ValueError as e_strat_init_val: 
+            logger.warning(f"{current_log_prefix} Erreur de validation des paramètres lors de l'instanciation de la stratégie: {e_strat_init_val}. Élagueage du trial.")
             trial.set_user_attr("failure_reason", f"Validation params strat: {str(e_strat_init_val)[:100]}")
             raise optuna.exceptions.TrialPruned(f"Validation params strat: {e_strat_init_val}")
-        except Exception as e_strat_init:
-            logger.error(f"{current_log_prefix} Erreur instanciation stratégie : {e_strat_init}", exc_info=True)
+        except Exception as e_strat_init: 
+            logger.error(f"{current_log_prefix} Erreur lors de l'instanciation de la stratégie : {e_strat_init}", exc_info=True)
             trial.set_user_attr("failure_reason", f"Erreur instanciation strat: {str(e_strat_init)[:100]}")
             return self._get_worst_objective_values(f"Erreur instanciation strat: {e_strat_init}")
         
         try:
             df_for_simulation = self._prepare_data_with_dynamic_indicators(
-                strategy_instance_for_eval,
-                trial_number_for_log=trial_number_for_prepare_log
+                strategy_instance_for_eval, # Passer l'instance correcte
+                trial_number_for_log=trial_number_for_prepare_log 
             )
+            # Sourcery: Lift duplicated conditional
             if df_for_simulation.empty or df_for_simulation[['open', 'high', 'low', 'close']].isnull().all().all():
-                logger.error(f"{current_log_prefix} Préparation données a résulté en DataFrame inutilisable. Élagueage.")
-                trial.set_user_attr("failure_reason", "Données inutilisables post-indicateurs")
-                raise optuna.exceptions.TrialPruned("Données inutilisables post-indicateurs.")
-        except optuna.exceptions.TrialPruned: raise
+                logger.error(f"{current_log_prefix} La préparation des données a résulté en un DataFrame vide ou inutilisable. Élagueage.")
+                trial.set_user_attr("failure_reason", "Données inutilisables post-calcul des indicateurs")
+                raise optuna.exceptions.TrialPruned("Données inutilisables post-calcul des indicateurs.")
+        except optuna.exceptions.TrialPruned: 
+            raise
         except Exception as e_prepare:
-            logger.error(f"{current_log_prefix} Erreur préparation données : {e_prepare}", exc_info=True)
+            logger.error(f"{current_log_prefix} Erreur lors de la préparation des données avec indicateurs : {e_prepare}", exc_info=True)
             trial.set_user_attr("failure_reason", f"Erreur préparation données: {str(e_prepare)[:100]}")
             return self._get_worst_objective_values(f"Erreur préparation données: {e_prepare}")
 
@@ -365,7 +340,7 @@ class ObjectiveFunctionEvaluator:
             slippage_config_dict=sim_defaults.slippage_config.__dict__,
             is_futures=sim_defaults.is_futures_trading,
             run_id=self.run_id,
-            is_oos_simulation=self.is_oos_eval,
+            is_oos_simulation=self.is_oos_eval, 
             verbosity=0 if not self.is_oos_eval else sim_defaults.backtest_verbosity
         )
 
@@ -374,20 +349,20 @@ class ObjectiveFunctionEvaluator:
         oos_detailed_log_from_sim: List[Dict[str, Any]]
 
         try:
-            logger.info(f"{current_log_prefix} Démarrage simulation backtest...")
+            logger.info(f"{current_log_prefix} Démarrage de la simulation de backtest...")
             trades, equity_curve_df, _, oos_detailed_log_from_sim = simulator.run_simulation()
             self.last_backtest_results = {
                 "params": current_trial_params, "trades": trades,
                 "equity_curve_df": equity_curve_df, "oos_detailed_trades_log": oos_detailed_log_from_sim,
                 "metrics": {}
             }
-            logger.info(f"{current_log_prefix} Simulation terminée. Trades: {len(trades)}")
+            logger.info(f"{current_log_prefix} Simulation de backtest terminée. Nombre de trades: {len(trades)}")
         except optuna.exceptions.TrialPruned as e_pruned_sim:
-            logger.info(f"{current_log_prefix} Trial élagué pendant simulation : {e_pruned_sim}")
+            logger.info(f"{current_log_prefix} Trial élagué pendant la simulation de backtest : {e_pruned_sim}")
             trial.set_user_attr("failure_reason", f"Élagué pendant sim: {str(e_pruned_sim)[:100]}")
-            raise
+            raise 
         except Exception as e_sim:
-            logger.error(f"{current_log_prefix} Erreur durant BacktestRunner : {e_sim}", exc_info=True)
+            logger.error(f"{current_log_prefix} Erreur durant l'exécution de BacktestRunner : {e_sim}", exc_info=True)
             trial.set_user_attr("failure_reason", f"Erreur BacktestRunner: {str(e_sim)[:100]}")
             return self._get_worst_objective_values(f"Erreur BacktestRunner: {e_sim}")
 
@@ -400,29 +375,38 @@ class ObjectiveFunctionEvaluator:
                 equity_series_for_metrics = ec_df_copy.set_index('timestamp')['equity'].sort_index()
         
         if equity_series_for_metrics.empty:
-            logger.warning(f"{current_log_prefix} Série d'équité vide. Utilisation capital initial pour métriques.")
+            logger.warning(f"{current_log_prefix} La série d'équité est vide après traitement. "
+                           "Utilisation du capital initial pour le calcul des métriques.")
             start_ts_data = df_for_simulation.index.min() if not df_for_simulation.empty else pd.Timestamp.now(tz='UTC')
             equity_series_for_metrics = pd.Series([sim_defaults.initial_capital], index=[start_ts_data])
 
         metrics = calculate_performance_metrics_from_inputs(
-            trades_df=pd.DataFrame(trades), equity_curve_series=equity_series_for_metrics,
+            trades_df=pd.DataFrame(trades), 
+            equity_curve_series=equity_series_for_metrics,
             initial_capital=sim_defaults.initial_capital,
-            risk_free_rate_daily=(1 + sim_defaults.risk_free_rate)**(1/252) - 1,
-            periods_per_year=252
+            risk_free_rate_daily=(1 + sim_defaults.risk_free_rate)**(1/252) - 1, 
+            periods_per_year=252 
         )
-        metrics['Total Trades'] = metrics.get('Total Trades', len(trades))
+        metrics['Total Trades'] = metrics.get('Total Trades', len(trades)) 
         
-        if self.last_backtest_results: self.last_backtest_results["metrics"] = metrics.copy()
+        if self.last_backtest_results: 
+            self.last_backtest_results["metrics"] = metrics.copy()
 
-        if not self.is_oos_eval:
+        if not self.is_oos_eval: 
             for key, value in metrics.items():
-                attr_val_optuna: Any = None
-                if isinstance(value, (int, float, str, bool)) and pd.notna(value) and not (isinstance(value, float) and (np.isinf(value) or np.isnan(value))):
+                attr_val_optuna: Any
+                # Sourcery: Swap if/else branches of if expression to remove negation
+                if not (value is None or isinstance(value, (bool, int, float, str))):
+                    attr_val_optuna = str(value) if pd.notna(value) else None
+                elif isinstance(value, float) and (np.isinf(value) or np.isnan(value)):
+                    attr_val_optuna = None
+                else:
                     attr_val_optuna = value
-                elif pd.notna(value): attr_val_optuna = str(value)
+                
                 if attr_val_optuna is not None:
-                    try: trial.set_user_attr(key, attr_val_optuna)
-                    except TypeError:
+                    try: 
+                        trial.set_user_attr(key, attr_val_optuna)
+                    except TypeError: 
                         logger.debug(f"{current_log_prefix} Impossible de définir user_attr '{key}' avec valeur '{attr_val_optuna}' (type: {type(attr_val_optuna)}). Conversion en str.")
                         trial.set_user_attr(key, str(attr_val_optuna))
 
@@ -433,36 +417,44 @@ class ObjectiveFunctionEvaluator:
         for i, metric_name in enumerate(obj_names):
             value = metrics.get(metric_name)
             direction = obj_dirs[i].lower() if i < len(obj_dirs) and isinstance(obj_dirs[i], str) else "maximize"
-
-            if value is None or not isinstance(value, (int, float)) or not np.isfinite(value):
+            
+            # Sourcery: Swap if/else branches of if expression to remove negation
+            if value is not None and isinstance(value, (int, float)) and np.isfinite(value):
+                objective_values_list.append(float(value))
+            else:
                 logger.warning(f"{current_log_prefix} Objectif '{metric_name}' valeur invalide: {value}. Assignation valeur très mauvaise.")
-                value = -1e12 if direction == "maximize" else 1e12
-                if metric_name == "Total Trades" and (not trades or len(trades) == 0): value = 0.0
-                elif "Ratio" in metric_name and (not trades or len(trades) == 0): value = -10.0 
-                elif ("PnL" in metric_name or "Profit" in metric_name) and (not trades or len(trades) == 0): value = 0.0
-            objective_values_list.append(float(value))
+                worst_val = -1e12 if direction == "maximize" else 1e12
+                if metric_name == "Total Trades" and not trades: worst_val = 0.0 
+                elif "Ratio" in metric_name and not trades: worst_val = -10.0 
+                elif ("PnL" in metric_name or "Profit" in metric_name) and not trades: worst_val = 0.0
+                objective_values_list.append(worst_val)
+
 
         log_metrics_summary = {k: metrics.get(k) for k in ["Total Net PnL USDC", "Sharpe Ratio", "Max Drawdown Pct", "Total Trades", "Win Rate Pct"]}
-        logger.info(f"{current_log_prefix} Métriques clés: { {k: (f'{v:.4f}' if isinstance(v, float) else v) for k, v in log_metrics_summary.items()} }")
+        logger.info(f"{current_log_prefix} Métriques clés du trial: { {k: (f'{v:.4f}' if isinstance(v, float) else v) for k, v in log_metrics_summary.items()} }")
         
         end_time_trial = time.time()
-        logger.info(f"{current_log_prefix} Évaluation trial terminée en {end_time_trial - start_time_trial:.2f}s. Objectifs ({obj_names}): {objective_values_list}")
+        logger.info(f"{current_log_prefix} Évaluation du trial terminée en {end_time_trial - start_time_trial:.2f}s. "
+                    f"Objectifs retournés ({obj_names}): {objective_values_list}")
         
-        if trial.should_prune():
-            logger.info(f"{current_log_prefix} Trial élagué par le pruner Optuna après évaluation.")
+        if not self.is_oos_eval and trial.should_prune(): 
+            logger.info(f"{current_log_prefix} Trial élagué par le pruner Optuna après évaluation complète.")
             trial.set_user_attr("failure_reason", "Élagué par le pruner Optuna post-évaluation")
-            raise optuna.exceptions.TrialPruned()
+            raise optuna.exceptions.TrialPruned() 
 
         return tuple(objective_values_list) if len(objective_values_list) > 1 else objective_values_list[0]
 
     def _get_worst_objective_values(self, reason_for_worst: str) -> Union[float, Tuple[float, ...]]:
         logger.warning(f"{self.log_prefix} Retour des pires valeurs d'objectif. Raison: {reason_for_worst}")
         obj_dirs: List[str] = self.optuna_objectives_config.get('objectives_directions', ['maximize'])
-        num_objectives = len(self.optuna_objectives_config.get('objectives_names', ['']))
+        num_objectives = len(self.optuna_objectives_config.get('objectives_names', [''])) 
         
         if not obj_dirs or len(obj_dirs) != num_objectives:
-            obj_dirs = ['maximize'] * num_objectives
-            logger.warning(f"{self.log_prefix} Directions d'objectifs incohérentes ou manquantes, utilisation de 'maximize' pour tous.")
+            obj_dirs = ['maximize'] * num_objectives 
+            logger.warning(f"{self.log_prefix} Directions d'objectifs incohérentes ou manquantes dans optuna_objectives_config. "
+                           "Utilisation de 'maximize' par défaut pour tous les {num_objectives} objectifs.")
 
-        worst_values = tuple([-1e12 if d.lower() == "maximize" else 1e12 for d in obj_dirs])
+        worst_values = tuple(
+            -1e12 if d.lower() == "maximize" else 1e12 for d in obj_dirs
+        ) # Sourcery: Replace unneeded comprehension with generator (kept for clarity)
         return worst_values if len(worst_values) > 1 else worst_values[0]

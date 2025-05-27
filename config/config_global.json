@@ -25,7 +25,7 @@
   },
   "simulation_defaults": {
     "initial_capital": 500.0,
-    "margin_leverage": 3,
+    "margin_leverage": 4,
     "trading_fee_bps": 7.5,
     "slippage_config": {
         "method": "percentage",
@@ -33,7 +33,7 @@
         "volume_factor": 0.1,
         "volatility_factor": 0.1,
         "min_slippage_bps": 0.0,
-        "max_slippage_bps": 20.0
+        "max_slippage_bps": 2.0
     },
     "is_futures_trading": false,
     "backtest_verbosity": 1,
@@ -59,7 +59,7 @@
     "pareto_selection_strategy": "SCORE_COMPOSITE",
     "pareto_selection_weights": {"Total Net PnL USDC": 0.6, "Sharpe Ratio": 0.4, "Max Drawdown Pct": 0.1},
     "pareto_selection_pnl_threshold": 0.0,
-    "default_profile_to_activate": "NSGAII_Hyperband",
+    "default_profile_to_activate": "TPE_Median",
     "sampler_name": "TPESampler",
     "sampler_params": {"seed": 42, "n_startup_trials": 10, "multivariate": true},
     "pruner_name": "MedianPruner",
@@ -91,14 +91,6 @@
         "sampler_name": "RandomSampler",
         "sampler_params": {"seed": 42},
         "pruner_name": "NopPruner",
-        "pruner_params": {}
-      },
-      "PartialFixed_TPE": {
-        "description": "Example for partial fixed parameters with TPE.",
-        "sampler_name": "TPESampler",
-         "sampler_params": {"multivariate": true, "group":true, "constant_liar":true,
-                           "fixed_params": {"some_fixed_param_name": 0.5} },
-        "pruner_name": "MedianPruner",
         "pruner_params": {}
       }
     }

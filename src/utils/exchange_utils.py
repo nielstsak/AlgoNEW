@@ -1,22 +1,17 @@
 # src/utils/exchange_utils.py
 """
-Ce module fournit des fonctions utilitaires pour gérer les filtres, les précisions
-(prix, quantité) et les validations spécifiques aux exchanges (par exemple, Binance),
-en se basant sur les informations de l'exchange.
+Utilitaires pour les opérations liées aux exchanges.
+Gère la précision des prix/quantités, les filtres d'exchange, et les calculs d'arrondi.
 """
-
 import logging
-import math 
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR, Context as DecimalContext, Inexact, Rounded, localcontext as decimal_localcontext # Importation correcte de localcontext
-from typing import Dict, Optional, Any, Union, List
+from typing import Any, Dict, Optional, Union, List
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP, ROUND_FLOOR,  InvalidOperation, Context as DecimalContext, localcontext as decimal_localcontext
+import math
 
 logger = logging.getLogger(__name__)
 
 # Contexte décimal pour les opérations de haute précision.
-DECIMAL_CONTEXT_HIGH_PRECISION = DecimalContext(prec=28)
-
-# Tolérance pour les comparaisons de Decimals.
-DECIMAL_COMPARISON_EPSILON = Decimal('1e-9')
+DECIMAL_CONTEXT_HIGH_PRECISION = DecimalContext(prec=28) # Précision suffisante pour la plupart des crypto-monnaies
 
 def get_pair_config_for_symbol(
     pair_symbol: str,
@@ -26,7 +21,7 @@ def get_pair_config_for_symbol(
     Extrait la configuration spécifique d'une paire (symbole) à partir des
     données d'information de l'exchange.
     """
-    log_prefix = f"[GetPairCfg({pair_symbol.upper()})]"
+    log_prefix = f"[GetPairCfg({pair_symbol.upper()})]" # Utilisation de pair_symbol pour le log
     if not isinstance(exchange_info_data, dict):
         logger.error(f"{log_prefix} exchange_info_data n'est pas un dictionnaire. Reçu : {type(exchange_info_data)}")
         return None
@@ -42,382 +37,316 @@ def get_pair_config_for_symbol(
             logger.debug(f"{log_prefix} Configuration trouvée pour la paire.")
             return symbol_details
 
-    logger.warning(f"{log_prefix} Aucune configuration trouvée pour la paire dans les données de l'exchange fournies.")
+    logger.warning(f"{log_prefix} Aucune configuration trouvée pour la paire '{pair_symbol_upper}' dans les données de l'exchange fournies.")
     return None
 
+def _calculate_precision(value_str: str) -> int:
+    """
+    Calcule la précision (nombre de décimales) à partir d'une chaîne.
+    Exemple: "0.001" -> 3, "1" -> 0, "0.100" -> 1 (après suppression des zéros non significatifs à droite).
+    Gère la notation scientifique.
+
+    Args:
+        value_str: Chaîne représentant un nombre (ex: "0.00010000", "1e-4").
+
+    Returns:
+        Nombre de décimales significatives.
+    """
+    if not isinstance(value_str, str) or not value_str.strip():
+        logger.warning(f"_calculate_precision: Chaîne de valeur invalide ou vide : '{value_str}'. Retourne 0.")
+        return 0
+    
+    value_str_cleaned = value_str.strip().lower()
+
+    if 'e' in value_str_cleaned:
+        try:
+            d_value = Decimal(value_str_cleaned)
+            if d_value.is_zero(): return 0 
+            exponent = d_value.normalize().as_tuple().exponent
+            return abs(exponent) if isinstance(exponent, int) and exponent < 0 else 0
+        except InvalidOperation:
+            logger.error(f"_calculate_precision: InvalidOperation pour la notation scientifique '{value_str_cleaned}'.")
+            return 0 
+
+    if '.' in value_str_cleaned:
+        parts = value_str_cleaned.split('.')
+        if len(parts) == 2:
+            decimal_part = parts[1].rstrip('0') 
+            return len(decimal_part)
+        else: 
+            logger.warning(f"_calculate_precision: Format de nombre décimal invalide '{value_str_cleaned}'.")
+            return 0
+    return 0 
+
+def get_precision_from_filter(symbol_info: Dict[str, Any], filter_type: str, key: str) -> Optional[int]:
+    """
+    Récupère la précision (nombre de décimales) depuis un filtre d'exchange.
+    """
+    log_prefix = f"[GetPrecision][{symbol_info.get('symbol','N/A')}/{filter_type}/{key}]"
+    if not symbol_info or 'filters' not in symbol_info or not isinstance(symbol_info['filters'], list):
+        logger.warning(f"{log_prefix} symbol_info manquant, invalide ou sans clé 'filters'.")
+        return None
+    
+    for filter_dict in symbol_info['filters']:
+        if isinstance(filter_dict, dict) and filter_dict.get('filterType') == filter_type:
+            value_str = filter_dict.get(key)
+            if value_str is not None and isinstance(value_str, str):
+                try:
+                    precision = _calculate_precision(value_str)
+                    logger.debug(f"{log_prefix} Précision calculée: {precision} depuis la valeur de filtre '{value_str}'.")
+                    return precision
+                except Exception as e: 
+                    logger.error(f"{log_prefix} Erreur lors du calcul de la précision pour la valeur '{value_str}': {e}", exc_info=True)
+                    return None 
+            else:
+                logger.debug(f"{log_prefix} Clé '{key}' non trouvée ou sa valeur n'est pas une chaîne dans le filtre {filter_type}: {filter_dict.get(key)}")
+    
+    logger.debug(f"{log_prefix} Filtre {filter_type} avec clé {key} non trouvé.")
+    return None
+
+def get_filter_value(symbol_info: Dict[str, Any], filter_type: str, key: str) -> Optional[float]:
+    """
+    Récupère une valeur de filtre comme float.
+    """
+    log_prefix = f"[GetFilterVal][{symbol_info.get('symbol','N/A')}/{filter_type}/{key}]"
+    if not symbol_info or 'filters' not in symbol_info or not isinstance(symbol_info['filters'], list):
+        logger.warning(f"{log_prefix} symbol_info manquant, invalide ou sans clé 'filters'.")
+        return None
+    
+    for filter_dict in symbol_info['filters']:
+        if isinstance(filter_dict, dict) and filter_dict.get('filterType') == filter_type:
+            value_str = filter_dict.get(key)
+            if value_str is not None:
+                try:
+                    val_float = float(str(value_str)) 
+                    logger.debug(f"{log_prefix} Valeur de filtre '{value_str}' convertie en float: {val_float}.")
+                    return val_float
+                except (ValueError, TypeError) as e_conv:
+                    logger.error(f"{log_prefix} Impossible de convertir la valeur de filtre '{value_str}' en float pour {filter_type}/{key}: {e_conv}")
+                    return None
+            else:
+                logger.debug(f"{log_prefix} Clé '{key}' non trouvée dans le filtre {filter_type}: {filter_dict}")
+
+    logger.debug(f"{log_prefix} Filtre {filter_type} avec clé {key} non trouvé.")
+    return None
 
 def adjust_precision(
-    value: Optional[Union[float, str, Decimal]],
-    precision: Optional[int] = None,
-    rounding_mode_str: str = "ROUND_HALF_UP",
-    tick_size: Optional[Union[float, str, Decimal]] = None
+    value: Union[float, str, Decimal], 
+    precision: Optional[int], 
+    tick_size: Optional[Union[float, str, Decimal]] = None,
+    rounding_mode_str: str = "ROUND_HALF_UP" 
 ) -> Optional[float]:
     """
     Ajuste une valeur numérique à une précision décimale spécifiée ou à un multiple
     d'un `tick_size` donné, en utilisant la classe `Decimal` pour la précision.
-
-    Args:
-        value: La valeur à ajuster.
-        precision: Le nombre de décimales souhaité si `tick_size` n'est pas utilisé.
-        rounding_mode_str: La méthode d'arrondi Decimal (ex: "ROUND_DOWN").
-        tick_size: La taille du pas (tick). Si fourni, `value` est ajustée à un multiple de `tick_size`.
-
-    Returns:
-        La valeur ajustée en float, ou None si l'entrée est invalide.
     """
     if value is None:
         return None
 
-    if not isinstance(rounding_mode_str, str):
-        logger.error(f"adjust_precision: 'rounding_mode_str' doit être une chaîne, reçu {type(rounding_mode_str)}. Valeur: {rounding_mode_str}")
-        return None
-
     try:
-        value_decimal = DECIMAL_CONTEXT_HIGH_PRECISION.create_decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError) as e_conv:
-        logger.warning(f"adjust_precision: Impossible de convertir la valeur '{value}' (type: {type(value)}) en Decimal: {e_conv}")
-        return None
+        with decimal_localcontext(DECIMAL_CONTEXT_HIGH_PRECISION) as ctx:
+            value_decimal = ctx.create_decimal(str(value)) 
 
-    if value_decimal.is_nan() or value_decimal.is_infinite():
-        logger.debug(f"adjust_precision: La valeur est NaN ou Inf ({value_decimal}). Retour de la valeur float originale.")
-        return float(value_decimal)
+            if value_decimal.is_nan() or value_decimal.is_infinite():
+                logger.debug(f"adjust_precision: Valeur {value} est NaN ou Inf. Retour de la valeur float originale.")
+                return float(value) 
 
-    actual_rounding_mode = getattr(Decimal, rounding_mode_str.upper(), None)
-    if actual_rounding_mode is None:
-        logger.warning(f"adjust_precision: Mode d'arrondi '{rounding_mode_str}' invalide. Utilisation de ROUND_HALF_UP par défaut.")
-        actual_rounding_mode = ROUND_HALF_UP
-
-    adjusted_value_decimal: Decimal
-    try:
-        with decimal_localcontext(DECIMAL_CONTEXT_HIGH_PRECISION) as ctx: # Utilisation correcte de localcontext
+            actual_rounding_mode = getattr(Decimal, rounding_mode_str.upper(), None)
+            if actual_rounding_mode is None:
+                logger.warning(f"adjust_precision: Mode d'arrondi '{rounding_mode_str}' invalide. Utilisation de ROUND_HALF_UP.")
+                actual_rounding_mode = ROUND_HALF_UP
             ctx.rounding = actual_rounding_mode 
+
+            adjusted_value_decimal: Decimal
 
             if tick_size is not None:
                 tick_size_decimal = ctx.create_decimal(str(tick_size))
                 if tick_size_decimal.is_zero() or not tick_size_decimal.is_finite():
-                    logger.warning(f"adjust_precision: tick_size '{tick_size}' est zéro ou non fini. "
-                                   "Tentative avec précision si fournie.")
+                    logger.warning(f"adjust_precision: tick_size '{tick_size}' invalide. "
+                                   "Tentative avec 'precision' si fournie.")
+                    # Laisser la logique de précision ci-dessous s'appliquer
+                else: 
+                    adjusted_value_decimal = (value_decimal / tick_size_decimal).quantize(Decimal('0'), context=ctx) * tick_size_decimal
+                    logger.debug(f"adjust_precision avec tick_size: {value_decimal} -> {adjusted_value_decimal} (tick_size={tick_size_decimal}, mode={rounding_mode_str})")
+                    # Si 'precision' est aussi fourni, on peut l'utiliser pour un formatage final après l'ajustement au tick_size.
+                    # Cela est utile si la précision souhaitée est plus grossière que celle induite par le tick_size.
                     if precision is not None and isinstance(precision, int) and precision >= 0:
-                        quantizer = Decimal('1e-' + str(precision))
-                        adjusted_value_decimal = value_decimal.quantize(quantizer) 
-                        return float(adjusted_value_decimal)
-                    logger.debug("adjust_precision: tick_size invalide et pas de précision. Retour de la valeur originale (float).")
-                    return float(value_decimal)
+                        quantizer_final_format = Decimal('1e-' + str(precision))
+                        adjusted_value_decimal = adjusted_value_decimal.quantize(quantizer_final_format, context=ctx)
+                        logger.debug(f"adjust_precision (post-tick_size) formatage final à {precision} décimales: -> {adjusted_value_decimal}")
+                    return float(adjusted_value_decimal)
 
-                adjusted_value_decimal = (value_decimal / tick_size_decimal).quantize(Decimal('1')) * tick_size_decimal
-            
-            elif precision is not None and isinstance(precision, int) and precision >= 0:
+            if precision is not None and isinstance(precision, int) and precision >= 0:
                 quantizer = Decimal('1e-' + str(precision))
-                adjusted_value_decimal = value_decimal.quantize(quantizer)
+                adjusted_value_decimal = value_decimal.quantize(quantizer, context=ctx)
+                logger.debug(f"adjust_precision avec precision: {value_decimal} -> {adjusted_value_decimal} (precision={precision}, mode={rounding_mode_str})")
+                return float(adjusted_value_decimal)
             
-            else: 
-                logger.debug(f"adjust_precision: Ni tick_size ni précision valide fournie. Retour de la valeur originale (float): {float(value_decimal)}.")
-                return float(value_decimal)
-        
-        return float(adjusted_value_decimal)
+            logger.debug(f"adjust_precision: Ni tick_size valide ni 'precision' fournie. Retour de la valeur originale (float): {float(value_decimal)}.")
+            return float(value_decimal)
 
-    except (InvalidOperation, OverflowError, Inexact, Rounded) as e_decimal_op:
-        logger.error(f"adjust_precision: Erreur/Signal Decimal lors de l'ajustement de {value_decimal} "
-                     f"(tick_size: {tick_size}, precision: {precision}): {type(e_decimal_op).__name__} - {e_decimal_op}. "
-                     "Retour de la valeur originale (float).")
-        return float(value_decimal) # Retourner la valeur originale en cas d'erreur d'opération Decimal spécifique
-    except Exception as e_unexp: 
-        logger.error(f"adjust_precision: Erreur inattendue lors de l'ajustement: {e_unexp}. "
-                      "Retour de la valeur originale (float).", exc_info=True)
-        return float(value_decimal)
-
-
-def get_precision_from_filter(symbol_info: Dict[str, Any], filter_type: str, filter_key: str) -> Optional[int]:
-    """
-    Extrait la précision (nombre de décimales) d'un filtre de symbole.
-    """
-    log_prefix = f"[GetPrecision({symbol_info.get('symbol', 'N/A')}/{filter_type}/{filter_key})]"
-    try:
-        if not isinstance(symbol_info, dict):
-            logger.warning(f"{log_prefix} symbol_info n'est pas un dictionnaire.")
-            return None
-        filters = symbol_info.get('filters', [])
-        if not isinstance(filters, list):
-            logger.warning(f"{log_prefix} 'filters' n'est pas une liste ou est manquant dans symbol_info.")
-            return None
-
-        target_filter = next((f for f in filters if isinstance(f, dict) and f.get('filterType') == filter_type), None)
-        if not target_filter:
-            logger.debug(f"{log_prefix} Filtre de type '{filter_type}' non trouvé.")
-            return None
-
-        size_str_raw = target_filter.get(filter_key)
-        if not isinstance(size_str_raw, str) or not size_str_raw.strip():
-            logger.warning(f"{log_prefix} Clé '{filter_key}' non trouvée, vide ou non-string dans le filtre '{filter_type}'. Valeur: '{size_str_raw}'")
-            return None
-        
-        size_str_cleaned = size_str_raw.strip().rstrip('0') 
-
+    except InvalidOperation as e_inv_op:
+        logger.warning(f"adjust_precision: InvalidOperation lors de la conversion de '{value}' ou '{tick_size}' en Decimal: {e_inv_op}. Retour de None.")
+        return None
+    except Exception as e_unexp:
+        logger.error(f"adjust_precision: Erreur inattendue lors de l'ajustement de '{value}': {e_unexp}", exc_info=True)
         try:
-            with decimal_localcontext(DECIMAL_CONTEXT_HIGH_PRECISION): # Utilisation correcte
-                d_value = Decimal(size_str_cleaned)
-        except InvalidOperation:
-            logger.warning(f"{log_prefix} Impossible de convertir '{filter_key}' ('{size_str_cleaned}') en Decimal.")
+            return round(float(str(value)), precision or 8) 
+        except:
             return None
 
-        if d_value.is_zero() or not d_value.is_finite():
-            logger.warning(f"{log_prefix} {filter_key} '{size_str_cleaned}' est zéro, NaN ou Inf. Précision indéfinie.")
-            return None
-        
-        exponent = d_value.normalize().as_tuple().exponent
-        if isinstance(exponent, int):
-            return abs(exponent) if exponent < 0 else 0
-        else: 
-            logger.warning(f"{log_prefix} Exponent non entier pour Decimal normalisé de '{size_str_cleaned}'. Ceci est inattendu.")
-            return None
-
-    except Exception as e: 
-        logger.error(f"{log_prefix} Erreur inattendue : {e}", exc_info=True)
-        return None
-
-
-def get_filter_value(symbol_info: Dict[str, Any], filter_type: str, filter_key: str) -> Optional[float]:
-    """
-    Extrait une valeur numérique spécifique (convertie en float) d'un filtre de symbole.
-    """
-    log_prefix = f"[GetFilterVal({symbol_info.get('symbol', 'N/A')}/{filter_type}/{filter_key})]"
-    try:
-        if not isinstance(symbol_info, dict):
-            logger.warning(f"{log_prefix} symbol_info n'est pas un dictionnaire.")
-            return None
-        filters = symbol_info.get('filters', [])
-        if not isinstance(filters, list):
-            logger.warning(f"{log_prefix} 'filters' n'est pas une liste ou est manquant.")
-            return None
-
-        target_filter = next((f for f in filters if isinstance(f,dict) and f.get('filterType') == filter_type), None)
-        if target_filter:
-            value_raw = target_filter.get(filter_key)
-            if value_raw is not None: 
-                try:
-                    return float(value_raw)
-                except (ValueError, TypeError):
-                     logger.warning(f"{log_prefix} Impossible de convertir '{filter_key}' ('{value_raw}') en float.")
-                     return None
-        return None
-    except Exception as e:
-        logger.error(f"{log_prefix} Erreur inattendue : {e}", exc_info=True)
-        return None
 
 def adjust_quantity_to_step_size(
-    quantity: Union[float, Decimal, str],
+    quantity: Union[float, str, Decimal],
     symbol_info: Dict[str, Any],
+    qty_precision: Optional[int] = None, 
     rounding_mode_str: str = "ROUND_FLOOR" 
-) -> float:
+) -> Optional[float]:
     """
-    Ajuste une quantité pour qu'elle soit un multiple de `stepSize` du filtre `LOT_SIZE`.
+    Ajuste une quantité selon le `stepSize` du filtre `LOT_SIZE` de l'exchange.
     """
-    log_prefix = f"[AdjustQtyToStep][{symbol_info.get('symbol', 'N/A')}]"
-    step_size_val_raw = get_filter_value(symbol_info, 'LOT_SIZE', 'stepSize')
+    log_prefix = f"[AdjustQtyToStep][{symbol_info.get('symbol','N/A')}]"
+    
+    try:
+        initial_quantity_decimal = Decimal(str(quantity))
+    except InvalidOperation:
+        logger.error(f"{log_prefix} Quantité initiale '{quantity}' non convertible en Decimal.")
+        return None
 
-    if step_size_val_raw is None or step_size_val_raw <= 1e-12: 
-        qty_precision_fallback = get_precision_from_filter(symbol_info, 'LOT_SIZE', 'stepSize')
-        final_precision_for_fallback = qty_precision_fallback if qty_precision_fallback is not None else 8
-        
-        logger.warning(f"{log_prefix} stepSize non trouvé ou invalide ({step_size_val_raw}). "
-                       f"Retour de la quantité originale arrondie à {final_precision_for_fallback} décimales "
-                       f"avec mode {rounding_mode_str}.")
-        
-        adjusted_qty_fallback = adjust_precision(
-            value=quantity, 
-            precision=final_precision_for_fallback, 
-            rounding_mode_str=rounding_mode_str,
-            tick_size=None 
-        )
-        original_qty_float = 0.0
-        try:
-            original_qty_float = float(str(quantity))
-        except (ValueError, TypeError):
-            logger.error(f"{log_prefix} Impossible de convertir la quantité originale '{quantity}' en float pour fallback. Retour de 0.0.")
-            return 0.0
+    if initial_quantity_decimal.is_nan() or initial_quantity_decimal.is_infinite() or initial_quantity_decimal < Decimal(0):
+        logger.warning(f"{log_prefix} Quantité initiale invalide: {initial_quantity_decimal}. Retour de 0.0.")
+        return 0.0 
+
+    step_size_from_filter_val = get_filter_value(symbol_info, 'LOT_SIZE', 'stepSize')
+    
+    effective_precision = qty_precision
+    if effective_precision is None and step_size_from_filter_val is not None:
+        effective_precision = _calculate_precision(str(step_size_from_filter_val))
+    elif effective_precision is None:
+        effective_precision = 8 
+        logger.debug(f"{log_prefix} Précision de quantité non fournie et non dérivable de stepSize. Utilisation de {effective_precision} décimales.")
+
+    if step_size_from_filter_val is None or step_size_from_filter_val <= 1e-12: 
+        logger.debug(f"{log_prefix} stepSize ('{step_size_from_filter_val}') non valide. "
+                       f"Arrondi de la quantité {initial_quantity_decimal} à {effective_precision} décimales avec {rounding_mode_str}.")
+        return adjust_precision(initial_quantity_decimal, effective_precision, tick_size=None, rounding_mode_str=rounding_mode_str)
+
+    try:
+        with decimal_localcontext(DECIMAL_CONTEXT_HIGH_PRECISION) as ctx:
+            step_size_decimal = ctx.create_decimal(str(step_size_from_filter_val))
             
-        return adjusted_qty_fallback if adjusted_qty_fallback is not None else round(original_qty_float, final_precision_for_fallback)
+            actual_rounding_mode = getattr(Decimal, rounding_mode_str.upper(), None)
+            if actual_rounding_mode is None:
+                logger.warning(f"{log_prefix} Mode d'arrondi '{rounding_mode_str}' invalide pour step_size. Utilisation de ROUND_FLOOR.")
+                actual_rounding_mode = ROUND_FLOOR
+            ctx.rounding = actual_rounding_mode
 
-    adjusted_quantity_float = adjust_precision(
-        value=quantity,
-        precision=None, 
-        rounding_mode_str=rounding_mode_str,
-        tick_size=step_size_val_raw 
-    )
-    
-    final_quantity = 0.0 
-    try:
-        final_quantity = float(str(quantity)) # Valeur par défaut si l'ajustement retourne None
-    except (ValueError, TypeError):
-        logger.error(f"{log_prefix} Impossible de convertir la quantité originale '{quantity}' en float pour fallback initial. Retour de 0.0.")
+            if step_size_decimal.is_zero():
+                 logger.error(f"{log_prefix} step_size_decimal est zéro. Division par zéro évitée.")
+                 return adjust_precision(initial_quantity_decimal, effective_precision, tick_size=None, rounding_mode_str=rounding_mode_str)
+
+            adjusted_qty_decimal = (initial_quantity_decimal / step_size_decimal).quantize(Decimal('0'), context=ctx) * step_size_decimal
+            
+            if effective_precision is not None:
+                quantizer_final = Decimal('1e-' + str(effective_precision))
+                adjusted_qty_decimal = adjusted_qty_decimal.quantize(quantizer_final, context=ctx)
+
+            logger.debug(f"{log_prefix} Quantité ajustée: {initial_quantity_decimal} -> {adjusted_qty_decimal} "
+                         f"(stepSize={step_size_decimal}, mode={rounding_mode_str}, prec_eff={effective_precision})")
+            
+            final_float_qty = float(adjusted_qty_decimal)
+            min_qty_filter = get_filter_value(symbol_info, 'LOT_SIZE', 'minQty')
+            if min_qty_filter is not None and final_float_qty < min_qty_filter and final_float_qty > 1e-9: 
+                logger.warning(f"{log_prefix} Quantité ajustée {final_float_qty} < minQty requis {min_qty_filter}. Retour de 0.0.")
+                return 0.0
+            elif final_float_qty < 0: 
+                 logger.error(f"{log_prefix} Quantité ajustée est devenue négative: {final_float_qty}. Retour de 0.0.")
+                 return 0.0
+
+            return final_float_qty
+
+    except InvalidOperation as e_inv_op_qty:
+        logger.error(f"{log_prefix} InvalidOperation lors de l'ajustement de la quantité '{quantity}' avec step_size '{step_size_from_filter_val}': {e_inv_op_qty}.")
+        return None
+    except Exception as e_unexp_qty:
+        logger.error(f"{log_prefix} Erreur inattendue lors de l'ajustement de la quantité '{quantity}': {e_unexp_qty}", exc_info=True)
+        return None
+
+
+def calculate_notional_value(quantity: float, price: float) -> float:
+    """
+    Calcule la valeur notionnelle d'un ordre.
+    """
+    if not (isinstance(quantity, (int, float)) and isinstance(price, (int, float))):
+        logger.warning(f"calculate_notional_value: Entrées invalides pour quantité ({quantity}, type {type(quantity)}) "
+                       f"ou prix ({price}, type {type(price)}).")
         return 0.0
+    return quantity * price
 
-    if adjusted_quantity_float is None:
-         logger.warning(f"{log_prefix} adjust_precision a retourné None pour la quantité. "
-                        f"Quantité originale: {quantity}, StepSize: {step_size_val_raw}. "
-                        "Retour de la quantité originale non modifiée (convertie en float).")
-    else:
-        final_quantity = adjusted_quantity_float
-        original_qty_float_for_log = 0.0
-        try: original_qty_float_for_log = float(str(quantity))
-        except: pass
-        logger.debug(f"{log_prefix} Quantité brute: {original_qty_float_for_log:.8f}, StepSize: {step_size_val_raw}, "
-                     f"Mode d'arrondi: {rounding_mode_str}, Quantité ajustée: {final_quantity:.8f}")
-
-    return final_quantity
-
-
-def validate_notional(
-    quantity: Union[float, Decimal, str],
-    price: Union[float, Decimal, str],
+def validate_order_filters(
+    quantity: float,
+    price: float,
     symbol_info: Dict[str, Any],
-    pair_symbol_for_log: Optional[str] = None
-) -> bool:
+    order_type: str = "LIMIT" 
+) -> Dict[str, Any]:
     """
-    Valide si la valeur notionnelle d'un ordre respecte le filtre MIN_NOTIONAL.
+    Valide un ordre contre tous les filtres pertinents de l'exchange.
     """
-    log_sym = pair_symbol_for_log or symbol_info.get('symbol', 'N/A_SYMBOL')
-    log_prefix = f"[{log_sym}][ValidateNotional]"
-
-    try:
-        with decimal_localcontext(DECIMAL_CONTEXT_HIGH_PRECISION): 
-            q_decimal = Decimal(str(quantity))
-            p_decimal = Decimal(str(price))
-    except InvalidOperation:
-        logger.warning(f"{log_prefix} Quantité ({quantity}) ou prix ({price}) non convertible en Decimal.")
-        return False
-
-    if q_decimal.is_nan() or q_decimal.is_infinite() or p_decimal.is_nan() or p_decimal.is_infinite():
-        logger.warning(f"{log_prefix} Quantité ({q_decimal}) ou prix ({p_decimal}) invalide (NaN/Inf).")
-        return False
-
-    min_notional_val_float = get_filter_value(symbol_info, 'MIN_NOTIONAL', 'minNotional')
-    if min_notional_val_float is None or min_notional_val_float <= 0:
-        min_notional_val_float = get_filter_value(symbol_info, 'NOTIONAL', 'minNotional')
-
-    if min_notional_val_float is not None and min_notional_val_float > 0:
-        min_notional_decimal = Decimal(str(min_notional_val_float))
-        current_notional = q_decimal.copy_abs() * p_decimal.copy_abs()
-
-        if current_notional < (min_notional_decimal - DECIMAL_COMPARISON_EPSILON):
-            logger.debug(f"{log_prefix} Échec : Notionnel actuel {current_notional} < Min requis {min_notional_decimal}")
-            return False
-        logger.debug(f"{log_prefix} Succès : Notionnel actuel {current_notional} >= Min requis {min_notional_decimal}")
-        return True
-
-    logger.debug(f"{log_prefix} Filtre MIN_NOTIONAL/NOTIONAL non trouvé, non applicable ou nul. Validation passée.")
-    return True
-
-
-def validate_order_parameters(
-    order_params: Dict[str, Any], 
-    symbol_info: Dict[str, Any],
-    pair_symbol_for_log: Optional[str] = None,
-    estimated_market_price_for_market_order: Optional[float] = None
-) -> List[str]:
-    """
-    Valide les paramètres d'un ordre par rapport aux filtres de l'exchange.
-    """
-    log_sym = pair_symbol_for_log or symbol_info.get('symbol', 'N/A_SYMBOL')
-    log_prefix = f"[{log_sym}][ValidateOrderParams]"
     errors: List[str] = []
+    log_prefix = f"[ValidateOrderFilters][{symbol_info.get('symbol','N/A')}]"
 
-    quantity_input = order_params.get('quantity')
-    if quantity_input is None:
-        errors.append("Paramètre 'quantity' manquant.")
-        return errors
-
-    try:
-        with decimal_localcontext(DECIMAL_CONTEXT_HIGH_PRECISION): 
-            quantity_decimal = Decimal(str(quantity_input))
-    except InvalidOperation:
-        errors.append(f"Quantité '{quantity_input}' n'est pas un nombre valide.")
-        return errors
-
-    if quantity_decimal.is_nan() or quantity_decimal.is_infinite() or quantity_decimal <= Decimal(0):
-        errors.append(f"Quantité invalide '{quantity_decimal}'. Doit être positive et finie.")
-        return errors 
-
-    min_qty_filter_float = get_filter_value(symbol_info, 'LOT_SIZE', 'minQty')
-    max_qty_filter_float = get_filter_value(symbol_info, 'LOT_SIZE', 'maxQty')
-    step_size_qty_filter_float = get_filter_value(symbol_info, 'LOT_SIZE', 'stepSize')
-
-    if min_qty_filter_float is not None:
-        min_qty_decimal = Decimal(str(min_qty_filter_float))
-        if quantity_decimal < (min_qty_decimal - DECIMAL_COMPARISON_EPSILON):
-            errors.append(f"Quantité {quantity_decimal} < minQty requis {min_qty_decimal}.")
+    min_qty = get_filter_value(symbol_info, 'LOT_SIZE', 'minQty')
+    if min_qty is not None and quantity < min_qty:
+        errors.append(f"Quantité {quantity:.8f} < minQty requis {min_qty:.8f}")
     
-    if max_qty_filter_float is not None:
-        max_qty_decimal = Decimal(str(max_qty_filter_float))
-        if quantity_decimal > (max_qty_decimal + DECIMAL_COMPARISON_EPSILON):
-            errors.append(f"Quantité {quantity_decimal} > maxQty requis {max_qty_decimal}.")
+    max_qty = get_filter_value(symbol_info, 'LOT_SIZE', 'maxQty')
+    if max_qty is not None and quantity > max_qty:
+        errors.append(f"Quantité {quantity:.8f} > maxQty requis {max_qty:.8f}")
 
-    if step_size_qty_filter_float is not None and step_size_qty_filter_float > 1e-12:
-        step_size_decimal = Decimal(str(step_size_qty_filter_float))
-        remainder = quantity_decimal % step_size_decimal
-        if not (remainder.is_zero() or remainder < DECIMAL_COMPARISON_EPSILON or abs(remainder - step_size_decimal) < DECIMAL_COMPARISON_EPSILON):
-            errors.append(f"Quantité {quantity_decimal} ne respecte pas stepSize {step_size_decimal} (Reste: {remainder}).")
+    if order_type.upper() not in ["MARKET"]: 
+        min_price = get_filter_value(symbol_info, 'PRICE_FILTER', 'minPrice')
+        if min_price is not None and price < min_price:
+            errors.append(f"Prix {price:.8f} < minPrice requis {min_price:.8f}")
+        
+        max_price = get_filter_value(symbol_info, 'PRICE_FILTER', 'maxPrice')
+        if max_price is not None and price > max_price:
+            errors.append(f"Prix {price:.8f} > maxPrice requis {max_price:.8f}")
 
-    order_type = str(order_params.get('type', "LIMIT")).upper()
-    price_input = order_params.get('price')
-    price_decimal: Optional[Decimal] = None
+    notional_value = calculate_notional_value(quantity, price)
+    min_notional_val: Optional[float] = None
+    notional_filter_type_used = ""
 
-    if order_type != "MARKET" and price_input is not None:
-        try:
-            with decimal_localcontext(DECIMAL_CONTEXT_HIGH_PRECISION): 
-                price_decimal = Decimal(str(price_input))
-        except InvalidOperation:
-            errors.append(f"Prix '{price_input}' n'est pas un nombre valide.")
-            price_decimal = None 
+    notional_filter_details = next((f for f in symbol_info.get('filters', []) if f.get('filterType') == 'NOTIONAL'), None)
+    min_notional_filter_details = next((f for f in symbol_info.get('filters', []) if f.get('filterType') == 'MIN_NOTIONAL'), None)
 
-        if price_decimal is not None: 
-            if price_decimal.is_nan() or price_decimal.is_infinite() or price_decimal <= Decimal(0):
-                errors.append(f"Prix '{price_decimal}' invalide. Doit être positif et fini.")
-            else:
-                min_price_filter_float = get_filter_value(symbol_info, 'PRICE_FILTER', 'minPrice')
-                max_price_filter_float = get_filter_value(symbol_info, 'PRICE_FILTER', 'maxPrice')
-                tick_size_price_filter_float = get_filter_value(symbol_info, 'PRICE_FILTER', 'tickSize')
+    if order_type.upper() == "MARKET":
+        if notional_filter_details and notional_filter_details.get('applyMinToMarket', False):
+            min_notional_val = get_filter_value(symbol_info, 'NOTIONAL', 'minNotional')
+            if min_notional_val is not None: notional_filter_type_used = "NOTIONAL (applyMinToMarket)"
+        elif notional_filter_details:
+             logger.debug(f"{log_prefix} Filtre NOTIONAL trouvé mais applyMinToMarket n'est pas true.")
+        
+        if min_notional_val is None and min_notional_filter_details: # Fallback rare si MIN_NOTIONAL s'applique aussi aux market
+            min_notional_val = get_filter_value(symbol_info, 'MIN_NOTIONAL', 'minNotional')
+            if min_notional_val is not None: notional_filter_type_used = "MIN_NOTIONAL (fallback pour MARKET)"
+    else: 
+        if min_notional_filter_details:
+            min_notional_val = get_filter_value(symbol_info, 'MIN_NOTIONAL', 'minNotional')
+            if min_notional_val is not None: notional_filter_type_used = "MIN_NOTIONAL"
+        
+        if min_notional_val is None and notional_filter_details: # Fallback sur NOTIONAL pour les ordres non-MARKET
+            min_notional_val = get_filter_value(symbol_info, 'NOTIONAL', 'minNotional')
+            if min_notional_val is not None: notional_filter_type_used = "NOTIONAL (fallback pour non-MARKET)"
 
-                if min_price_filter_float is not None:
-                    min_price_decimal = Decimal(str(min_price_filter_float))
-                    if price_decimal < (min_price_decimal - DECIMAL_COMPARISON_EPSILON):
-                        errors.append(f"Prix {price_decimal} < minPrice requis {min_price_decimal}.")
-                
-                if max_price_filter_float is not None and max_price_filter_float > 0: 
-                    max_price_decimal = Decimal(str(max_price_filter_float))
-                    if price_decimal > (max_price_decimal + DECIMAL_COMPARISON_EPSILON):
-                        errors.append(f"Prix {price_decimal} > maxPrice requis {max_price_decimal}.")
-                
-                if tick_size_price_filter_float is not None and tick_size_price_filter_float > 1e-12:
-                    tick_size_decimal = Decimal(str(tick_size_price_filter_float))
-                    remainder_price = price_decimal % tick_size_decimal
-                    if not (remainder_price.is_zero() or remainder_price < DECIMAL_COMPARISON_EPSILON or abs(remainder_price - tick_size_decimal) < DECIMAL_COMPARISON_EPSILON):
-                        errors.append(f"Prix {price_decimal} ne respecte pas tickSize {tick_size_decimal} (Reste: {remainder_price}).")
-
-    price_for_notional_check_float: Optional[float] = None
-    if order_type == "MARKET":
-        price_for_notional_check_float = estimated_market_price_for_market_order
-        if price_for_notional_check_float is None:
-            logger.debug(f"{log_prefix} Prix de marché estimé non fourni pour ordre MARKET. Validation MIN_NOTIONAL/NOTIONAL sautée/imprécise.")
-    elif price_decimal is not None and price_decimal.is_finite() and price_decimal > Decimal(0): 
-        price_for_notional_check_float = float(price_decimal)
-
-    if price_for_notional_check_float is not None:
-        # Assurer que quantity_decimal est défini avant d'appeler validate_notional
-        if 'quantity_decimal' in locals() and quantity_decimal is not None:
-            if not validate_notional(quantity_decimal, Decimal(str(price_for_notional_check_float)), symbol_info, log_sym):
-                min_notional_report_float = get_filter_value(symbol_info, 'MIN_NOTIONAL', 'minNotional') or \
-                                            get_filter_value(symbol_info, 'NOTIONAL', 'minNotional')
-                current_notional_val = float(quantity_decimal.copy_abs() * Decimal(str(price_for_notional_check_float)).copy_abs())
-                errors.append(f"Valeur notionnelle ({current_notional_val:.4f}) "
-                              f"< MIN_NOTIONAL/NOTIONAL requis ({min_notional_report_float if min_notional_report_float is not None else 'N/A'}).")
-        else:
-            # Ce cas ne devrait pas se produire si la logique précédente est correcte.
-            logger.error(f"{log_prefix} quantity_decimal non défini avant l'appel à validate_notional.")
-
+    if min_notional_val is not None and notional_value < min_notional_val:
+        errors.append(f"Valeur notionnelle {notional_value:.2f} < {notional_filter_type_used} requis {min_notional_val:.2f}")
 
     if errors:
         logger.warning(f"{log_prefix} Échecs de validation de l'ordre : {'; '.join(errors)}")
     else:
-        logger.debug(f"{log_prefix} Validation de l'ordre réussie.")
-    return errors
+        logger.debug(f"{log_prefix} Validation des filtres d'ordre réussie pour Qty:{quantity}, Px:{price}.")
+        
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors
+    }

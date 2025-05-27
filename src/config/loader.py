@@ -12,7 +12,8 @@ import dataclasses # Pour fields, is_dataclass
 from typing import Dict, Optional, Any, List, Union, Type, Tuple, get_origin, get_args, cast 
 from pathlib import Path
 from dotenv import load_dotenv
-
+from decimal import Decimal # <--- AJOUT DE L'IMPORT DECIMAL ICI
+import math
 # Tentative d'importation des définitions de dataclasses
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:

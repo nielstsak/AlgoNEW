@@ -9,11 +9,13 @@ import logging
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
-import pandas as pd
-import pandas_ta as ta # Pour le calcul de la pente (slope)
+import pandas as pd # Assurer l'import pour Pylance
+import pandas_ta as ta # Assurer l'import pour Pylance
 
 from src.strategies.base import BaseStrategy
-from src.data.data_utils import get_kline_prefix_effective # Import pour déterminer les colonnes sources
+from src.data.data_utils import get_kline_prefix_effective 
+from src.utils.exchange_utils import adjust_precision, get_filter_value
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,16 @@ class TripleMAAnticipationStrategy(BaseStrategy):
     ]
 
     def __init__(self, strategy_name: str, symbol: str, params: Dict[str, Any]):
+        self.anticipate_crossovers_enabled: bool = bool(params.get('anticipate_crossovers', False))
+        self.slope_ma_short_col_strat: Optional[str] = None
+        self.slope_ma_medium_col_strat: Optional[str] = None
+        self.anticipation_slope_period_val: Optional[int] = None
+        self.anticipation_convergence_threshold_pct_val: Optional[float] = None
+
+        if self.anticipate_crossovers_enabled:
+            self.slope_ma_short_col_strat = "SLOPE_MA_SHORT_strat"
+            self.slope_ma_medium_col_strat = "SLOPE_MA_MEDIUM_strat"
+
         super().__init__(strategy_name, symbol, params)
 
         self.ma_short_col_strat: str = "MA_SHORT_strat"
@@ -44,37 +56,31 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         self.ma_long_col_strat: str = "MA_LONG_strat"
         self.atr_col_strat: str = "ATR_strat"
 
-        # Ces attributs seront correctement initialisés après l'appel à _validate_params
-        self.anticipate_crossovers_enabled: bool = False
-        self.slope_ma_short_col_strat: Optional[str] = None
-        self.slope_ma_medium_col_strat: Optional[str] = None
-        self.anticipation_slope_period_val: Optional[int] = None
-        self.anticipation_convergence_threshold_pct_val: Optional[float] = None
-        
-        # _validate_params est appelé par le __init__ de BaseStrategy,
-        # donc les attributs ci-dessus seront mis à jour si anticipate_crossovers est True.
 
     def _validate_params(self) -> None:
         """Valide les paramètres spécifiques à TripleMAAnticipationStrategy."""
-        # Déterminer si l'anticipation est activée pour ajuster les paramètres requis
-        self.anticipate_crossovers_enabled = bool(self.get_param('anticipate_crossovers', False))
-
-        current_required = self.REQUIRED_PARAMS[:] # Copie pour modification locale
+        current_required_params = self.REQUIRED_PARAMS[:] 
         if self.anticipate_crossovers_enabled:
-            if 'anticipation_slope_period' not in current_required:
-                current_required.append('anticipation_slope_period')
-            if 'anticipation_convergence_threshold_pct' not in current_required:
-                current_required.append('anticipation_convergence_threshold_pct')
+            if 'anticipation_slope_period' not in current_required_params:
+                current_required_params.append('anticipation_slope_period')
+            if 'anticipation_convergence_threshold_pct' not in current_required_params:
+                current_required_params.append('anticipation_convergence_threshold_pct')
 
-        missing_params = [p for p in current_required if self.get_param(p) is None]
-        if missing_params:
+        # Sourcery: Use named expression (walrus operator)
+        if missing_params := [
+            p for p in current_required_params if self.get_param(p) is None
+        ]:
             raise ValueError(f"{self.log_prefix} Paramètres requis manquants : {', '.join(missing_params)}")
 
         ma_s = self.get_param('ma_short_period')
         ma_m = self.get_param('ma_medium_period')
         ma_l = self.get_param('ma_long_period')
-        if not (isinstance(ma_s, int) and ma_s > 0 and isinstance(ma_m, int) and ma_m > 0 and isinstance(ma_l, int) and ma_l > 0):
-            raise ValueError(f"{self.log_prefix} Les périodes MA (short, medium, long) doivent être des entiers positifs.")
+
+        if not (isinstance(ma_s, int) and ma_s > 0 and \
+                isinstance(ma_m, int) and ma_m > 0 and \
+                isinstance(ma_l, int) and ma_l > 0):
+            raise ValueError(f"{self.log_prefix} Les périodes MA (short, medium, long) doivent être des entiers positifs. "
+                             f"Reçu: S={ma_s}, M={ma_m}, L={ma_l}")
         if not (ma_s < ma_m < ma_l):
             raise ValueError(f"{self.log_prefix} Les périodes MA doivent être en ordre croissant : short ({ma_s}) < medium ({ma_m}) < long ({ma_l}).")
 
@@ -84,37 +90,33 @@ class TripleMAAnticipationStrategy(BaseStrategy):
             raise ValueError(f"{self.log_prefix} 'ma_type' ({ma_type_val}) invalide. Supportés : {supported_ma_types}")
 
         if self.anticipate_crossovers_enabled:
-            self.slope_ma_short_col_strat = "SLOPE_MA_SHORT_strat" # Définir les noms de colonnes ici
-            self.slope_ma_medium_col_strat = "SLOPE_MA_MEDIUM_strat"
-
             slope_p = self.get_param('anticipation_slope_period')
             conv_thresh = self.get_param('anticipation_convergence_threshold_pct')
-            if not (isinstance(slope_p, int) and slope_p >= 2): # pandas_ta.slope requiert length >= 2
+            if not (isinstance(slope_p, int) and slope_p >= 2): 
                 raise ValueError(f"{self.log_prefix} 'anticipation_slope_period' ({slope_p}) doit être un entier >= 2 si l'anticipation est activée.")
-            if not (isinstance(conv_thresh, (int, float)) and 0 < conv_thresh < 1): # Généralement un petit pourcentage
-                raise ValueError(f"{self.log_prefix} 'anticipation_convergence_threshold_pct' ({conv_thresh}) doit être un float entre 0 (exclusif) et 1 (exclusif) si l'anticipation est activée.")
-            self.anticipation_slope_period_val = slope_p
-            self.anticipation_convergence_threshold_pct_val = float(conv_thresh)
-        else: # S'assurer que les attributs liés à l'anticipation sont None si désactivée
-            self.slope_ma_short_col_strat = None
+            if not (isinstance(conv_thresh, (int, float)) and 0 < conv_thresh < 1): 
+                raise ValueError(f"{self.log_prefix} 'anticipation_convergence_threshold_pct' ({conv_thresh}) doit être un float > 0 et < 1 si l'anticipation est activée.")
+            self.anticipation_slope_period_val = slope_p 
+            self.anticipation_convergence_threshold_pct_val = float(conv_thresh) 
+        else: 
+            self.slope_ma_short_col_strat = None 
             self.slope_ma_medium_col_strat = None
             self.anticipation_slope_period_val = None
             self.anticipation_convergence_threshold_pct_val = None
 
-
         atr_p = self.get_param('atr_period_sl_tp')
         if not (isinstance(atr_p, int) and atr_p > 0):
-            raise ValueError(f"{self.log_prefix} 'atr_period_sl_tp' doit être un entier positif.")
+            raise ValueError(f"{self.log_prefix} 'atr_period_sl_tp' ({atr_p}) doit être un entier positif.")
         sl_mult = self.get_param('sl_atr_mult')
         tp_mult = self.get_param('tp_atr_mult')
         if not (isinstance(sl_mult, (int, float)) and sl_mult > 0):
-            raise ValueError(f"{self.log_prefix} 'sl_atr_mult' doit être un nombre positif.")
+            raise ValueError(f"{self.log_prefix} 'sl_atr_mult' ({sl_mult}) doit être un nombre positif.")
         if not (isinstance(tp_mult, (int, float)) and tp_mult > 0):
-            raise ValueError(f"{self.log_prefix} 'tp_atr_mult' doit être un nombre positif.")
+            raise ValueError(f"{self.log_prefix} 'tp_atr_mult' ({tp_mult}) doit être un nombre positif.")
 
         cap_alloc = self.get_param('capital_allocation_pct')
         if not (isinstance(cap_alloc, (int, float)) and 0 < cap_alloc <= 1.0):
-            raise ValueError(f"{self.log_prefix} 'capital_allocation_pct' doit être entre 0 (exclusif) et 1 (inclusif).")
+            raise ValueError(f"{self.log_prefix} 'capital_allocation_pct' ({cap_alloc}) doit être entre 0 (exclusif) et 1 (inclusif).")
         
         margin_lev = self.get_param('margin_leverage')
         if not (isinstance(margin_lev, (int, float)) and margin_lev >= 1.0):
@@ -122,14 +124,17 @@ class TripleMAAnticipationStrategy(BaseStrategy):
 
         order_type_pref_val = self.get_param('order_type_preference')
         if order_type_pref_val not in ["MARKET", "LIMIT"]:
-            raise ValueError(f"{self.log_prefix} 'order_type_preference' doit être 'MARKET' ou 'LIMIT'.")
+            raise ValueError(f"{self.log_prefix} 'order_type_preference' ({order_type_pref_val}) doit être 'MARKET' ou 'LIMIT'.")
+
+        if not isinstance(self.get_param('allow_shorting'), bool):
+            raise ValueError(f"{self.log_prefix} 'allow_shorting' ({self.get_param('allow_shorting')}) doit être un booléen (true/false).")
 
         for freq_param_name in ['indicateur_frequence_mms', 'indicateur_frequence_mmm', 'indicateur_frequence_mml', 'atr_base_frequency_sl_tp']:
             freq_val = self.get_param(freq_param_name)
             if not isinstance(freq_val, str) or not freq_val.strip():
-                raise ValueError(f"{self.log_prefix} Paramètre de fréquence '{freq_param_name}' doit être une chaîne non vide.")
+                raise ValueError(f"{self.log_prefix} Paramètre de fréquence '{freq_param_name}' ({freq_val}) doit être une chaîne de caractères non vide.")
         
-        logger.debug(f"{self.log_prefix} Validation des paramètres terminée avec succès. Anticipation activée: {self.anticipate_crossovers_enabled}")
+        logger.debug(f"{self.log_prefix} Validation des paramètres terminée. Anticipation activée: {self.anticipate_crossovers_enabled}")
 
 
     def get_required_indicator_configs(self) -> List[Dict[str, Any]]:
@@ -187,90 +192,77 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         return configs
 
     def _calculate_indicators(self, data_feed: pd.DataFrame) -> pd.DataFrame:
-        """
-        Vérifie la présence des colonnes MA et ATR (fournies par IndicatorCalculator),
-        calcule les pentes des MAs si l'anticipation est activée, et applique ffill.
-        """
         df = data_feed.copy()
         
         expected_base_strat_cols = [
             self.ma_short_col_strat, self.ma_medium_col_strat,
             self.ma_long_col_strat, self.atr_col_strat
         ]
-        all_expected_cols = expected_base_strat_cols[:] # Copie pour ajouter les pentes si besoin
-
-        # Si l'anticipation est activée, les colonnes de pente sont aussi attendues (ou seront créées)
+        all_final_expected_strat_cols = expected_base_strat_cols[:] 
         if self.anticipate_crossovers_enabled:
-            if self.slope_ma_short_col_strat: all_expected_cols.append(self.slope_ma_short_col_strat)
-            if self.slope_ma_medium_col_strat: all_expected_cols.append(self.slope_ma_medium_col_strat)
+            if self.slope_ma_short_col_strat: all_final_expected_strat_cols.append(self.slope_ma_short_col_strat)
+            if self.slope_ma_medium_col_strat: all_final_expected_strat_cols.append(self.slope_ma_medium_col_strat)
 
-        # Vérifier les colonnes OHLCV de base
         base_ohlcv = ['open', 'high', 'low', 'close', 'volume']
-        missing_ohlcv = [col for col in base_ohlcv if col not in df.columns]
-        if missing_ohlcv:
-            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}."
+        # Sourcery: Use named expression (walrus operator)
+        if missing_ohlcv := [col for col in base_ohlcv if col not in df.columns]:
+            msg = f"{self.log_prefix} Colonnes OHLCV de base manquantes dans data_feed: {missing_ohlcv}. Essentielles."
             logger.critical(msg)
             raise ValueError(msg)
 
-        # Vérifier les colonnes d'indicateurs de base (MAs, ATR)
-        missing_strat_cols = []
-        for col_name in expected_base_strat_cols: # Seulement les MAs et ATR ici
-            if col_name not in df.columns:
-                logger.warning(f"{self.log_prefix} Colonne indicateur de base attendue '{col_name}' manquante. "
-                               "Elle sera ajoutée avec NaN, indiquant un problème en amont (IndicatorCalculator).")
+        # Sourcery: Use named expression (walrus operator)
+        if missing_initial_strat_cols := [
+            col_name
+            for col_name in expected_base_strat_cols
+            if col_name not in df.columns
+        ]:
+            for col_name in missing_initial_strat_cols:
+                logger.warning(f"{self.log_prefix} Colonne indicateur de base attendue '{col_name}' manquante. Ajout avec NaN.")
                 df[col_name] = np.nan
-                missing_strat_cols.append(col_name)
         
-        # Calculer les pentes si l'anticipation est activée et que les MAs sont présentes
         if self.anticipate_crossovers_enabled and self.slope_ma_short_col_strat and self.slope_ma_medium_col_strat and self.anticipation_slope_period_val:
             slope_period = self.anticipation_slope_period_val 
 
-            if self.ma_short_col_strat in df.columns and df[self.ma_short_col_strat].notna().any():
-                ma_short_clean = df[self.ma_short_col_strat].dropna()
-                if len(ma_short_clean) >= slope_period:
-                    slope_short_series = ta.slope(ma_short_clean.copy(), length=slope_period, append=False) # type: ignore
-                    df[self.slope_ma_short_col_strat] = slope_short_series.reindex(df.index)
-                    logger.debug(f"{self.log_prefix} Pente MA courte calculée.")
-                else:
-                    logger.warning(f"{self.log_prefix} Pas assez de points de données non-NaN ({len(ma_short_clean)}) pour MA courte pour calculer la pente de période {slope_period}. {self.slope_ma_short_col_strat} sera NaN.")
-                    df[self.slope_ma_short_col_strat] = np.nan
-            else: # ma_short_col_strat n'est pas dans df ou est entièrement NaN
-                logger.warning(f"{self.log_prefix} Colonne {self.ma_short_col_strat} manquante ou entièrement NaN. Impossible de calculer sa pente. {self.slope_ma_short_col_strat} sera NaN.")
-                df[self.slope_ma_short_col_strat] = np.nan
-
-            if self.ma_medium_col_strat in df.columns and df[self.ma_medium_col_strat].notna().any():
-                ma_medium_clean = df[self.ma_medium_col_strat].dropna()
-                if len(ma_medium_clean) >= slope_period:
-                    slope_medium_series = ta.slope(ma_medium_clean.copy(), length=slope_period, append=False) # type: ignore
-                    df[self.slope_ma_medium_col_strat] = slope_medium_series.reindex(df.index)
-                    logger.debug(f"{self.log_prefix} Pente MA moyenne calculée.")
-                else:
-                    logger.warning(f"{self.log_prefix} Pas assez de points de données non-NaN ({len(ma_medium_clean)}) pour MA moyenne pour calculer la pente de période {slope_period}. {self.slope_ma_medium_col_strat} sera NaN.")
-                    df[self.slope_ma_medium_col_strat] = np.nan
-            else: # ma_medium_col_strat n'est pas dans df ou est entièrement NaN
-                logger.warning(f"{self.log_prefix} Colonne {self.ma_medium_col_strat} manquante ou entièrement NaN. Impossible de calculer sa pente. {self.slope_ma_medium_col_strat} sera NaN.")
-                df[self.slope_ma_medium_col_strat] = np.nan
+            for ma_col_name, slope_col_name, ma_name_log in [
+                (self.ma_short_col_strat, self.slope_ma_short_col_strat, "courte"),
+                (self.ma_medium_col_strat, self.slope_ma_medium_col_strat, "moyenne")
+            ]:
+                if ma_col_name in df.columns and df[ma_col_name].notna().any():
+                    ma_series_clean = df[ma_col_name].dropna()
+                    if len(ma_series_clean) >= slope_period:
+                        slope_series = ta.slope(ma_series_clean.copy(), length=slope_period, append=False) # type: ignore
+                        df[slope_col_name] = slope_series.reindex(df.index) 
+                        logger.debug(f"{self.log_prefix} Pente MA {ma_name_log} calculée et assignée à '{slope_col_name}'.")
+                    else:
+                        logger.warning(f"{self.log_prefix} Pas assez de points de données non-NaN ({len(ma_series_clean)}) pour MA {ma_name_log} "
+                                       f"pour calculer la pente de période {slope_period}. '{slope_col_name}' sera NaN.")
+                        df[slope_col_name] = np.nan
+                else: 
+                    logger.warning(f"{self.log_prefix} Colonne MA {ma_name_log} ('{ma_col_name}') manquante ou entièrement NaN. "
+                                   f"Impossible de calculer sa pente. '{slope_col_name}' sera NaN.")
+                    df[slope_col_name] = np.nan
         
-        # Vérifier si des colonnes _strat (y compris pentes) sont encore manquantes après calculs
-        # et les initialiser à NaN si c'est le cas.
-        final_missing_strat_cols = []
-        for col_name_final_check in all_expected_cols:
-            if col_name_final_check not in df.columns:
-                 logger.warning(f"{self.log_prefix} Colonne _strat finale attendue '{col_name_final_check}' toujours manquante. Ajout avec NaN.")
-                 df[col_name_final_check] = np.nan
-                 final_missing_strat_cols.append(col_name_final_check)
+        # Sourcery: Use named expression (walrus operator)
+        if final_missing_strat_cols_after_calc := [
+            col_final_check
+            for col_final_check in all_final_expected_strat_cols
+            if col_final_check not in df.columns
+        ]:
+            for col_final_check in final_missing_strat_cols_after_calc:
+                 logger.warning(f"{self.log_prefix} Colonne _strat finale attendue '{col_final_check}' toujours manquante après calculs. Ajout avec NaN.")
+                 df[col_final_check] = np.nan
 
-        if missing_strat_cols or final_missing_strat_cols: # Si des colonnes _strat de base ou des pentes ont été ajoutées
-             logger.debug(f"{self.log_prefix} Après vérification/calcul _calculate_indicators, "
-                          f"colonnes _strat manquantes initialement: {missing_strat_cols}, "
-                          f"colonnes _strat encore manquantes après calculs (pentes): {final_missing_strat_cols}. "
-                          f"Colonnes actuelles: {df.columns.tolist()}")
+        if missing_initial_strat_cols or final_missing_strat_cols_after_calc: # Check if either list has content
+             logger.debug(f"{self.log_prefix} Après vérification/calcul dans _calculate_indicators: "
+                          f"Colonnes _strat de base manquantes initialement: {missing_initial_strat_cols or 'Aucune'}, "
+                          f"Colonnes _strat (pentes) encore manquantes après calculs: {final_missing_strat_cols_after_calc or 'Aucune'}. "
+                          f"Colonnes actuelles dans df: {df.columns.tolist()}")
 
-        # Appliquer ffill à toutes les colonnes _strat présentes
-        cols_to_ffill_present = [col for col in all_expected_cols if col in df.columns]
-        if cols_to_ffill_present:
-            df[cols_to_ffill_present] = df[cols_to_ffill_present].ffill()
-            logger.debug(f"{self.log_prefix} ffill appliqué aux colonnes _strat présentes : {cols_to_ffill_present}")
+        cols_to_ffill_present_in_df = [col for col in all_final_expected_strat_cols if col in df.columns]
+        # Sourcery: Remove redundant conditional
+        if cols_to_ffill_present_in_df:
+            df[cols_to_ffill_present_in_df] = df[cols_to_ffill_present_in_df].ffill()
+            # Le log de ffill a été commenté/supprimé pour réduire la verbosité
         
         return df
 
@@ -280,7 +272,7 @@ class TripleMAAnticipationStrategy(BaseStrategy):
                           current_position_direction: int,
                           current_entry_price: float
                          ) -> Tuple[int, Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
-        signal_type: int = 0
+        signal_type: int = 0 
         limit_price: Optional[float] = None
         sl_price: Optional[float] = None
         tp_price: Optional[float] = None
@@ -301,22 +293,25 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         close_price_curr = latest_row.get('close')
         atr_value_curr = latest_row.get(self.atr_col_strat)
 
-        essential_values = [ma_s_curr, ma_m_curr, ma_l_curr, ma_s_prev, ma_m_prev, close_price_curr, atr_value_curr]
+        essential_values_check = [ma_s_curr, ma_m_curr, ma_l_curr, ma_s_prev, ma_m_prev, close_price_curr, atr_value_curr]
         
         slope_s_curr: Optional[float] = None
         slope_m_curr: Optional[float] = None
-        if self.anticipate_crossovers_enabled: # Utiliser l'attribut de classe
+        if self.anticipate_crossovers_enabled:
             if self.slope_ma_short_col_strat and self.slope_ma_medium_col_strat:
                 slope_s_curr = latest_row.get(self.slope_ma_short_col_strat)
                 slope_m_curr = latest_row.get(self.slope_ma_medium_col_strat)
-                essential_values.extend([slope_s_curr, slope_m_curr])
-            else: # Si les colonnes de pente ne sont pas définies, l'anticipation ne peut pas fonctionner
-                logger.warning(f"{self.log_prefix} Anticipation activée mais noms de colonnes de pente non définis. "
-                               "Anticipation désactivée pour ce signal.")
-                # Pas besoin de modifier self.anticipate_crossovers_enabled ici, juste ne pas utiliser les pentes.
+                essential_values_check.extend([slope_s_curr, slope_m_curr])
+            else: 
+                logger.warning(f"{self.log_prefix} Anticipation activée mais noms de colonnes de pente non définis. Désactivation pour ce signal.")
 
-        if any(pd.isna(val) for val in essential_values):
-            nan_details = {k:v for k,v in locals().items() if k in ['ma_s_curr', 'ma_m_curr', 'ma_l_curr', 'slope_s_curr', 'slope_m_curr', 'close_price_curr', 'atr_value_curr']}
+        if any(pd.isna(val) for val in essential_values_check):
+            nan_details = {
+                "ma_s_c": ma_s_curr, "ma_m_c": ma_m_curr, "ma_l_c": ma_l_curr,
+                "ma_s_p": ma_s_prev, "ma_m_p": ma_m_prev,
+                "close_c": close_price_curr, "atr_c": atr_value_curr,
+                "slope_s_c": slope_s_curr, "slope_m_c": slope_m_curr 
+            }
             logger.debug(f"{self.log_prefix} Valeurs d'indicateur/prix manquantes (NaN) à {latest_row.name}. Détails: {nan_details}. Signal HOLD.")
             return 0, self.get_param("order_type_preference"), None, None, None, self.get_param('capital_allocation_pct')
 
@@ -335,15 +330,17 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         anticipated_short_entry = False
         anticipated_short_exit = False
 
-        if self.anticipate_crossovers_enabled and pd.notna(slope_s_curr) and pd.notna(slope_m_curr) and self.anticipation_convergence_threshold_pct_val is not None:
+        if self.anticipate_crossovers_enabled and pd.notna(slope_s_curr) and pd.notna(slope_m_curr) and \
+           self.anticipation_convergence_threshold_pct_val is not None:
+            
             conv_thresh_pct = self.anticipation_convergence_threshold_pct_val
             convergence_distance = ma_m_curr * conv_thresh_pct # type: ignore
             ma_diff_abs = abs(ma_s_curr - ma_m_curr) # type: ignore
 
-            is_converging_up = slope_s_curr > slope_m_curr # type: ignore 
-            is_below_and_closing_for_long = (ma_s_curr < ma_m_curr) and (ma_diff_abs < convergence_distance) # type: ignore
-            main_trend_bullish_for_anticip = ma_m_curr > ma_l_curr # type: ignore 
-            anticipated_long_entry = is_converging_up and is_below_and_closing_for_long and main_trend_bullish_for_anticip
+            is_converging_up_for_long = slope_s_curr > slope_m_curr # type: ignore 
+            is_below_and_closing_for_long = (ma_s_curr < ma_m_curr) and (ma_diff_abs < convergence_distance) # type: ignore 
+            main_trend_bullish_for_anticip_long = ma_m_curr > ma_l_curr # type: ignore 
+            anticipated_long_entry = is_converging_up_for_long and is_below_and_closing_for_long and main_trend_bullish_for_anticip_long
 
             is_converging_down_for_exit_long = slope_s_curr < slope_m_curr # type: ignore
             is_above_and_closing_for_long_exit = (ma_s_curr > ma_m_curr) and (ma_diff_abs < convergence_distance) # type: ignore
@@ -352,8 +349,8 @@ class TripleMAAnticipationStrategy(BaseStrategy):
             if allow_shorting_param:
                 is_converging_down_for_entry_short = slope_s_curr < slope_m_curr # type: ignore
                 is_above_and_closing_for_short_entry = (ma_s_curr > ma_m_curr) and (ma_diff_abs < convergence_distance) # type: ignore
-                main_trend_bearish_for_anticip = ma_m_curr < ma_l_curr # type: ignore
-                anticipated_short_entry = is_converging_down_for_entry_short and is_above_and_closing_for_short_entry and main_trend_bearish_for_anticip
+                main_trend_bearish_for_anticip_short = ma_m_curr < ma_l_curr # type: ignore
+                anticipated_short_entry = is_converging_down_for_entry_short and is_above_and_closing_for_short_entry and main_trend_bearish_for_anticip_short
                 
                 is_converging_up_for_exit_short = slope_s_curr > slope_m_curr # type: ignore
                 is_below_and_closing_for_short_exit = (ma_s_curr < ma_m_curr) and (ma_diff_abs < convergence_distance) # type: ignore
@@ -371,30 +368,40 @@ class TripleMAAnticipationStrategy(BaseStrategy):
         sl_atr_mult = float(self.get_param('sl_atr_mult'))
         tp_atr_mult = float(self.get_param('tp_atr_mult'))
 
-        if not current_position_open:
-            if final_entry_long:
-                signal_type = 1
-                if atr_value_curr > 0: # type: ignore
-                    sl_price = close_price_curr - (atr_value_curr * sl_atr_mult) # type: ignore
-                    tp_price = close_price_curr + (atr_value_curr * tp_atr_mult) # type: ignore
-                logger.info(f"{self.log_prefix} Signal BUY @ {close_price_curr:.4f}. SL={sl_price}, TP={tp_price}. Anticipated: {anticipated_long_entry}")
-            elif final_entry_short: 
-                signal_type = -1
-                if atr_value_curr > 0: # type: ignore
-                    sl_price = close_price_curr + (atr_value_curr * sl_atr_mult) # type: ignore
-                    tp_price = close_price_curr - (atr_value_curr * tp_atr_mult) # type: ignore
-                logger.info(f"{self.log_prefix} Signal SELL @ {close_price_curr:.4f}. SL={sl_price}, TP={tp_price}. Anticipated: {anticipated_short_entry}")
-        else: 
+        # Sourcery: Move assignments closer to their usage, Swap if/else branches, Merge else clause's nested if statement into elif
+        if current_position_open:
             if current_position_direction == 1 and final_exit_long:
-                signal_type = 2 
-                logger.info(f"{self.log_prefix} Signal EXIT LONG @ {close_price_curr:.4f}. Anticipated: {anticipated_long_exit}")
-            elif current_position_direction == -1 and final_exit_short: 
-                signal_type = 2 
-                logger.info(f"{self.log_prefix} Signal EXIT SHORT @ {close_price_curr:.4f}. Anticipated: {anticipated_short_exit}")
-
+                signal_type = 2
+                logger.info(f"{self.log_prefix} Signal EXIT LONG @ {close_price_curr:.4f}. "
+                            f"(Croisement réel: {actual_long_exit_cross}, Anticipé: {anticipated_long_exit})")
+            elif current_position_direction == -1 and final_exit_short:
+                signal_type = 2
+                logger.info(f"{self.log_prefix} Signal EXIT SHORT @ {close_price_curr:.4f}. "
+                            f"(Croisement réel: {actual_short_exit_cross}, Anticipé: {anticipated_short_exit})")
+            else:
+                logger.debug(
+                    f"{self.log_prefix} Position ouverte ({'LONG' if current_position_direction == 1 else 'SHORT'}). Aucun signal de sortie actif. Attente SL/TP."
+                )
+        elif final_entry_long:
+            signal_type = 1
+            if atr_value_curr > 0: # type: ignore
+                sl_price = close_price_curr - (atr_value_curr * sl_atr_mult) # type: ignore
+                tp_price = close_price_curr + (atr_value_curr * tp_atr_mult) # type: ignore
+            # Sourcery: Replace if-expression with `or`
+            logger.info(f"{self.log_prefix} Signal BUY @ {close_price_curr:.4f}. SL={sl_price}, TP={tp_price or 'N/A'}. "
+                        f"(Croisement réel: {actual_long_entry_cross}, Anticipé: {anticipated_long_entry})")
+        elif final_entry_short:
+            signal_type = -1
+            if atr_value_curr > 0: # type: ignore
+                sl_price = close_price_curr + (atr_value_curr * sl_atr_mult) # type: ignore
+                tp_price = close_price_curr - (atr_value_curr * tp_atr_mult) # type: ignore
+            # Sourcery: Replace if-expression with `or`
+            logger.info(f"{self.log_prefix} Signal SELL (SHORT) @ {close_price_curr:.4f}. SL={sl_price}, TP={tp_price or 'N/A'}. "
+                        f"(Croisement réel: {actual_short_entry_cross}, Anticipé: {anticipated_short_entry})")
+        
         order_type_preference = str(self.get_param("order_type_preference", "MARKET"))
         if signal_type != 0 and order_type_preference == "LIMIT":
-            limit_price = float(close_price_curr)
+            limit_price = float(close_price_curr) # type: ignore
 
         position_size_pct = float(self.get_param('capital_allocation_pct', 1.0))
 
@@ -402,9 +409,9 @@ class TripleMAAnticipationStrategy(BaseStrategy):
 
     def generate_order_request(self,
                                data: pd.DataFrame,
-                               current_position: int,
-                               available_capital: float,
-                               symbol_info: Dict[str, Any]
+                               current_position: int, 
+                               available_capital: float, 
+                               symbol_info: Dict[str, Any] 
                                ) -> Optional[Tuple[Dict[str, Any], Dict[str, float]]]:
         if current_position != 0:
             logger.debug(f"{self.log_prefix} [Live] Position déjà ouverte (état: {current_position}). Pas de nouvelle requête d'ordre d'entrée.")
@@ -416,10 +423,10 @@ class TripleMAAnticipationStrategy(BaseStrategy):
             return None
 
         signal, order_type, limit_price_sugg, sl_price_raw, tp_price_raw, pos_size_pct = \
-            self._generate_signals(data_with_indicators, False, 0, 0.0)
+            self._generate_signals(data_with_indicators, False, 0, 0.0) 
 
         if signal not in [1, -1]: 
-            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée (1 ou -1) généré. Signal: {signal}")
+            logger.debug(f"{self.log_prefix} [Live] Aucun signal d'entrée (1 ou -1) généré. Signal actuel: {signal}")
             return None
         
         if signal == -1 and not bool(self.get_param('allow_shorting', False)):
@@ -427,29 +434,30 @@ class TripleMAAnticipationStrategy(BaseStrategy):
             return None
 
         latest_bar = data_with_indicators.iloc[-1]
-        entry_price_theoretical: float
-        if order_type == "LIMIT" and limit_price_sugg is not None:
-            entry_price_theoretical = limit_price_sugg
-        else:
-            entry_price_theoretical = float(latest_bar.get('close', 0.0))
-            if entry_price_theoretical <= 0: entry_price_theoretical = float(latest_bar.get('open', 0.0))
+        entry_price_theoretical: float = limit_price_sugg if order_type == "LIMIT" and limit_price_sugg is not None else float(latest_bar.get('close', 0.0))
+        
+        if entry_price_theoretical <= 0: 
+            entry_price_theoretical = float(latest_bar.get('open', 0.0))
         
         if pd.isna(entry_price_theoretical) or entry_price_theoretical <= 0:
-            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique invalide ({entry_price_theoretical}).")
+            logger.error(f"{self.log_prefix} [Live] Prix d'entrée théorique pour calcul de quantité invalide ({entry_price_theoretical}).")
             return None
 
         if self.quantity_precision is None or self.pair_config is None:
-            logger.error(f"{self.log_prefix} [Live] Contexte de backtest (précisions, pair_config) non défini.")
+            logger.error(f"{self.log_prefix} [Live] Contexte (précisions, pair_config) non défini via set_backtest_context.")
             return None
             
         quantity_base = self._calculate_quantity(
-            entry_price=entry_price_theoretical, available_capital=available_capital,
-            qty_precision=self.quantity_precision, symbol_info=self.pair_config,
-            symbol=self.symbol, position_size_pct=pos_size_pct
+            entry_price=entry_price_theoretical,
+            available_capital=available_capital,
+            qty_precision=self.quantity_precision,
+            symbol_info=self.pair_config,
+            symbol=self.symbol,
+            position_size_pct=pos_size_pct
         )
 
         if quantity_base is None or quantity_base <= 1e-9:
-            logger.warning(f"{self.log_prefix} [Live] Quantité calculée nulle ou invalide ({quantity_base}).")
+            logger.warning(f"{self.log_prefix} [Live] Quantité calculée nulle ou invalide ({quantity_base}). Pas d'ordre.")
             return None
 
         if self.price_precision is None:
@@ -458,9 +466,12 @@ class TripleMAAnticipationStrategy(BaseStrategy):
 
         entry_price_for_order_str: Optional[str] = None
         if order_type == "LIMIT" and limit_price_sugg is not None:
-            from src.utils.exchange_utils import adjust_precision, get_filter_value 
-            adjusted_limit_price = adjust_precision(limit_price_sugg, self.price_precision, tick_size=get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize'))
-            if adjusted_limit_price is None: return None
+            tick_size_price = get_filter_value(self.pair_config, 'PRICE_FILTER', 'tickSize')
+            # Sourcery: Use named expression (walrus operator)
+            if (adjusted_limit_price := adjust_precision(
+                limit_price_sugg, self.price_precision, tick_size=tick_size_price
+            )) is None: 
+                return None
             entry_price_for_order_str = f"{adjusted_limit_price:.{self.price_precision}f}"
         
         quantity_str_formatted = f"{quantity_base:.{self.quantity_precision}f}"
