@@ -9,7 +9,8 @@
     "results": "results",
     "data_live_raw": "data/live/raw",
     "data_live_processed": "data/live/processed",
-    "live_state": "data/live_state"
+    "live_state": "data/live_state",
+    "report_templates_dir": "src/reporting/templates"
   },
   "logging": {
     "level": "INFO",
@@ -20,7 +21,10 @@
     "log_levels_by_module": {
       "src.live": "DEBUG",
       "src.data": "INFO",
-      "src.live.manager": "DEBUG"
+      "src.live.manager": "DEBUG",
+      "src.backtesting": "INFO",
+      "src.utils.dependency_injector": "INFO",
+      "src.core.cache_manager": "INFO"
     }
   },
   "simulation_defaults": {
@@ -44,11 +48,25 @@
     "n_splits": 3,
     "oos_period_days": 20,
     "min_is_period_days": 100,
-    "fold_type": "expanding",
+    "fold_type": "expanding", 
     "metric_to_optimize": "Total Net PnL USDC",
     "optimization_direction": "maximize",
     "top_n_trials_for_oos_validation": 5,
-    "top_n_trials_to_report_oos": 2
+    "top_n_trials_to_report_oos": 2,
+    "overlap_ratio_is_oos": 0.0,
+    "purging_period_days": 1,
+    "embargo_period_days": 1,
+    "adaptive_volatility_window": 20,
+    "adaptive_volatility_column": "close", 
+    "adaptive_n_regimes_target": 3,
+    "combinatorial_n_combinations": 10,
+    "combinatorial_is_duration_days": 90,
+    "combinatorial_oos_duration_days": 30,
+    "combinatorial_min_gap_days": 5,
+    "combinatorial_random_seed": null,
+    "change_point_model": "l2",
+    "change_point_penalty": null, 
+    "change_point_series_column": "close"
   },
   "optuna_settings": {
     "n_trials": 50,
@@ -61,9 +79,12 @@
     "pareto_selection_pnl_threshold": 0.0,
     "default_profile_to_activate": "TPE_Median",
     "sampler_name": "TPESampler",
-    "sampler_params": {"seed": 42, "n_startup_trials": 10, "multivariate": true},
+    "sampler_params": {"seed": 42, "n_startup_trials": 10, "multivariate": true, "constant_liar": false},
     "pruner_name": "MedianPruner",
     "pruner_params": {"n_startup_trials": 5, "n_warmup_steps": 0, "interval_steps": 1},
+    "early_stopping_rounds": 20, 
+    "early_stopping_patience": 5, 
+    "early_stopping_delta_threshold": 0.001,
     "sampler_pruner_profiles": {
       "TPE_Median": {
         "description": "Tree-structured Parzen Estimator with Median Pruner. Good general purpose.",
@@ -94,5 +115,9 @@
         "pruner_params": {}
       }
     }
+  },
+  "exchange_settings": {
+    "exchange_name": "binance",
+    "exchange_info_file_path": "config/binance_exchange_info.json"
   }
 }

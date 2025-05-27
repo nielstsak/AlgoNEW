@@ -1,31 +1,29 @@
-# Core Data Science and Utilities
 pandas>=1.5.0
-numpy==1.23.5
-pandas-ta >=0.3.14b0
+numpy==1.23.5 # Maintenir la version spécifique si importante pour la compatibilité
+pandas-ta>=0.3.14b0
 python-dotenv>=1.0.0
-requests>=2.25.0 # For direct API calls if needed, and often a dependency of other libs
+requests>=2.25.0
+pyyaml>=6.0 # Pour le chargement de configuration YAML (optionnel mais recommandé)
+psutil>=5.9.0 # Pour le monitoring système (CacheManager, ParallelExecutor)
+tqdm>=4.60.0 # Pour les barres de progression (ParallelExecutor)
 
-# Binance API Interaction
-python-binance>=1.0.19 # Ensure this version or newer for modern API features
 
-# Optimization
-optuna>=3.0.0
+python-binance>=1.0.19
 
-# Configuration & Dataclasses (implicitly handled by Python >=3.7)
-# dataclasses; python_version>="3.7"
+optuna>=3.0.0 # Déjà présent
 
-# Data Serialization/Storage
-pyarrow>=7.0.0 # For Parquet file support with pandas
+pyarrow>=7.0.0 # Déjà présent, pour Parquet
 
-# Logging (Optional, if using advanced JSON logging)
-# python-json-logger>=2.0.0
+plotly>=5.0.0 # Déjà présent, pour Optuna visualizations
+matplotlib>=3.5.0 # Pour la visualisation des folds
+openpyxl>=3.0.0 # Pour l'export Excel avec Pandas/styling
+jinja2>=3.0.0 # Pour le templating des rapports
 
-# Plotting (Optional, for Optuna visualizations in reports)
-plotly>=5.0.0
+scikit-learn>=1.0.0 # Pour KMeans, IsolationForest, StandardScaler
+scipy>=1.7.0 # Pour scipy.stats (KS test, Jarque-Bera, distributions)
+networkx>=2.6.0 # Pour les graphes de dépendances d'indicateurs
+ruptures>=1.1.0 # Pour la détection de points de changement (optimisation des folds)
 
-# Add other specific dependencies if your strategies use them:
-# مثلاً:
-# scikit-learn
-# statsmodels
-# tensorflow
-# torch
+joblib>=1.0.0 # Utile pour la parallélisation ou la persistance de modèles/objets Python complexes (optionnel pour l'instant si non activement utilisé)
+numba>=0.55.0
+
