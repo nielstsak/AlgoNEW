@@ -143,7 +143,7 @@ def main():
     )
     args = parser.parse_args()
 
-    project_root_arg = args.root if args.root else str(PROJECT_ROOT)
+    project_root_arg = args.root or str(PROJECT_ROOT)
     project_root_path = Path(project_root_arg).resolve()
 
     app_config: Optional[AppConfig] = None
@@ -331,6 +331,23 @@ def main():
     logger.info(f"{orchestrator_log_prefix} Temps Exécution Total Orchestrateur: {total_duration_seconds_script:.2f}s ({timedelta(seconds=total_duration_seconds_script)})")
     logger.info(f"{orchestrator_log_prefix} --- Fin Orchestrateur WFO (Run ID: {orchestrator_run_id}) ---")
     logging.shutdown()
+
+
+def save_orchestrator_summary(orchestrator_run_log_dir: Path, orchestrator_run_id: str, args: argparse.Namespace, project_root_path: Path, task_execution_results: List[Dict[str, Any]], orchestrator_log_prefix: str):
+    """Sauvegarde le résumé de l'orchestration dans un fichier JSON."""
+    orchestrator_summary_file_path = orchestrator_run_log_dir / "orchestrator_run_summary.json"
+    try:
+        summary_content_orch = {
+            "orchestrator_run_id": orchestrator_run_id,
+            "cli_arguments_used": vars(args),
+            "project_root_used": str(project_root_path),
+            "wfo_task_execution_results": task_execution_results
+        }
+        with open(orchestrator_summary_file_path, 'w', encoding='utf-8') as f_summary_orch:
+            json.dump(summary_content_orch, f_summary_orch, cls=EnhancedJSONEncoder, indent=4)
+        logger.info(f"{orchestrator_log_prefix} Résumé orchestration sauvegardé: {orchestrator_summary_file_path}")
+    except Exception as e_save_summary_orch:
+        logger.error(f"{orchestrator_log_prefix} Échec sauvegarde résumé orchestration: {e_save_summary_orch}", exc_info=True)
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,7 @@
 # src/backtesting/optimization/objective_function_evaluator.py
 """
-Ce module définit ObjectiveFunctionEvaluator, la fonction objectif pour Optuna.
-Elle évalue un ensemble d'hyperparamètres (un "trial") en exécutant un backtest
+Ce module défini ObjectiveFunctionEvaluator, la fonction objectif pour Optuna.
+elle évalue un ensemble d'hyperparamètres (un "trial") en exécutant un backtest
 et en retournant les métriques de performance qui servent d'objectifs pour
 l'optimisation.
 Refactorisé pour l'injection de dépendances, la mise en cache des évaluations,
@@ -17,7 +17,7 @@ import traceback # Pour les traces d'erreur complètes
 import contextlib # Pourrait être utilisé pour des context managers si besoin
 import functools # Pour @functools.lru_cache ou d'autres décorateurs
 
-from typing import Any, Dict, Optional, Tuple, List, Type, Union, TYPE_CHECKING, Callable, cast
+from typing import Any, Dict, Optional, Tuple, List, Type, Union, TYPE_CHECKING, Callable, cast, Protocol
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -102,7 +102,7 @@ class SimpleStrategyLoader(IStrategyLoader):
         # Ex: "src/strategies/my_strat.py" -> "src.strategies.my_strat"
         module_path_standardized = strategy_script_ref.replace('\\', '/').removesuffix('.py')
         parts = module_path_standardized.split('/')
-        if parts and parts[0] != 'src': # Assurer que ça commence par src si c'est un chemin relatif depuis la racine
+        if parts and parts[0] != 'src': # S'assurer que ça commence par src si c'est un chemin relatif depuis la racine
             module_import_str = module_path_standardized.replace('/', '.')
             if not module_import_str.startswith('src.') and 'src.' in module_import_str: # ex: project_root/src/...
                 module_import_str = f"src.{module_import_str.split('src.', 1)[-1]}"
@@ -196,8 +196,8 @@ class ObjectiveFunctionEvaluator:
                  is_trial_number_for_oos_log: Optional[int] = None
                 ):
         self.strategy_name_key = strategy_name_key
-        self.strategy_config_dict = strategy_config_dict # C'est StrategyParamsConfig as dict
-        self.df_enriched_slice = df_enriched_slice.copy() # Travailler sur une copie
+        self.strategy_config_dict = strategy_config_dict
+        self.df_enriched_slice = self._prepare_df(df_enriched_slice.copy())
         self.optuna_objectives_config = optuna_objectives_config
         self.pair_symbol = pair_symbol.upper()
         self.symbol_info_data = symbol_info_data
@@ -206,58 +206,72 @@ class ObjectiveFunctionEvaluator:
         self.is_oos_eval = is_oos_eval
         self.is_trial_number_for_oos_log = is_trial_number_for_oos_log
 
-        # Injection des dépendances
         self.strategy_loader = strategy_loader
         self.cache_manager = cache_manager
         self.error_handler = error_handler
 
-        self.log_prefix = (
-            f"[{self.strategy_name_key}/{self.pair_symbol}]"
-            f"[Run:{self.run_id}]"
-            f"[{'OOS' if self.is_oos_eval else 'IS_Opt'}]"
-            f"{f'[OrigIS_Trial:{self.is_trial_number_for_oos_log}]' if self.is_oos_eval and self.is_trial_number_for_oos_log is not None else ''}"
-            f"[ObjFuncEvalV2]"
-        )
+        self.log_prefix = self._build_log_prefix()
 
-        self.strategy_script_reference: str = self.strategy_config_dict.get('script_reference', '')
-        self.strategy_class_name: str = self.strategy_config_dict.get('class_name', '')
-        if not self.strategy_script_reference or not self.strategy_class_name:
-            msg = f"'script_reference' ou 'class_name' manquant dans strategy_config_dict pour {self.strategy_name_key}."
-            logger.critical(f"{self.log_prefix} {msg}")
-            raise ValueError(msg)
+        self.strategy_script_reference, self.strategy_class_name = self._validate_strategy_config()
+        self.params_space_details = self._load_params_space_details()
 
-        self.params_space_details: Dict[str, ParamDetail] = {}
-        raw_params_space = self.strategy_config_dict.get('params_space', {})
-        if isinstance(raw_params_space, dict):
-            for param_key, param_value_dict in raw_params_space.items():
-                if isinstance(param_value_dict, dict):
-                    try:
-                        # Assumer que ParamDetail est importable depuis definitions
-                        from src.config.definitions import ParamDetail
-                        self.params_space_details[param_key] = ParamDetail(**param_value_dict)
-                    except Exception as e_pd_create:
-                         logger.error(f"{self.log_prefix} Erreur création ParamDetail pour '{param_key}': {e_pd_create}")
-        
-        # Standardisation de l'index du DataFrame
-        if not isinstance(self.df_enriched_slice.index, pd.DatetimeIndex):
-            msg = "df_enriched_slice doit avoir un DatetimeIndex."
-            logger.error(f"{self.log_prefix} {msg}")
-            raise ValueError(msg)
-        if self.df_enriched_slice.index.tz is None:
-            self.df_enriched_slice.index = self.df_enriched_slice.index.tz_localize('UTC') # type: ignore
-        elif str(self.df_enriched_slice.index.tz).upper() != 'UTC':
-            self.df_enriched_slice.index = self.df_enriched_slice.index.tz_convert('UTC') # type: ignore
-        if not self.df_enriched_slice.index.is_monotonic_increasing: self.df_enriched_slice.sort_index(inplace=True)
-        if self.df_enriched_slice.index.duplicated().any(): self.df_enriched_slice = self.df_enriched_slice[~self.df_enriched_slice.index.duplicated(keep='first')]
-
-        self.last_backtest_results: Optional[Dict[str, Any]] = None # Pour stocker les résultats du dernier backtest (utile pour OOS)
-        
-        # Pour la mémoïsation des données préparées
+        self.last_backtest_results: Optional[Dict[str, Any]] = None
         self._last_indicator_params_signature: Optional[str] = None
         self._last_prepared_df_with_indicators: Optional[pd.DataFrame] = None
 
         logger.info(f"{self.log_prefix} Initialisé. Données shape: {self.df_enriched_slice.shape}")
 
+    def _build_log_prefix(self) -> str:
+        """Construit le préfixe de log pour l'évaluateur."""
+        oos_tag = 'OOS' if self.is_oos_eval else 'IS_Opt'
+        trial_tag = f'[OrigIS_Trial:{self.is_trial_number_for_oos_log}]' if self.is_oos_eval and self.is_trial_number_for_oos_log is not None else ''
+        return (
+            f"[{self.strategy_name_key}/{self.pair_symbol}]"
+            f"[Run:{self.run_id}]"
+            f"[{oos_tag}]"
+            f"{trial_tag}"
+            f"[ObjFuncEvalV2]"
+        )
+
+    def _validate_strategy_config(self) -> Tuple[str, str]:
+        """Valide la configuration de la stratégie et retourne la référence du script et le nom de la classe."""
+        script_ref = self.strategy_config_dict.get('script_reference', '')
+        class_name = self.strategy_config_dict.get('class_name', '')
+        if not script_ref or not class_name:
+            msg = f"'script_reference' ou 'class_name' manquant dans strategy_config_dict pour {self.strategy_name_key}."
+            logger.critical(f"{self.log_prefix} {msg}")
+            raise ValueError(msg)
+        return script_ref, class_name
+
+    def _load_params_space_details(self) -> Dict[str, ParamDetail]:
+        """Charge les détails de l'espace des paramètres depuis la configuration."""
+        params_space: Dict[str, ParamDetail] = {}
+        raw_params_space = self.strategy_config_dict.get('params_space', {})
+        if isinstance(raw_params_space, dict):
+            for param_key, param_value_dict in raw_params_space.items():
+                if isinstance(param_value_dict, dict):
+                    try:
+                        from src.config.definitions import ParamDetail # Import local pour éviter dépendance circulaire au niveau module
+                        params_space[param_key] = ParamDetail(**param_value_dict)
+                    except Exception as e_pd_create:
+                        logger.error(f"{self.log_prefix} Erreur création ParamDetail pour '{param_key}': {e_pd_create}")
+        return params_space
+
+    def _prepare_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Prépare et standardise le DataFrame d'entrée."""
+        if not isinstance(df.index, pd.DatetimeIndex):
+            msg = "df_enriched_slice doit avoir un DatetimeIndex."
+            logger.error(f"{self.log_prefix} {msg}")
+            raise ValueError(msg)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('UTC')
+        elif str(df.index.tz).upper() != 'UTC':
+            df.index = df.index.tz_convert('UTC')
+        if not df.index.is_monotonic_increasing:
+            df.sort_index(inplace=True)
+        if df.index.duplicated().any():
+            df = df[~df.index.duplicated(keep='first')]
+        return df
 
     def _generate_params_signature(self, params: Dict[str, Any], relevant_keys_prefix: Optional[List[str]] = None) -> str:
         """Génère une signature stable (hash) pour un sous-ensemble de paramètres."""
@@ -265,7 +279,7 @@ class ObjectiveFunctionEvaluator:
             relevant_keys_prefix = ["indicateur_frequence", "ma_", "atr_", "rsi_", "bbands_", "psar_"] # Exemples
 
         keys_for_signature = sorted([
-            k for k in params.keys()
+            k for k in params
             if any(k.startswith(prefix) for prefix in relevant_keys_prefix)
         ])
         
@@ -273,7 +287,7 @@ class ObjectiveFunctionEvaluator:
             return "no_indicator_params"
 
         params_subset_for_signature = {k: params[k] for k in keys_for_signature}
-        # Utiliser json.dumps avec sort_keys pour une représentation stable avant hashage
+        # Utiliser json.dumps avec sort_keys pour une représentation stable avant hachage
         params_str = json.dumps(params_subset_for_signature, sort_keys=True, default=str)
         return hashlib.sha256(params_str.encode('utf-8')).hexdigest()
 
@@ -302,7 +316,7 @@ class ObjectiveFunctionEvaluator:
             required_configs = strategy_instance.get_required_indicator_configs()
         except Exception as e_get_cfg:
             logger.error(f"{log_prefix_prep} Erreur get_required_indicator_configs(): {e_get_cfg}", exc_info=True)
-            raise ValueError(f"Erreur get_required_indicator_configs: {e_get_cfg}")
+            raise ValueError(f"Erreur get_required_indicator_configs: {e_get_cfg}") from e_get_cfg
 
         try:
             df_with_ta_indicators = calculate_indicators_for_trial(
@@ -313,7 +327,7 @@ class ObjectiveFunctionEvaluator:
             )
         except Exception as e_calc_indic_trial:
             logger.error(f"{log_prefix_prep} Erreur calculate_indicators_for_trial: {e_calc_indic_trial}", exc_info=True)
-            raise ValueError(f"Erreur calculate_indicators_for_trial: {e_calc_indic_trial}")
+            raise ValueError(f"Erreur calculate_indicators_for_trial: {e_calc_indic_trial}") from e_calc_indic_trial
 
         if df_with_ta_indicators.empty:
             raise ValueError("calculate_indicators_for_trial a retourné un DataFrame vide.")
@@ -322,7 +336,7 @@ class ObjectiveFunctionEvaluator:
             df_final_for_simulation = strategy_instance._calculate_indicators(df_with_ta_indicators)
         except Exception as e_strat_calc:
             logger.error(f"{log_prefix_prep} Erreur strategy_instance._calculate_indicators(): {e_strat_calc}", exc_info=True)
-            raise ValueError(f"Erreur strategy_instance._calculate_indicators: {e_strat_calc}")
+            raise ValueError(f"Erreur strategy_instance._calculate_indicators: {e_strat_calc}") from e_strat_calc
         
         if df_final_for_simulation.empty:
             raise ValueError("strategy_instance._calculate_indicators() a retourné un DataFrame vide.")
@@ -340,46 +354,70 @@ class ObjectiveFunctionEvaluator:
         Contient la logique réelle d'évaluation d'un trial (chargement strat, prépa données, simu, métriques).
         Cette fonction est ce qui sera mis en cache par _evaluate_with_cache.
         """
-        eval_id_log = trial.number if hasattr(trial, 'number') and not self.is_oos_eval else \
-                      (self.is_trial_number_for_oos_log if self.is_oos_eval else "N/A")
+        eval_id_log = self._get_eval_id_log(trial)
         current_log_prefix = f"{self.log_prefix}[Trial:{eval_id_log}][PerformEval]"
+
+        strategy_instance = self._load_strategy(trial_params, current_log_prefix)
+        df_for_simulation = self._prepare_simulation_data(strategy_instance, trial_params, eval_id_log, current_log_prefix)
         
-        # 1. Charger la Stratégie (chronométré)
-        time_start_load_strat = time.perf_counter()
+        trades_log, equity_curve_df, oos_detailed_log = self._run_simulation(
+            df_for_simulation, strategy_instance, trial_params, current_log_prefix
+        )
+        
+        metrics = self._calculate_metrics(
+            trades_log, equity_curve_df, df_for_simulation, eval_id_log, current_log_prefix
+        )
+        
+        if self.last_backtest_results: # self.last_backtest_results est mis à jour dans _run_simulation
+            self.last_backtest_results["metrics"] = metrics.copy()
+
+        return self._determine_objective_values(metrics)
+
+    def _get_eval_id_log(self, trial: optuna.Trial) -> str:
+        """Détermine l'ID de log pour l'évaluation en cours."""
+        if self.is_oos_eval:
+            return str(self.is_trial_number_for_oos_log) if self.is_trial_number_for_oos_log is not None else "N/A_OOS"
+        return str(trial.number) if hasattr(trial, 'number') else "N/A_IS"
+
+    def _load_strategy(self, trial_params: Dict[str, Any], log_prefix: str) -> 'IStrategy':
+        """Charge l'instance de la stratégie."""
+        time_start = time.perf_counter()
         try:
             strategy_instance = self.strategy_loader.load_strategy(
                 strategy_name_key=self.strategy_name_key,
                 params_for_strategy=trial_params,
                 strategy_script_ref=self.strategy_script_reference,
                 strategy_class_name=self.strategy_class_name,
-                pair_symbol=self.pair_symbol # Passer la paire
+                pair_symbol=self.pair_symbol
             )
-        except Exception as e_load_s:
-            logger.error(f"{current_log_prefix} Erreur chargement stratégie: {e_load_s}", exc_info=True)
-            raise # Renvoyer pour être attrapé par _evaluate_with_cache ou __call__
-        time_end_load_strat = time.perf_counter()
-        logger.info(f"{current_log_prefix} Stratégie chargée en {time_end_load_strat - time_start_load_strat:.4f}s.")
+        except Exception as e:
+            logger.error(f"{log_prefix} Erreur chargement stratégie: {e}", exc_info=True)
+            raise
+        logger.info(f"{log_prefix} Stratégie chargée en {time.perf_counter() - time_start:.4f}s.")
+        return strategy_instance
 
-        # 2. Préparer les Données avec Indicateurs (chronométré, utilise la mémoïsation interne)
-        time_start_prep_data = time.perf_counter()
+    def _prepare_simulation_data(self, strategy_instance: 'IStrategy', trial_params: Dict[str, Any], eval_id_log: str, log_prefix: str) -> pd.DataFrame:
+        """Prépare les données pour la simulation, incluant les indicateurs."""
+        time_start = time.perf_counter()
         try:
             df_for_simulation = self._prepare_data_with_dynamic_indicators(
                 strategy_instance,
-                trial_params, # Passer les params du trial pour la clé de mémoïsation des indicateurs
+                trial_params,
                 trial_number_for_log=eval_id_log
             )
             if df_for_simulation.empty or df_for_simulation[['open', 'high', 'low', 'close']].isnull().all().all():
                 raise ValueError("Préparation des données a résulté en un DataFrame vide ou inutilisable.")
-        except Exception as e_prep_d:
-            logger.error(f"{current_log_prefix} Erreur préparation données: {e_prep_d}", exc_info=True)
+        except Exception as e:
+            logger.error(f"{log_prefix} Erreur préparation données: {e}", exc_info=True)
             raise
-        time_end_prep_data = time.perf_counter()
-        logger.info(f"{current_log_prefix} Données préparées en {time_end_prep_data - time_start_prep_data:.4f}s.")
+        logger.info(f"{log_prefix} Données préparées en {time.perf_counter() - time_start:.4f}s.")
+        return df_for_simulation
 
-        # 3. Exécuter la Simulation (chronométré)
+    def _run_simulation(self, df_for_simulation: pd.DataFrame, strategy_instance: 'IStrategy', trial_params: Dict[str, Any], log_prefix: str) -> Tuple[List[Dict[str, Any]], pd.DataFrame, List[Dict[str, Any]]]:
+        """Exécute la simulation de backtesting."""
         sim_defaults: SimulationDefaults = self.app_config.global_config.simulation_defaults
         leverage_to_use = int(trial_params.get('margin_leverage', sim_defaults.margin_leverage))
-        
+
         strategy_instance.set_trading_context(
             pair_config=self.symbol_info_data,
             is_futures=sim_defaults.is_futures_trading,
@@ -387,7 +425,7 @@ class ObjectiveFunctionEvaluator:
             initial_equity=sim_defaults.initial_capital,
             account_type=self.app_config.data_config.source_details.asset_type
         )
-        
+
         simulator = BacktestRunner(
             df_ohlcv_with_indicators=df_for_simulation, strategy_instance=strategy_instance,
             initial_equity=sim_defaults.initial_capital, leverage=leverage_to_use,
@@ -395,64 +433,55 @@ class ObjectiveFunctionEvaluator:
             trading_fee_bps=sim_defaults.trading_fee_bps,
             slippage_config_dict=sim_defaults.slippage_config.__dict__,
             is_futures=sim_defaults.is_futures_trading, run_id=self.run_id,
-            data_validator=self.app_config.data_validator_instance, # type: ignore # Passer l'instance
-            cache_manager=self.cache_manager, # Passer le cache manager
-            event_dispatcher=self.app_config.event_dispatcher_instance, # type: ignore # Passer l'instance
+            data_validator=self.app_config.data_validator_instance, # type: ignore
+            cache_manager=self.cache_manager,
+            event_dispatcher=self.app_config.event_dispatcher_instance, # type: ignore
             is_oos_simulation=self.is_oos_eval,
             verbosity=0 if not self.is_oos_eval else sim_defaults.backtest_verbosity
         )
         
-        trades_log: List[Dict[str, Any]]
-        equity_curve_df: pd.DataFrame
-        oos_detailed_log: List[Dict[str, Any]] # Capturer ce log
-
-        time_start_sim = time.perf_counter()
+        time_start = time.perf_counter()
         try:
             trades_log, equity_curve_df, _, oos_detailed_log = simulator.run_simulation()
-            # Stocker les résultats bruts pour un accès potentiel (ex: OOSValidator)
-            self.last_backtest_results = {
+            self.last_backtest_results = { # Mise à jour ici
                 "params": trial_params, "trades": trades_log,
                 "equity_curve_df": equity_curve_df,
-                "oos_detailed_trades_log": oos_detailed_log, # Important pour OOS
-                "metrics": {} # Sera rempli ensuite
+                "oos_detailed_trades_log": oos_detailed_log,
+                "metrics": {} 
             }
-        except optuna.exceptions.TrialPruned as e_pruned_sim_intern: # Si le simulateur élague
-            logger.info(f"{current_log_prefix} Trial élagué par BacktestRunner: {e_pruned_sim_intern}")
+        except optuna.exceptions.TrialPruned as e_pruned:
+            logger.info(f"{log_prefix} Trial élagué par BacktestRunner: {e_pruned}")
             raise
-        except Exception as e_sim_run:
-            logger.error(f"{current_log_prefix} Erreur BacktestRunner: {e_sim_run}", exc_info=True)
+        except Exception as e:
+            logger.error(f"{log_prefix} Erreur BacktestRunner: {e}", exc_info=True)
             raise
-        time_end_sim = time.perf_counter()
-        logger.info(f"{current_log_prefix} Simulation terminée ({len(trades_log)} trades) en {time_end_sim - time_start_sim:.4f}s.")
+        logger.info(f"{log_prefix} Simulation terminée ({len(trades_log)} trades) en {time.perf_counter() - time_start:.4f}s.")
+        return trades_log, equity_curve_df, oos_detailed_log
 
-        # 4. Calculer les Métriques (chronométré)
-        equity_series_for_metrics = pd.Series(dtype=float)
-        if not equity_curve_df.empty and 'equity' in equity_curve_df.columns:
-            # L'index de equity_curve_df est déjà un DatetimeIndex UTC
-            equity_series_for_metrics = equity_curve_df['equity']
-        
-        if equity_series_for_metrics.empty:
-            start_ts_data = df_for_simulation.index.min() if not df_for_simulation.empty else pd.Timestamp.now(tz='UTC')
-            equity_series_for_metrics = pd.Series([sim_defaults.initial_capital], index=[start_ts_data])
+    def _calculate_metrics(self, trades_log: List[Dict[str, Any]], equity_curve_df: pd.DataFrame, df_for_simulation: pd.DataFrame, eval_id_log: str, log_prefix: str) -> Dict[str, Any]:
+        """Calcule les métriques de performance."""
+        sim_defaults = self.app_config.global_config.simulation_defaults
+        equity_series = equity_curve_df['equity'] if not equity_curve_df.empty and 'equity' in equity_curve_df.columns else \
+                        pd.Series([sim_defaults.initial_capital], index=[df_for_simulation.index.min() if not df_for_simulation.empty else pd.Timestamp.now(tz='UTC')])
 
-        time_start_metrics = time.perf_counter()
+        time_start = time.perf_counter()
         metrics = calculate_performance_metrics_from_inputs(
-            trades_df=pd.DataFrame(trades_log), equity_curve_series=equity_series_for_metrics,
+            trades_df=pd.DataFrame(trades_log), equity_curve_series=equity_series,
             initial_capital=sim_defaults.initial_capital,
             risk_free_rate_daily=(1 + sim_defaults.risk_free_rate)**(1/252) - 1,
             periods_per_year=252,
-            cache_manager=self.cache_manager, # Passer le cache aux métriques
+            cache_manager=self.cache_manager,
             base_cache_key_prefix=f"{self.log_prefix}_trial_{eval_id_log}_metrics"
         )
         metrics['Total Trades'] = metrics.get('Total Trades', len(trades_log))
-        if self.last_backtest_results: self.last_backtest_results["metrics"] = metrics.copy()
-        time_end_metrics = time.perf_counter()
-        logger.info(f"{current_log_prefix} Métriques calculées en {time_end_metrics - time_start_metrics:.4f}s.")
+        logger.info(f"{log_prefix} Métriques calculées en {time.perf_counter() - time_start:.4f}s.")
+        return metrics
 
-        # 5. Retourner les valeurs des objectifs pour Optuna
+    def _determine_objective_values(self, metrics: Dict[str, Any]) -> Union[float, Tuple[float, ...]]:
+        """Détermine les valeurs des objectifs pour Optuna à partir des métriques."""
         objective_values_list: List[float] = []
-        obj_names: List[str] = self.optuna_objectives_config.get('objectives_names', ["Total Net PnL USDC"])
-        obj_dirs: List[str] = self.optuna_objectives_config.get('objectives_directions', ["maximize"] * len(obj_names))
+        obj_names = self.optuna_objectives_config.get('objectives_names', ["Total Net PnL USDC"])
+        obj_dirs = self.optuna_objectives_config.get('objectives_directions', ["maximize"] * len(obj_names))
 
         for i, metric_name in enumerate(obj_names):
             value = metrics.get(metric_name)
@@ -460,16 +489,21 @@ class ObjectiveFunctionEvaluator:
             
             if value is not None and isinstance(value, (int, float)) and np.isfinite(value):
                 objective_values_list.append(float(value))
-            else: # Valeur non finie ou None
+            else:
                 worst_val = -1e12 if direction == "maximize" else 1e12
                 objective_values_list.append(worst_val)
         
         return tuple(objective_values_list) if len(objective_values_list) > 1 else objective_values_list[0]
-
+        
     def _evaluate_with_cache(self, trial: optuna.Trial) -> Union[float, Tuple[float, ...]]:
         """Gère la mise en cache de l'évaluation complète du trial."""
-        eval_id_log = trial.number if hasattr(trial, 'number') and not self.is_oos_eval else \
-                      (self.is_trial_number_for_oos_log if self.is_oos_eval else "N/A_OOS_FIXED")
+        eval_id_log = (
+            self.is_trial_number_for_oos_log
+            if self.is_oos_eval
+            else trial.number
+            if hasattr(trial, 'number')
+            else "N/A_OOS_FIXED"
+        )
         current_log_prefix = f"{self.log_prefix}[Trial:{eval_id_log}][EvalWithCache]"
 
         # Utiliser les paramètres du trial pour la clé de cache
@@ -478,7 +512,7 @@ class ObjectiveFunctionEvaluator:
         if not params_for_key and self.is_oos_eval: # Pour OOS, trial.params peut être vide si on enqueued sans params
              # Dans ce cas, on ne peut pas vraiment utiliser trial.params pour la clé de cache.
              # La logique OOS devrait passer les params IS via user_attrs ou une autre méthode.
-             # Pour l'instant, on assume que si is_oos_eval, trial.params CONTIENT les params à évaluer.
+             # Pour l'instant, on suppose que si is_oos_eval, trial.params CONTIENT les params à évaluer.
              logger.error(f"{current_log_prefix} Évaluation OOS mais trial.params est vide. Impossible de générer une clé de cache ou d'évaluer.")
              raise ValueError("OOS evaluation requires params in trial.params for caching/evaluation.")
 
@@ -529,141 +563,130 @@ class ObjectiveFunctionEvaluator:
     def __call__(self, trial: optuna.Trial) -> Union[float, Tuple[float, ...]]:
         """Point d'entrée pour Optuna pour évaluer un trial."""
         time_start_call = time.perf_counter()
-        eval_id_log = trial.number if hasattr(trial, 'number') and not self.is_oos_eval else \
-                      (self.is_trial_number_for_oos_log if self.is_oos_eval else "N/A_OOS_FIXED")
+        eval_id_log = self._get_eval_id_log(trial)
         current_log_prefix = f"{self.log_prefix}[Trial:{eval_id_log}][__call__]"
-        logger.info(f"{current_log_prefix} Démarrage de l'évaluation (via __call__).")
-        
-        # Pour l'évaluation OOS, les paramètres sont fixés et passés via trial.params
-        # (par ex. en utilisant study.enqueue_trial(fixed_params) dans OOSValidator)
-        # Pour l'évaluation IS, Optuna suggère les paramètres.
-        
-        # La logique de suggestion de paramètres pour IS est maintenant dans _perform_evaluation_for_trial,
-        # car elle est spécifique au trial et ne doit pas être cachée au niveau de _evaluate_with_cache
-        # si la clé de cache est basée uniquement sur les params.
-        # Cependant, si _evaluate_with_cache met en cache le résultat de _perform_evaluation_for_trial,
-        # alors les params suggérés par Optuna seront utilisés pour la clé de cache.
-        
-        # Si c'est une évaluation OOS, les params sont déjà dans trial.params (via enqueue_trial)
-        # Si c'est IS, _suggest_params sera appelé dans _perform_evaluation_for_trial
-        # si `trial.params` est vide.
-        # Pour que le cache fonctionne correctement, `trial.params` doit être rempli *avant*
-        # la génération de la clé de cache dans `_evaluate_with_cache`.
-        # Donc, si IS et `trial.params` est vide, on doit le remplir ici.
-        
-        params_for_this_trial: Dict[str, Any]
-        if not self.is_oos_eval and not trial.params: # IS et pas de params déjà fixés (cas normal)
+        logger.info(f"{current_log_prefix} Démarrage de l'évaluation.")
+
+        params_for_this_trial = self._get_params_for_trial(trial, current_log_prefix)
+        if params_for_this_trial is None: # Indique une erreur de configuration ou un élagage précoce
+            return self._get_worst_objective_values("Paramètres non déterminés pour le trial.")
+
+        try:
+            # `trial.params` est rempli par `_suggest_params_for_optuna_trial` (pour IS)
+            # ou par `study.enqueue_trial` (pour OOS).
+            # `_evaluate_with_cache` utilise `trial.params` pour la clé de cache.
+            objective_values = self._evaluate_with_cache(trial)
+            
+            duration = time.perf_counter() - time_start_call
+            logger.info(f"{current_log_prefix} Évaluation terminée en {duration:.4f}s. Objectifs: {objective_values}")
+            return objective_values
+        except optuna.exceptions.TrialPruned as e_pruned:
+            logger.info(f"{current_log_prefix} Trial élagué: {e_pruned}")
+            raise
+        except Exception as e_main:
+            logger.critical(f"{current_log_prefix} Erreur critique: {e_main}", exc_info=True)
+            # Utiliser trial.params si disponible, sinon params_for_this_trial (qui pourrait être None)
+            error_params = trial.params.copy() if trial.params else params_for_this_trial if params_for_this_trial is not None else {}
+            self.error_handler.handle_evaluation_error(e_main, {"trial_params": error_params, "stage": "__call__"}, trial)
+            return self._get_worst_objective_values(f"Erreur critique __call__: {e_main}")
+
+    def _get_params_for_trial(self, trial: optuna.Trial, log_prefix: str) -> Optional[Dict[str, Any]]:
+        """
+        Détermine les paramètres pour le trial.
+        Suggère si IS et non déjà présents, sinon utilise trial.params (pour OOS ou IS enqueued).
+        Retourne None si une erreur survient ou si élagage nécessaire.
+        """
+        if not self.is_oos_eval and not trial.params: # Cas standard IS: Optuna suggère
             try:
-                params_for_this_trial = self._suggest_params_for_optuna_trial(trial) # Nouvelle méthode pour juste suggérer
-                # Mettre à jour trial.params pour que _evaluate_with_cache puisse l'utiliser pour la clé
-                # Optuna ne permet pas de modifier trial.params directement après suggestion.
-                # On va passer ces params à _evaluate_with_cache / _perform_evaluation_for_trial
-                # et la clé de cache sera générée à partir de ces params.
+                # _suggest_params_for_optuna_trial remplit trial.params et les retourne
+                return self._suggest_params_for_optuna_trial(trial)
             except optuna.exceptions.TrialPruned:
                 raise # Laisser Optuna gérer l'élagage
-            except Exception as e_sug_call:
-                logger.error(f"{current_log_prefix} Erreur _suggest_params_for_optuna_trial: {e_sug_call}", exc_info=True)
-                error_context = {"stage": "suggest_params_is", "params_space": self.params_space_details}
-                self.error_handler.handle_evaluation_error(e_sug_call, error_context, trial)
-                return self._get_worst_objective_values(f"Erreur suggestion params IS: {e_sug_call}")
-        else: # OOS ou IS avec params déjà fixés (ex: enqueue_trial)
-            params_for_this_trial = trial.params.copy() if trial.params else {}
-            if not params_for_this_trial and self.is_oos_eval:
-                 logger.error(f"{current_log_prefix} Évaluation OOS mais trial.params est vide. Impossible d'évaluer.")
-                 self.error_handler.handle_evaluation_error(ValueError("OOS eval: trial.params vide"), {"stage": "oos_params_check"}, trial)
-                 return self._get_worst_objective_values("OOS eval: trial.params vide")
+            except Exception as e_suggest:
+                logger.error(f"{log_prefix} Erreur _suggest_params_for_optuna_trial: {e_suggest}", exc_info=True)
+                self.error_handler.handle_evaluation_error(e_suggest, {"stage": "suggest_params_is", "params_space": self.params_space_details}, trial)
+                # Pas besoin de retourner _get_worst_objective_values ici, car Optuna attrape l'exception
+                # si on la relance, ou on peut retourner None pour indiquer un échec.
+                # Mais comme on a déjà géré l'erreur et que Optuna va élaguer, on peut juste relancer.
+                raise # Ou retourner None et laisser __call__ gérer la valeur de retour.
+                # Pour la robustesse, si on ne relance pas, __call__ doit gérer le None.
+
+        # Cas OOS ou IS avec params déjà fixés (ex: study.enqueue_trial)
+        # trial.params devrait déjà être rempli.
+        if not trial.params and self.is_oos_eval: # Erreur: OOS mais pas de params
+            logger.error(f"{log_prefix} Évaluation OOS mais trial.params est vide. Impossible d'évaluer.")
+            self.error_handler.handle_evaluation_error(ValueError("OOS eval: trial.params vide"), {"stage": "oos_params_check"}, trial)
+            # Pourrait lever TrialPruned ici ou retourner None pour que __call__ gère.
+            # Lever TrialPruned est plus direct pour Optuna.
+            raise optuna.exceptions.TrialPruned("OOS eval: trial.params vide")
         
-        # La clé de cache dans _evaluate_with_cache utilisera ces `params_for_this_trial`
-        # en les récupérant depuis `trial` (si on les y stocke) ou en les passant.
-        # Pour l'instant, _perform_evaluation_for_trial reçoit `trial_params` qui sont ceux-ci.
-        
-        try:
-            # _evaluate_with_cache va maintenant appeler _perform_evaluation_for_trial
-            # qui utilisera les `params_for_this_trial`
-            # Nous devons nous assurer que `trial.params` est rempli si c'est un nouveau trial IS
-            # ou que `_perform_evaluation_for_trial` reçoit les bons params.
-            # Optuna gère `trial.params` après `trial.suggest_...`.
-            # Si on appelle `_suggest_params_for_optuna_trial`, `trial.params` est rempli.
-            
-            # Modifier _evaluate_with_cache pour qu'il prenne les params en argument
-            # ou s'assurer que trial.params est bien rempli avant de générer la clé.
-            # La solution la plus simple est que _evaluate_with_cache lise trial.params.
-            
-            # Si c'est un nouveau trial IS, _suggest_params_for_optuna_trial a rempli trial.params.
-            # Si c'est OOS, trial.params a été rempli par enqueue_trial.
-            
-            objective_values = self._evaluate_with_cache(trial) # _evaluate_with_cache lira trial.params
-            
-            time_end_call = time.perf_counter()
-            logger.info(f"{current_log_prefix} Évaluation complète (via __call__) terminée en {time_end_call - time_start_call:.4f}s. "
-                        f"Objectifs: {objective_values}")
-            return objective_values
-        except optuna.exceptions.TrialPruned as e_pruned_call:
-            logger.info(f"{current_log_prefix} Trial élagué (attrapé par __call__): {e_pruned_call}")
-            raise # Laisser Optuna gérer
-        except Exception as e_call_main:
-            logger.critical(f"{current_log_prefix} Erreur critique non gérée dans __call__: {e_call_main}", exc_info=True)
-            error_context = {"trial_params": trial.params if trial.params else params_for_this_trial, "stage": "__call__"}
-            self.error_handler.handle_evaluation_error(e_call_main, error_context, trial)
-            return self._get_worst_objective_values(f"Erreur critique __call__: {e_call_main}")
+        return trial.params.copy() if trial.params else {}
 
 
     def _suggest_params_for_optuna_trial(self, trial: optuna.Trial) -> Dict[str, Any]:
         """Suggère les paramètres pour un trial Optuna (utilisé en mode IS)."""
-        # Cette méthode est séparée pour que __call__ puisse remplir trial.params
-        # avant d'appeler _evaluate_with_cache qui génère la clé de cache.
         params_for_trial: Dict[str, Any] = {}
         log_prefix_suggest = f"{self.log_prefix}[Trial:{trial.number}][SuggestParamsOptuna]"
 
-        if not self.params_space_details: # Devrait être attrapé par __init__ si is_oos_eval=False
-            default_params = self.strategy_config_dict.get('default_params', {})
-            if default_params and isinstance(default_params, dict):
-                logger.warning(f"{log_prefix_suggest} params_space vide. Utilisation de default_params : {default_params}")
-                # Optuna ne permet pas de retourner directement sans suggestion, donc on doit suggérer les défauts
-                for p_name, p_val in default_params.items():
-                    # Ceci est un hack, car on ne connaît pas le type de suggestion à faire.
-                    # Idéalement, params_space ne devrait jamais être vide pour l'optimisation.
-                    # On va essayer de suggérer comme constant si possible.
-                    # Pour l'instant, on retourne juste les défauts, et on espère que Optuna
-                    # ne les utilise pas pour générer une clé de cache si on ne les suggère pas.
-                    # Mieux: élaguer si params_space est vide.
-                    trial.set_user_attr("failure_reason", "params_space vide, utilisation des défauts, mais élagueage.")
-                    raise optuna.exceptions.TrialPruned("params_space vide, utilisation des défauts, mais élagueage.")
-                # return default_params.copy() # Ne devrait pas être atteint
-            trial.set_user_attr("failure_reason", "params_space vide et pas de default_params.")
-            raise optuna.exceptions.TrialPruned("params_space vide et pas de default_params.")
+        if not self.params_space_details:
+            self._handle_empty_params_space(trial, log_prefix_suggest) # Lève TrialPruned
 
         for param_name, p_detail in self.params_space_details.items():
             try:
                 if p_detail.type == 'int':
-                    low = int(p_detail.low) if p_detail.low is not None else 0
-                    high = int(p_detail.high) if p_detail.high is not None else low + 1
-                    if low > high: high = low
-                    step = int(p_detail.step or 1)
-                    params_for_trial[param_name] = trial.suggest_int(param_name, low, high, step=step)
+                    params_for_trial[param_name] = trial.suggest_int(
+                        param_name, 
+                        int(p_detail.low) if p_detail.low is not None else 0,
+                        int(p_detail.high) if p_detail.high is not None else (int(p_detail.low) if p_detail.low is not None else 0) + 1, # type: ignore
+                        step=int(p_detail.step or 1)
+                    )
                 elif p_detail.type == 'float':
-                    low_f = float(p_detail.low) if p_detail.low is not None else 0.0
-                    high_f = float(p_detail.high) if p_detail.high is not None else low_f + 1.0
-                    if low_f > high_f: high_f = low_f
-                    step_f = float(p_detail.step) if p_detail.step is not None else None
-                    params_for_trial[param_name] = trial.suggest_float(param_name, low_f, high_f, step=step_f, log=p_detail.log_scale)
+                    params_for_trial[param_name] = trial.suggest_float(
+                        param_name,
+                        float(p_detail.low) if p_detail.low is not None else 0.0,
+                        float(p_detail.high) if p_detail.high is not None else (float(p_detail.low) if p_detail.low is not None else 0.0) + 1.0, # type: ignore
+                        step=float(p_detail.step) if p_detail.step is not None else None,
+                        log=p_detail.log_scale
+                    )
                 elif p_detail.type == 'categorical' and p_detail.choices:
                     params_for_trial[param_name] = trial.suggest_categorical(param_name, p_detail.choices)
-                # ... (gestion des autres types ou fallback comme dans _suggest_params original)
+                else:
+                    # Gérer autres types ou fallback si nécessaire, ex: utiliser p_detail.default
+                    if p_detail.default is not None:
+                        params_for_trial[param_name] = p_detail.default # Suggérer comme constant si type inconnu mais défaut existe
+                        logger.warning(f"{log_prefix_suggest} Type de paramètre '{p_detail.type}' pour '{param_name}' non géré. "
+                                       f"Utilisation de la valeur par défaut: {p_detail.default}")
+                    else:
+                        logger.error(f"{log_prefix_suggest} Type de paramètre '{p_detail.type}' pour '{param_name}' non géré et pas de défaut.")
+                        raise optuna.exceptions.TrialPruned(f"Type param non géré '{p_detail.type}' pour '{param_name}' sans défaut.")
             except Exception as e_sug_item:
                 logger.error(f"{log_prefix_suggest} Erreur suggestion paramètre '{param_name}': {e_sug_item}", exc_info=True)
-                # Fallback sur la valeur par défaut du ParamDetail si elle existe
                 if p_detail.default is not None:
                     params_for_trial[param_name] = p_detail.default
                     trial.set_user_attr(f"warning_suggest_{param_name}", f"Used ParamDetail default due to error: {e_sug_item}")
                 else:
-                    trial.set_user_attr("failure_reason", f"Échec suggestion pour {param_name}")
-                    raise optuna.exceptions.TrialPruned(f"Échec suggestion pour {param_name}")
+                    raise optuna.exceptions.TrialPruned(f"Échec suggestion pour {param_name}") from e_sug_item
         
-        logger.debug(f"{log_prefix_suggest} Paramètres suggérés pour Optuna trial : {params_for_trial}")
-        # Optuna stocke ces paramètres dans trial.params automatiquement.
-        return params_for_trial # Retourner pour référence si besoin, mais trial.params est la source de vérité.
+        logger.debug(f"{log_prefix_suggest} Paramètres suggérés pour Optuna trial: {params_for_trial}")
+        # Optuna stocke ces paramètres dans trial.params automatiquement après les appels à suggest_*.
+        return params_for_trial
 
+    def _handle_empty_params_space(self, trial: optuna.Trial, log_prefix_suggest: str):
+        """Gère le cas où params_space_details est vide."""
+        default_params = self.strategy_config_dict.get('default_params') or {}
+        if not isinstance(default_params, dict): # Vérification supplémentaire
+            trial.set_user_attr("failure_reason", "params_space vide et default_params n'est pas un dict.")
+            raise optuna.exceptions.TrialPruned("params_space vide et default_params n'est pas un dict.")
+
+        logger.warning(f"{log_prefix_suggest} params_space vide. Tentative d'utilisation de default_params: {default_params}")
+        if not default_params: # Si default_params est aussi vide
+            trial.set_user_attr("failure_reason", "params_space vide et pas de default_params.")
+            raise optuna.exceptions.TrialPruned("params_space vide et pas de default_params.")
+
+        # Si default_params existe, on pourrait essayer de les utiliser, mais Optuna attend des appels `trial.suggest_*`.
+        # Il est plus sûr d'élaguer si l'espace n'est pas défini pour l'optimisation.
+        trial.set_user_attr("failure_reason", "params_space vide. L'optimisation nécessite un params_space défini.")
+        raise optuna.exceptions.TrialPruned("params_space vide. L'optimisation nécessite un params_space défini.")
 
     def _get_worst_objective_values(self, reason_for_worst: str) -> Union[float, Tuple[float, ...]]:
         """Retourne les pires valeurs possibles pour les objectifs configurés."""

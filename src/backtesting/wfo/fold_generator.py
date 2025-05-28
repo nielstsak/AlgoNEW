@@ -299,7 +299,7 @@ class WfoFoldGenerator:
             return []
         
         # 1. Calculer la volatilité (ex: rolling std dev des rendements journaliers)
-        # Assurer des rendements journaliers pour une mesure de volatilité standard
+        # S'assurer des rendements journaliers pour une mesure de volatilité standard
         if 'close' in df_enriched_data.columns:
             daily_returns = df_enriched_data['close'].resample('D').last().pct_change().dropna()
             rolling_volatility = daily_returns.rolling(window=volatility_window).std().dropna()
@@ -328,88 +328,122 @@ class WfoFoldGenerator:
         n_combinations: int = 10,
         is_duration_days: int = 90,
         oos_duration_days: int = 30,
-        min_gap_days: int = 5, # Gap minimum entre la fin de IS et le début de OOS
+        min_gap_days: int = 5,
         random_seed: Optional[int] = None
     ) -> List[Tuple[pd.DataFrame, pd.DataFrame, int, pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
-        """
-        Génère des folds combinatoires (Purged K-Fold CV by de Prado),
-        où les périodes IS et OOS sont sélectionnées pour tester la robustesse
-        sur différentes conditions de marché non nécessairement contiguës.
-        """
         logger.info(f"{self.log_prefix} Génération de {n_combinations} folds combinatoires...")
-        if df_enriched_data.empty or len(df_enriched_data) < (is_duration_days + oos_duration_days + min_gap_days):
-            logger.warning(f"{self.log_prefix} Pas assez de données pour générer des folds combinatoires avec les durées spécifiées.")
+        if not self._can_generate_combinatorial_folds(df_enriched_data, is_duration_days, oos_duration_days, min_gap_days):
             return []
 
         rng = np.random.default_rng(random_seed)
         folds_generated: List[Tuple[pd.DataFrame, pd.DataFrame, int, pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
-        
-        is_duration_td = pd.Timedelta(days=is_duration_days)
-        oos_duration_td = pd.Timedelta(days=oos_duration_days)
-        min_gap_td = pd.Timedelta(days=min_gap_days)
-        
-        date_index = df_enriched_data.index
-        min_date = date_index.min()
-        max_date = date_index.max()
-
         attempts = 0
-        max_attempts = n_combinations * 5 # Pour éviter une boucle infinie
+        # Increase max_attempts to give more chances to find valid folds, especially if date range is tight or sparse.
+        max_attempts = n_combinations * 20 
 
         while len(folds_generated) < n_combinations and attempts < max_attempts:
             attempts += 1
-            
-            # Sélectionner un début IS aléatoire
-            # Max start for IS = max_date - oos_duration - min_gap - is_duration
-            max_is_start_date = max_date - oos_duration_td - min_gap_td - is_duration_td
-            if min_date >= max_is_start_date: # Pas assez de place
-                logger.warning(f"{self.log_prefix} Plage de dates trop courte pour sélectionner un début IS aléatoire valide.")
-                break 
-            
-            # Choisir un index aléatoire parmi les dates possibles pour le début IS
-            possible_is_start_indices = date_index[date_index <= max_is_start_date]
-            if possible_is_start_indices.empty: continue
-            
-            is_start_ts = rng.choice(possible_is_start_indices.to_numpy())
-            is_start_ts = pd.Timestamp(is_start_ts, tz='UTC') # S'assurer que c'est un Timestamp
-            is_end_ts_target = is_start_ts + is_duration_td
-            
-            # Trouver la date réelle la plus proche dans l'index
-            is_end_idx_loc = date_index.get_indexer([is_end_ts_target], method='ffill')[0]
-            is_end_ts = date_index[is_end_idx_loc]
-
-            # Sélectionner un début OOS aléatoire après IS + gap
-            oos_start_min_target = is_end_ts + min_gap_td
-            max_oos_start_date = max_date - oos_duration_td
-            
-            if oos_start_min_target >= max_oos_start_date: continue # Pas de place pour OOS
-
-            possible_oos_start_indices = date_index[(date_index >= oos_start_min_target) & (date_index <= max_oos_start_date)]
-            if possible_oos_start_indices.empty: continue
-            
-            oos_start_ts = rng.choice(possible_oos_start_indices.to_numpy())
-            oos_start_ts = pd.Timestamp(oos_start_ts, tz='UTC')
-            oos_end_ts_target = oos_start_ts + oos_duration_td
-            
-            oos_end_idx_loc = date_index.get_indexer([oos_end_ts_target], method='ffill')[0]
-            oos_end_ts = date_index[oos_end_idx_loc]
-
-            # Vérifier validité et non-chevauchement
-            if is_start_ts >= is_end_ts or oos_start_ts >= oos_end_ts or is_end_ts >= oos_start_ts:
-                continue
-
-            df_is = df_enriched_data.loc[is_start_ts:is_end_ts].copy()
-            df_oos = df_enriched_data.loc[oos_start_ts:oos_end_ts].copy()
-
-            if df_is.empty or df_oos.empty:
-                continue
-            
-            folds_generated.append((df_is, df_oos, len(folds_generated), is_start_ts, is_end_ts, oos_start_ts, oos_end_ts))
-            logger.debug(f"{self.log_prefix} Fold combinatoire {len(folds_generated)} généré. IS: {is_start_ts}-{is_end_ts}, OOS: {oos_start_ts}-{oos_end_ts}")
+            fold_data = self._try_generate_single_combinatorial_fold(
+                df_enriched_data, is_duration_days, oos_duration_days, min_gap_days, rng
+            )
+            if fold_data:
+                df_is, df_oos, is_start_ts, is_end_ts, oos_start_ts, oos_end_ts = fold_data
+                fold_id = len(folds_generated)
+                folds_generated.append((df_is, df_oos, fold_id, is_start_ts, is_end_ts, oos_start_ts, oos_end_ts))
+                logger.debug(f"{self.log_prefix} Fold combinatoire {fold_id} généré. IS: {is_start_ts}-{is_end_ts}, OOS: {oos_start_ts}-{oos_end_ts}")
 
         if len(folds_generated) < n_combinations:
-            logger.warning(f"{self.log_prefix} Seulement {len(folds_generated)}/{n_combinations} folds combinatoires ont pu être générés.")
+            logger.warning(f"{self.log_prefix} Seulement {len(folds_generated)}/{n_combinations} folds combinatoires ont pu être générés après {attempts} tentatives.")
         return folds_generated
 
+    def _can_generate_combinatorial_folds(self, df_data: pd.DataFrame, is_days: int, oos_days: int, gap_days: int) -> bool:
+        """Vérifie si les données sont suffisantes pour générer des folds combinatoires."""
+        if df_data.empty:
+            logger.warning(f"{self.log_prefix} DataFrame vide, impossible de générer des folds combinatoires.")
+            return False
+
+        unique_days_available = len(df_data.index.normalize().unique())
+        min_required_unique_days = is_days + oos_days + gap_days
+        
+        if unique_days_available < min_required_unique_days:
+            logger.warning(f"{self.log_prefix} Pas assez de jours uniques ({unique_days_available}) pour générer des folds combinatoires "
+                           f"avec IS={is_days}j, OOS={oos_days}j, Gap={gap_days}j (besoin: {min_required_unique_days}j).")
+            return False
+        
+        total_data_span_days = (df_data.index.max() - df_data.index.min()).days
+        if total_data_span_days < min_required_unique_days: # Should be caught by unique_days_available in most cases, but good as a sanity check.
+            logger.warning(f"{self.log_prefix} Étendue totale des données ({total_data_span_days} jours) insuffisante pour générer "
+                           f"des folds combinatoires (besoin: {min_required_unique_days} jours).")
+            return False
+        return True
+
+    def _try_generate_single_combinatorial_fold(
+        self, df_data: pd.DataFrame, is_duration_days: int, oos_duration_days: int, min_gap_days: int, rng: np.random.Generator
+    ) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+        """Tente de générer un seul fold combinatoire valide."""
+        date_index = df_data.index # Assumed to be sorted DatetimeIndex UTC
+        min_date, max_date = date_index.min(), date_index.max()
+
+        is_duration_td = pd.Timedelta(days=is_duration_days)
+        oos_duration_td = pd.Timedelta(days=oos_duration_days)
+        min_gap_td = pd.Timedelta(days=min_gap_days)
+
+        # Determine valid range for IS start_ts
+        # IS must end early enough to allow for gap + OOS duration
+        max_allowable_is_end_for_selection = max_date - oos_duration_td - min_gap_td
+        max_is_start_date = max_allowable_is_end_for_selection - is_duration_td
+        
+        if min_date > max_is_start_date:
+            # This case should ideally be caught by _can_generate_combinatorial_folds
+            logger.debug(f"{self.log_prefix} Plage de dates trop courte pour sélectionner un début IS aléatoire valide.")
+            return None
+
+        possible_is_starts = date_index[date_index <= max_is_start_date]
+        if possible_is_starts.empty: 
+            logger.debug(f"{self.log_prefix} Aucun début IS possible trouvé pour la plage max_is_start_date: {max_is_start_date}")
+            return None
+        
+        is_start_ts = pd.Timestamp(rng.choice(possible_is_starts.to_numpy()), tz='UTC')
+        is_end_ts_target = is_start_ts + is_duration_td
+        
+        # Find actual end date in index (<= target)
+        is_end_ts_candidates = date_index[(date_index >= is_start_ts) & (date_index <= is_end_ts_target)]
+        if is_end_ts_candidates.empty or (is_end_ts_candidates.max() - is_start_ts) < pd.Timedelta(days=is_duration_days * 0.8): # Ensure IS is reasonably long
+            return None # Not enough data for IS period
+        is_end_ts = is_end_ts_candidates.max()
+
+
+        # Determine valid range for OOS start_ts
+        min_oos_start_target = is_end_ts + min_gap_td
+        max_allowable_oos_end_for_selection = max_date
+        max_oos_start_date = max_allowable_oos_end_for_selection - oos_duration_td
+        
+        if min_oos_start_target > max_oos_start_date:
+            return None # Not enough space for OOS after IS and gap
+
+        possible_oos_starts = date_index[(date_index >= min_oos_start_target) & (date_index <= max_oos_start_date)]
+        if possible_oos_starts.empty: return None
+
+        oos_start_ts = pd.Timestamp(rng.choice(possible_oos_starts.to_numpy()), tz='UTC')
+        oos_end_ts_target = oos_start_ts + oos_duration_td
+        
+        oos_end_ts_candidates = date_index[(date_index >= oos_start_ts) & (date_index <= oos_end_ts_target)]
+        if oos_end_ts_candidates.empty or (oos_end_ts_candidates.max() - oos_start_ts) < pd.Timedelta(days=oos_duration_days * 0.8): # Ensure OOS is reasonably long
+             return None # Not enough data for OOS period
+        oos_end_ts = oos_end_ts_candidates.max()
+        
+        # Final check for validity (though logic above should mostly prevent these)
+        if is_start_ts >= is_end_ts or oos_start_ts >= oos_end_ts or (is_end_ts + min_gap_td) > oos_start_ts :
+            return None
+
+        df_is = df_data.loc[is_start_ts:is_end_ts].copy()
+        df_oos = df_data.loc[oos_start_ts:oos_end_ts].copy()
+
+        # Ensure periods are not empty after slicing (can happen with sparse data)
+        if df_is.empty or df_oos.empty:
+            return None
+            
+        return df_is, df_oos, is_start_ts, is_end_ts, oos_start_ts, oos_end_ts
 
     def analyze_fold_stability(
         self,
@@ -488,65 +522,139 @@ class WfoFoldGenerator:
         Retourne une liste de timestamps suggérés comme frontières de folds.
         """
         logger.info(f"{self.log_prefix} Optimisation des frontières de folds (modèle: {model})...")
+        if not self._check_ruptures_availability(): return []
+        
+        series_for_segmentation = self._prepare_series_for_segmentation(df_enriched_data, series_to_segment)
+        if series_for_segmentation is None or series_for_segmentation.empty:
+             # Erreur déjà loguée dans la méthode helper si series_for_segmentation est None
+            if series_for_segmentation is not None and series_for_segmentation.empty : # Log specific empty case
+                 logger.warning(f"{self.log_prefix} Série à segmenter est vide après préparation.")
+            return []
+        
+        # Default n_bkps_to_find if not provided, based on wfo_settings.n_splits
+        effective_n_bkps = n_bkps_to_find if n_bkps_to_find is not None else getattr(self.wfo_settings, 'n_splits', 1) -1
+        if effective_n_bkps < 0: effective_n_bkps = 0 # Ensure non-negative
+
+        min_required_points = effective_n_bkps * 2 + 1 # Need at least one point per segment +1 for start/end
+        if len(series_for_segmentation) < min_required_points:
+            logger.warning(f"{self.log_prefix} Série à segmenter trop courte ({len(series_for_segmentation)} points) pour {effective_n_bkps} points de rupture (besoin: {min_required_points}).")
+            return []
+
+        points_to_fit = series_for_segmentation.to_numpy().reshape(-1, 1)
+        
+        bkps_indices = self._run_change_point_algo(points_to_fit, model, penalty_value, effective_n_bkps)
+        if bkps_indices is None: # Erreur ou algo non applicable
+            return []
+
+        return self._process_breakpoint_indices(bkps_indices, series_for_segmentation)
+
+    def _check_ruptures_availability(self) -> bool:
+        """Vérifie si la bibliothèque 'ruptures' est disponible."""
         if not RUPTURES_AVAILABLE:
             logger.error(f"{self.log_prefix} Bibliothèque 'ruptures' non disponible. Impossible d'optimiser les frontières.")
-            return []
-        if df_enriched_data.empty:
-            logger.warning(f"{self.log_prefix} DataFrame vide. Impossible d'optimiser les frontières.")
-            return []
+            return False
+        return True
 
-        if series_to_segment is None:
-            # Utiliser la volatilité du prix de clôture par défaut
-            if 'close' in df_enriched_data.columns:
-                series_to_segment = df_enriched_data['close'].pct_change().rolling(window=getattr(self.wfo_settings, 'adaptive_volatility_window', 20)).std().dropna()
-            else:
-                logger.error(f"{self.log_prefix} Colonne 'close' non trouvée pour calculer la série par défaut pour la segmentation.")
-                return []
-        
-        if series_to_segment.empty or len(series_to_segment) < (n_bkps_to_find or self.wfo_settings.n_splits) * 2:
-            logger.warning(f"{self.log_prefix} Série à segmenter vide ou trop courte ({len(series_to_segment)} points).")
-            return []
+    def _prepare_series_for_segmentation(self, df_data: pd.DataFrame, series_input: Optional[pd.Series]) -> Optional[pd.Series]:
+        """Prépare la série à utiliser pour la segmentation (volatilité par défaut ou fournie)."""
+        if df_data.empty and series_input is None: # df_data can be empty if series_input is provided
+            logger.warning(f"{self.log_prefix} DataFrame vide et aucune série fournie. Impossible de préparer la série pour segmentation.")
+            return None
 
-        points = series_to_segment.to_numpy().reshape(-1, 1)
-        
-        algo = None
-        if penalty_value is not None and hasattr(rpt, "Pelt"): # Pelt si une pénalité est donnée
-            algo = rpt.Pelt(model=model).fit(points)
-            try:
-                bkps_indices = algo.predict(pen=penalty_value)
-            except Exception as e_pelt:
-                logger.error(f"{self.log_prefix} Erreur avec rpt.Pelt: {e_pelt}")
-                return []
-        elif hasattr(rpt, "Binseg"): # Binseg si n_bkps est donné ou déduit
-            n_bkps = n_bkps_to_find if n_bkps_to_find is not None else self.wfo_settings.n_splits -1
-            if n_bkps <=0:
-                logger.warning(f"{self.log_prefix} Nombre de points de rupture (n_bkps={n_bkps}) invalide pour Binseg.")
-                return []
-            algo = rpt.Binseg(model=model).fit(points)
-            try:
-                bkps_indices = algo.predict(n_bkps=n_bkps)
-            except Exception as e_binseg:
-                logger.error(f"{self.log_prefix} Erreur avec rpt.Binseg: {e_binseg}")
-                return []
+        if series_input is not None:
+            if series_input.empty:
+                logger.warning(f"{self.log_prefix} La série fournie pour segmentation est vide.")
+                return None
+            return series_input.dropna()
+
+        # Calculer la volatilité par défaut si aucune série n'est fournie et df_data est disponible
+        if 'close' in df_data.columns:
+            volatility_window = getattr(self.wfo_settings, 'adaptive_volatility_window', 20)
+            if volatility_window <= 0:
+                logger.warning(f"{self.log_prefix} Fenêtre de volatilité adaptative ({volatility_window}) invalide. Doit être > 0.")
+                return None
+            series = df_data['close'].pct_change().rolling(window=volatility_window).std().dropna()
+            if series.empty:
+                logger.warning(f"{self.log_prefix} Calcul de la volatilité par défaut n'a produit aucune donnée.")
+                return None
+            return series
         else:
-            logger.error(f"{self.log_prefix} Configuration invalide pour la détection de points de rupture (ni pénalité pour Pelt, ni n_bkps pour Binseg).")
-            return []
+            logger.error(f"{self.log_prefix} Colonne 'close' non trouvée dans df_data pour calculer la série par défaut pour la segmentation.")
+            return None
 
-        # Les indices retournés par ruptures sont des positions *après* le point de rupture.
-        # Ils sont relatifs à l'index de `series_to_segment`.
-        # On les convertit en timestamps de `series_to_segment.index`.
-        # On enlève le dernier qui est souvent la fin du signal.
-        if bkps_indices and bkps_indices[-1] >= len(series_to_segment):
-            bkps_indices = bkps_indices[:-1]
+    def _run_change_point_algo(
+        self, points: np.ndarray, model: str, penalty: Optional[float], n_bkps: int # n_bkps is now effective_n_bkps
+    ) -> Optional[List[int]]:
+        """Exécute l'algorithme de détection de points de changement (Pelt ou Binseg)."""
+        algo_instance = None
+        bkps_indices: Optional[List[int]] = None
+
+        if penalty is not None and hasattr(rpt, "Pelt"):
+            logger.debug(f"{self.log_prefix} Utilisation de Pelt avec pénalité {penalty}.")
+            algo_instance = rpt.Pelt(model=model) # type: ignore
+            try:
+                algo_instance.fit(points)
+                bkps_indices = algo_instance.predict(pen=penalty)
+            except Exception as e: # Catch more specific exceptions if known for Pelt
+                logger.error(f"{self.log_prefix} Erreur avec rpt.Pelt: {e}", exc_info=True)
+                return None
+        elif hasattr(rpt, "Binseg"): # n_bkps est maintenant garanti être effective_n_bkps (non-négatif)
+            if n_bkps <= 0: # Binseg requires n_bkps > 0 for meaningful segmentation
+                logger.info(f"{self.log_prefix} Nombre de points de rupture (n_bkps={n_bkps}) est <= 0. Aucun point de rupture ne sera détecté par Binseg.")
+                return [] # Return empty list as no breakpoints are sought
+            logger.debug(f"{self.log_prefix} Utilisation de Binseg avec n_bkps={n_bkps}.")
+            algo_instance = rpt.Binseg(model=model) # type: ignore
+            try:
+                algo_instance.fit(points)
+                bkps_indices = algo_instance.predict(n_bkps=n_bkps)
+            except Exception as e: # Catch more specific exceptions if known for Binseg
+                logger.error(f"{self.log_prefix} Erreur avec rpt.Binseg: {e}", exc_info=True)
+                return None
+        else:
+            logger.error(f"{self.log_prefix} Configuration invalide pour détection de points de rupture: "
+                           "Pelt non dispo ou pénalité non fournie, et Binseg non dispo.")
+            return None
+        
+        if bkps_indices is None: 
+            logger.warning(f"{self.log_prefix} Aucun indice de point de rupture retourné par l'algorithme (résultat None).")
+            return [] 
             
-        breakpoint_timestamps = [series_to_segment.index[idx-1] for idx in bkps_indices if 0 < idx < len(series_to_segment)] # idx-1 pour prendre le point *avant* la rupture
-        
-        # Ajouter le début et la fin de la série globale si ce ne sont pas déjà des points de rupture
-        all_boundaries = sorted(list(set([series_to_segment.index.min()] + breakpoint_timestamps + [series_to_segment.index.max()])))
-        
-        logger.info(f"{self.log_prefix} {len(breakpoint_timestamps)} points de rupture optimisés trouvés, résultant en {len(all_boundaries)-1} segments.")
-        return all_boundaries # Retourne une liste de timestamps qui délimitent les segments
+        return bkps_indices
 
+    def _process_breakpoint_indices(self, bkps_indices: List[int], series_segmented: pd.Series) -> List[pd.Timestamp]:
+        """Convertit les indices de points de rupture en timestamps et finalise les frontières."""
+        if not bkps_indices: # If bkps_indices is empty (e.g. n_bkps=0 for Binseg, or Pelt found none)
+            logger.info(f"{self.log_prefix} Aucun point de rupture trouvé ou demandé. Frontières seront début/fin de série.")
+            return sorted(list(set([series_segmented.index.min(), series_segmented.index.max()])))
+
+        # Filter out indices that are out of bounds for series_segmented.index
+        # Ruptures indices are typically 1-based for the point *after* the break, or can be 0-based.
+        # Filtrer sûrement: les indices doivent être < len(series_segmented) pour series_segmented.index[idx]
+        # Et > 0 pour series_segmented.index[idx-1]
+        valid_timestamps = []
+        for idx in bkps_indices:
+            if 0 < idx < len(series_segmented):
+                valid_timestamps.append(series_segmented.index[idx - 1]) # Point before the break
+            elif idx == len(series_segmented) and len(series_segmented) > 0 : # Break after last point
+                 # This means the last segment ends at the very last data point.
+                 # We don't need to add series_segmented.index[-1] again if it's already the last point.
+                 pass # No specific timestamp to add here other than series_segmented.index.max() later
+            elif idx == 0: # Break before the first point, shouldn't happen with typical usage
+                logger.debug(f"{self.log_prefix} Indice de point de rupture 0 ignoré.")
+
+
+        # Add start and end of the series to ensure full coverage
+        all_boundaries = sorted(list(set(
+            [series_segmented.index.min()] + valid_timestamps + [series_segmented.index.max()]
+        )))
+        
+        # Nombre de points de rupture réels identifiés (excluant début/fin de série sauf s'ils étaient des points de rupture)
+        num_actual_bkps = len(all_boundaries) - 2 if len(all_boundaries) > 1 else 0 
+        num_segments = len(all_boundaries) -1 if len(all_boundaries) > 0 else 0
+
+        logger.info(f"{self.log_prefix} {num_actual_bkps} points de rupture uniques traités, "
+                    f"résultant en {num_segments} segments.")
+        return all_boundaries
 
     def plot_folds(
         self,
@@ -590,7 +698,7 @@ class WfoFoldGenerator:
         plt.ylabel(plot_column)
         plt.xlabel("Date")
         
-        final_title = title if title else f"Visualisation des Folds WFO pour {plot_column}"
+        final_title = title or f"Visualisation des Folds WFO pour {plot_column}"
         plt.title(final_title)
         
         # Créer une légende unique pour "IS" et "OOS"

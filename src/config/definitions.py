@@ -10,6 +10,13 @@ import logging
 # --- Imports des interfaces pour AppConfig (pour type hinting) ---
 # Ces imports supposent que les interfaces sont définies dans src.core.interfaces
 # et que les implémentations de base/simples sont disponibles (ex: dans utils ou core)
+
+from typing import TYPE_CHECKING # Ensure TYPE_CHECKING is imported
+
+if TYPE_CHECKING:
+    from src.strategies.strategy_factory import StrategyFactory
+    # Other imports needed only for type hinting can go here
+
 try:
     from src.core.interfaces import (
         IDataValidator, ICacheManager, IEventDispatcher
@@ -22,7 +29,7 @@ try:
         IErrorHandler, SimpleErrorHandler     # IErrorHandler est un Protocol ici
     )
     # StrategyFactory est une classe concrète
-    # from src.strategies.strategy_factory import StrategyFactory # Removed to break circular import
+    # from src.strategies.strategy_factory import StrategyFactory # Removed to break circular import - Keep this as is for runtime
 except ImportError:
     # Fallbacks si les imports échouent (pour permettre au module de se charger)
     class IDataValidator: pass # type: ignore
