@@ -14,10 +14,13 @@ import weakref
 import functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, Optional, List, Union, TypeVar, Generic, Callable
+from typing import Dict, Any, Tuple, Optional, List, Union, TypeVar, Generic, Callable, TYPE_CHECKING
 
 import pandas as pd
 import numpy as np
+
+if TYPE_CHECKING:
+    from src.config.definitions import StrategyConfig
 import vectorbt as vbt
 
 from src.config.definitions import StrategyParamsConfig # Maintenu pour la compatibilité avec le nouveau framework
@@ -111,7 +114,7 @@ class BaseStrategy(IStrategy, ABC):
     REQUIRED_INPUT_COLUMNS = ["Open", "High", "Low", "Close", "Volume"] # Nouvelle version
     EXPECTED_SIGNAL_COLUMNS = ["entries", "exits", "short_entries", "short_exits"] # Nouvelle version
 
-    def __init__(self, strategy_config: StrategyConfig, params: Optional[Dict[str, Any]] = None):
+    def __init__(self, strategy_config: 'StrategyConfig', params: Optional[Dict[str, Any]] = None):
         """
         Initialise la stratégie.
         Utilise StrategyConfig pour la configuration principale, mais permet la surcharge des paramètres.
@@ -225,14 +228,14 @@ class BaseStrategy(IStrategy, ABC):
         """Calcule les indicateurs. (Nouvelle version - pour vbt)"""
         if self.data is None:
             raise ValueError("Données non définies pour _calculate_indicators.")
-        pass
+        ...
 
     @abstractmethod
     def _generate_signals(self) -> pd.DataFrame:
         """Génère les signaux. (Nouvelle version - pour vbt)"""
         if self.data is None or not self.indicator_data:
             raise ValueError("Données ou indicateurs non prêts pour _generate_signals.")
-        pass
+        ...
 
     def run(self) -> pd.DataFrame:
         """Exécute la stratégie et retourne les signaux (Nouvelle version - pour vbt)."""
@@ -591,14 +594,14 @@ class BaseStrategy(IStrategy, ABC):
             logger.error(full_message, exc_info=exc_info)
         elif is_warning:
             logger.warning(full_message, exc_info=exc_info)
-        elif level == logging.INFO: # Mappage simple des niveaux
-             logger.info(full_message)
-        elif level == logging.DEBUG:
-             logger.debug(full_message)
-        elif level >= logging.ERROR: # Si un niveau numérique est passé
-             logger.log(level, full_message, exc_info=exc_info)
-        else: # Par défaut, debug pour les autres entiers ou niveaux custom bas
-             logger.debug(full_message)
+        elif level >= logging.ERROR: # Handles ERROR, CRITICAL (and custom > ERROR)
+            logger.log(level, full_message, exc_info=exc_info)
+        elif level >= logging.WARNING: # Handles WARNING (already covered by elif is_warning but good for explicitness if flags are removed)
+            logger.log(level, full_message, exc_info=exc_info)
+        elif level >= logging.INFO: # Handles INFO
+            logger.info(full_message)
+        else: # Handles DEBUG and any other lower custom levels
+            logger.debug(full_message)
 
 
     def __repr__(self) -> str:

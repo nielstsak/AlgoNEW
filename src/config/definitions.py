@@ -22,11 +22,12 @@ try:
         IDataValidator, ICacheManager, IEventDispatcher
     )
     # Pour IStrategyLoader et IErrorHandler, si elles sont dans interfaces.py
-    # from src.core.interfaces import IStrategyLoader, IErrorHandler
+    # from src.core.interfaces import IStrategyLoader, IErrorHandler # Original comment, interfaces are now directly imported
+    from src.core.interfaces import IStrategyLoader, IErrorHandler # Protocols from interfaces
     # Si les implémentations simples sont utilisées directement:
     from src.backtesting.optimization.objective_function_evaluator import (
-        IStrategyLoader, SimpleStrategyLoader, # IStrategyLoader est un Protocol ici
-        IErrorHandler, SimpleErrorHandler     # IErrorHandler est un Protocol ici
+        SimpleStrategyLoader, # Concrete class
+        SimpleErrorHandler     # Concrete class
     )
     # StrategyFactory est une classe concrète
     # from src.strategies.strategy_factory import StrategyFactory # Removed to break circular import - Keep this as is for runtime
@@ -169,7 +170,7 @@ class WfoSettings:
         if self.min_is_period_days <= 0: raise ValueError("min_is_period_days doit être positif.")
         if not isinstance(self.fold_type, FoldType):
             try: self.fold_type = FoldType(str(self.fold_type).lower())
-            except ValueError: raise ValueError(f"fold_type '{self.fold_type}' invalide. Options: {[ft.value for ft in FoldType]}")
+            except ValueError as e_fold_type: raise ValueError(f"fold_type '{self.fold_type}' invalide. Options: {[ft.value for ft in FoldType]}") from e_fold_type
         if self.optimization_direction not in ["maximize", "minimize"]: raise ValueError("optimization_direction doit être 'maximize' ou 'minimize'.")
         if not (0.0 <= self.overlap_ratio_is_oos < 1.0): raise ValueError("overlap_ratio_is_oos doit être entre 0.0 (inclus) et 1.0 (exclus).")
         if self.purging_period_days < 0: raise ValueError("purging_period_days ne peut pas être négatif.")
@@ -255,7 +256,7 @@ class HistoricalPeriod:
                 if pd_start_date >= pd_end_date:
                     raise ValueError(f"HistoricalPeriod: start_date ({self.start_date}) doit être antérieure à end_date ({self.end_date}).")
         except Exception as e:
-             raise ValueError(f"HistoricalPeriod: date invalide. Erreur: {e}")
+             raise ValueError(f"HistoricalPeriod: date invalide. Erreur: {e}") from e
 
 
 @dataclass

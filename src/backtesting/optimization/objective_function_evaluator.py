@@ -64,27 +64,6 @@ class ErrorResult:
     timestamp_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     suggestions: List[str] = field(default_factory=list) # Suggestions pour résoudre l'erreur
 
-# --- Interfaces Placeholder pour les dépendances injectées (à déplacer dans core.interfaces.py) ---
-class IStrategyLoader(Protocol if TYPE_CHECKING else object):
-    """Interface pour un chargeur de stratégie."""
-    def load_strategy(self,
-                      strategy_name_key: str,
-                      params_for_strategy: Dict[str, Any],
-                      strategy_script_ref: str,
-                      strategy_class_name: str,
-                      pair_symbol: str # Ajouté pour que le loader puisse passer le symbole
-                     ) -> 'IStrategy':
-        ...
-
-class IErrorHandler(Protocol if TYPE_CHECKING else object):
-    """Interface pour un gestionnaire d'erreurs."""
-    def handle_evaluation_error(self,
-                                exception: Exception,
-                                context: Dict[str, Any],
-                                trial: Optional[optuna.Trial] = None
-                               ) -> ErrorResult:
-        ...
-
 # --- Implémentation Placeholder Simple (pour test si non injecté de l'extérieur) ---
 class SimpleStrategyLoader(IStrategyLoader):
     """Chargeur de stratégie simple pour l'ObjectiveFunctionEvaluator."""
