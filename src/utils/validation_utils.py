@@ -6,6 +6,7 @@ de données, de types, de formats, et d'autres conditions courantes.
 import logging
 import re
 from typing import Any, Optional, List, Union, Type, Pattern, Tuple, Dict
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -306,4 +307,68 @@ def is_valid_email(email_string: Any) -> bool:
     if not isinstance(email_string, str):
         return False
     return matches_regex(email_string, EMAIL_REGEX_PATTERN)
+
+
+def validate_dataframe_columns(df: pd.DataFrame, required_columns: List[str], df_name: str = "DataFrame") -> None:
+    """
+    Valide qu'un DataFrame contient toutes les colonnes requises.
+
+    Args:
+        df (pd.DataFrame): Le DataFrame à valider.
+        required_columns (List[str]): La liste des noms de colonnes requis.
+        df_name (str): Un nom descriptif pour le DataFrame (utilisé dans les messages d'erreur).
+
+    Raises:
+        TypeError: Si df n'est pas un DataFrame pandas.
+        ValueError: Si une ou plusieurs colonnes requises sont manquantes.
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"{df_name} doit être un DataFrame pandas. Reçu : {type(df)}")
+    
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(
+            f"{df_name} ne contient pas les colonnes requises : {', '.join(missing_columns)}. "
+            f"Colonnes disponibles : {', '.join(df.columns.tolist())}"
+        )
+
+def validate_non_empty_dataframe(df: pd.DataFrame, df_name: str = "DataFrame") -> None:
+    """
+    Valide qu'un DataFrame n'est pas None et n'est pas vide.
+
+    Args:
+        df (pd.DataFrame): Le DataFrame à valider.
+        df_name (str): Un nom descriptif pour le DataFrame (utilisé dans les messages d'erreur).
+
+    Raises:
+        TypeError: Si df n'est pas un DataFrame pandas.
+        ValueError: Si le DataFrame est None ou vide.
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"{df_name} doit être un DataFrame pandas. Reçu : {type(df)}")
+    if df is None: # Redondant avec le check de type mais explicit
+        raise ValueError(f"{df_name} ne peut pas être None.")
+    if df.empty:
+        raise ValueError(f"{df_name} ne peut pas être vide.")
+
+def validate_series_not_empty_or_all_na(series: pd.Series, series_name: str = "Series") -> None:
+    """
+    Valide qu'une Series pandas n'est pas None, n'est pas vide, et ne contient pas que des NA.
+
+    Args:
+        series (pd.Series): La Series à valider.
+        series_name (str): Un nom descriptif pour la Series (utilisé dans les messages d'erreur).
+
+    Raises:
+        TypeError: Si series n'est pas une Series pandas.
+        ValueError: Si la Series est None, vide, ou ne contient que des valeurs NA.
+    """
+    if not isinstance(series, pd.Series):
+        raise TypeError(f"{series_name} doit être une Series pandas. Reçu : {type(series)}")
+    if series is None: # Redondant
+        raise ValueError(f"{series_name} ne peut pas être None.")
+    if series.empty:
+        raise ValueError(f"{series_name} ne peut pas être vide.")
+    if series.isnull().all():
+        raise ValueError(f"{series_name} ne doit pas contenir que des valeurs NA.")
 
