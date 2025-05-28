@@ -72,8 +72,8 @@ def _generate_data_fingerprint(df: pd.DataFrame, relevant_cols: Optional[List[st
         
         try:
             # Convertir en numérique, ignorer les erreurs pour les colonnes non numériques
-            desc_head = df_sample_head.apply(pd.to_numeric, errors='ignore').describe().to_json(orient="split", date_format="iso", default_handler=str)
-            desc_tail = df_sample_tail.apply(pd.to_numeric, errors='ignore').describe().to_json(orient="split", date_format="iso", default_handler=str)
+            desc_head = df_sample_head.apply(pd.to_numeric, errors='coerce').describe().to_json(orient="split", date_format="iso", default_handler=str)
+            desc_tail = df_sample_tail.apply(pd.to_numeric, errors='coerce').describe().to_json(orient="split", date_format="iso", default_handler=str)
             fingerprint_parts.append(desc_head)
             fingerprint_parts.append(desc_tail)
         except Exception as e_desc:

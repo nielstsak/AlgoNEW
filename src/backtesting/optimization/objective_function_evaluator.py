@@ -19,7 +19,7 @@ import functools # Pour @functools.lru_cache ou d'autres décorateurs
 
 from typing import Any, Dict, Optional, Tuple, List, Type, Union, TYPE_CHECKING, Callable, cast
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -380,7 +380,7 @@ class ObjectiveFunctionEvaluator:
         sim_defaults: SimulationDefaults = self.app_config.global_config.simulation_defaults
         leverage_to_use = int(trial_params.get('margin_leverage', sim_defaults.margin_leverage))
         
-        strategy_instance.set_backtest_context(
+        strategy_instance.set_trading_context(
             pair_config=self.symbol_info_data,
             is_futures=sim_defaults.is_futures_trading,
             leverage=leverage_to_use,
