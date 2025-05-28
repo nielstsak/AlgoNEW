@@ -18,9 +18,9 @@ from typing import Dict, Any, Tuple, Optional, List, Union, TypeVar, Generic, Ca
 
 import pandas as pd
 import numpy as np
-import vectorbtpro as vbt
+import vectorbt as vbt
 
-from src.config.definitions import StrategyConfig # Maintenu pour la compatibilité avec le nouveau framework
+from src.config.definitions import StrategyParamsConfig # Maintenu pour la compatibilité avec le nouveau framework
 from src.core.interfaces import IStrategy # IStrategy est maintenant un Protocol
 
 # Tentative d'import des utilitaires exchange et IEventDispatcher comme dans l'ancienne version

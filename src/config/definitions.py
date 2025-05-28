@@ -12,16 +12,17 @@ import logging
 # et que les implémentations de base/simples sont disponibles (ex: dans utils ou core)
 try:
     from src.core.interfaces import (
-        IDataValidator, ICacheManager, IEventDispatcher,
-        IStrategyLoader, IErrorHandler  # IMPORTER LES INTERFACES DEPUIS src.core.interfaces
+        IDataValidator, ICacheManager, IEventDispatcher
     )
-    # Les implémentations comme SimpleStrategyLoader ne sont pas nécessaires ici.
-    # AppConfig utilisera les types d'interface pour les champs d'instance.
-    # Le module loader.py sera responsable de l'instanciation des implémentations concrètes.
-    
-    # StrategyFactory est une classe concrète qui peut être utilisée pour typer un champ si nécessaire,
-    # ou si elle est utilisée comme default_factory (bien que non idéal ici).
-    from src.strategies.strategy_factory import StrategyFactory
+    # Pour IStrategyLoader et IErrorHandler, si elles sont dans interfaces.py
+    # from src.core.interfaces import IStrategyLoader, IErrorHandler
+    # Si les implémentations simples sont utilisées directement:
+    from src.backtesting.optimization.objective_function_evaluator import (
+        IStrategyLoader, SimpleStrategyLoader, # IStrategyLoader est un Protocol ici
+        IErrorHandler, SimpleErrorHandler     # IErrorHandler est un Protocol ici
+    )
+    # StrategyFactory est une classe concrète
+    # from src.strategies.strategy_factory import StrategyFactory # Removed to break circular import
 except ImportError:
     # Fallbacks si les imports échouent (pour permettre au module de se charger)
     class IDataValidator: pass # type: ignore
@@ -29,7 +30,7 @@ except ImportError:
     class IEventDispatcher: pass # type: ignore
     class IStrategyLoader: pass # type: ignore
     class IErrorHandler: pass # type: ignore
-    class StrategyFactory: pass # type: ignore
+    # class StrategyFactory: pass # type: ignore # Removed to break circular import
     class SimpleStrategyLoader(IStrategyLoader): pass # type: ignore
     class SimpleErrorHandler(IErrorHandler): pass # type: ignore
     logging.getLogger(__name__).warning(
@@ -397,7 +398,7 @@ class AppConfig:
     # L'idéal est d'importer les Protocoles/ABCs depuis src.core.interfaces.
     data_validator_instance: Optional[Any] = field(default=None, repr=False) # IDataValidator
     cache_manager_instance: Optional[Any] = field(default=None, repr=False)    # ICacheManager
-    strategy_factory_instance: Optional[Any] = field(default=None, repr=False) # StrategyFactory
+    strategy_factory_instance: Optional['StrategyFactory'] = field(default=None, repr=False) # StrategyFactory
     strategy_loader_instance: Optional[Any] = field(default=None, repr=False)  # IStrategyLoader
     error_handler_instance: Optional[Any] = field(default=None, repr=False)    # IErrorHandler
     event_dispatcher_instance: Optional[Any] = field(default=None, repr=False) # IEventDispatcher

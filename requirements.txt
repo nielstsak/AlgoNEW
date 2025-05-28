@@ -4,6 +4,7 @@ pandas-ta>=0.3.14b0
 python-dotenv>=1.0.0
 requests>=2.25.0
 pyyaml>=6.0 # Pour le chargement de configuration YAML (optionnel mais recommandé)
+jsonschema>=4.0.0 # For strategy params validation (optional)
 psutil>=5.9.0 # Pour le monitoring système (CacheManager, ParallelExecutor)
 tqdm>=4.60.0 # Pour les barres de progression (ParallelExecutor)
 
@@ -11,6 +12,7 @@ tqdm>=4.60.0 # Pour les barres de progression (ParallelExecutor)
 python-binance>=1.0.19
 
 optuna>=3.0.0 # Déjà présent
+vectorbtpro # Professional backtesting library
 
 pyarrow>=7.0.0 # Déjà présent, pour Parquet
 
@@ -26,4 +28,3 @@ ruptures>=1.1.0 # Pour la détection de points de changement (optimisation des f
 
 joblib>=1.0.0 # Utile pour la parallélisation ou la persistance de modèles/objets Python complexes (optionnel pour l'instant si non activement utilisé)
 numba>=0.55.0
-
