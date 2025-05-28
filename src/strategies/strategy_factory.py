@@ -165,9 +165,9 @@ class StrategyFactory:
             bool: True si l'enregistrement a réussi, False sinon.
         """
         with self._lock:
-            if not inspect.isclass(strategy_class) or not issubclass(strategy_class, IStrategy): # type: ignore
-                logger.error(f"{self.log_prefix} Tentative d'enregistrement de '{strategy_class}' qui n'est pas une sous-classe de IStrategy.")
-                return False
+            if not inspect.isclass(strategy_class) or not issubclass(strategy_class, BaseStrategy):
+                logger.error(f"{self.log_prefix} Tentative d'enregistrement de '{strategy_class}' qui n'est pas une sous-classe de BaseStrategy.")
+                return False                                                        
             # Éviter d'enregistrer la classe de base elle-même ou les interfaces/protocoles
             if strategy_class is BaseStrategy or strategy_class is IStrategy or inspect.isabstract(strategy_class):
                 logger.debug(f"{self.log_prefix} Tentative d'enregistrement d'une classe de base/abstraite '{strategy_class.__name__}'. Ignorée.")
@@ -241,10 +241,9 @@ class StrategyFactory:
                         for name_in_module, obj_in_module in inspect.getmembers(module, inspect.isclass):
                             # Vérifier si c'est une sous-classe de IStrategy (ou BaseStrategy)
                             # et qu'elle n'est pas IStrategy/BaseStrategy elle-même, ni abstraite.
-                            if issubclass(obj_in_module, IStrategy) and \
-                               obj_in_module is not IStrategy and \
-                               obj_in_module is not BaseStrategy and \
-                               not inspect.isabstract(obj_in_module):
+                            if issubclass(obj_in_module, BaseStrategy) and \
+                                obj_in_module is not BaseStrategy and \
+                                not inspect.isabstract(obj_in_module):
                                 
                                 # Utiliser le nom de la classe comme nom par défaut pour l'enregistrement
                                 if self.register_strategy(obj_in_module): # register_strategy gère les doublons

@@ -12,16 +12,15 @@ import logging
 # et que les implémentations de base/simples sont disponibles (ex: dans utils ou core)
 try:
     from src.core.interfaces import (
-        IDataValidator, ICacheManager, IEventDispatcher
+        IDataValidator, ICacheManager, IEventDispatcher,
+        IStrategyLoader, IErrorHandler  # IMPORTER LES INTERFACES DEPUIS src.core.interfaces
     )
-    # Pour IStrategyLoader et IErrorHandler, si elles sont dans interfaces.py
-    # from src.core.interfaces import IStrategyLoader, IErrorHandler
-    # Si les implémentations simples sont utilisées directement:
-    from src.backtesting.optimization.objective_function_evaluator import (
-        IStrategyLoader, SimpleStrategyLoader, # IStrategyLoader est un Protocol ici
-        IErrorHandler, SimpleErrorHandler     # IErrorHandler est un Protocol ici
-    )
-    # StrategyFactory est une classe concrète
+    # Les implémentations comme SimpleStrategyLoader ne sont pas nécessaires ici.
+    # AppConfig utilisera les types d'interface pour les champs d'instance.
+    # Le module loader.py sera responsable de l'instanciation des implémentations concrètes.
+    
+    # StrategyFactory est une classe concrète qui peut être utilisée pour typer un champ si nécessaire,
+    # ou si elle est utilisée comme default_factory (bien que non idéal ici).
     from src.strategies.strategy_factory import StrategyFactory
 except ImportError:
     # Fallbacks si les imports échouent (pour permettre au module de se charger)

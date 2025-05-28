@@ -37,7 +37,9 @@
   },
   "live_logging": {
     "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s",
     "log_to_file": true,
+    "log_filename_global": "live_global_app.log",
     "log_filename_live": "live_trading_activity.log",
     "log_levels_by_module": {
       "src.live.manager": "DEBUG"

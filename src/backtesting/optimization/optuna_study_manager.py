@@ -11,8 +11,9 @@ import dataclasses
 import time
 import threading # Pour le heartbeat dans un thread séparé si study.optimize est bloquant
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, TYPE_CHECKING, List, cast, Callable
+from typing import Any, Dict, Optional, Type, TYPE_CHECKING, List, cast, Callable, Union
 from datetime import datetime, timedelta # Pour ETA dans analytics
+from dataclasses import dataclass, field
 
 import optuna
 import pandas as pd
@@ -142,31 +143,7 @@ class EarlyStoppingCallback:
                         f"(après {self.patience} essais de patience). Meilleure valeur vue: {self._best_value_seen:.4f}")
             study.stop()
 
-class CheckpointCallback(optuna.integration.CheckpointCallback): # Hériter pour type hinting
-    """
-    Callback pour explicitement sauvegarder (commit) l'étude dans la base de données
-    RDBStorage à intervalles réguliers. Optuna avec RDBStorage sauvegarde déjà
-    après chaque trial, mais ceci peut forcer un commit ou loguer l'événement.
-    """
-    def __init__(self, checkpoint_dir: Union[str, Path], interval_trials: int = 10):
-        # Optuna CheckpointCallback prend `checkpoint_dir` mais le stocke en interne.
-        # Pour RDBStorage, le "checkpointing" est continu.
-        # Cette classe est plus pour loguer ou forcer des actions spécifiques.
-        # L'argument `checkpoint_dir` est pour la compatibilité avec l'ancienne signature
-        # de l'utilisateur, mais avec RDB, le `storage_url` gère la persistance.
-        self.interval_trials = interval_trials
-        self.checkpoint_path_info = Path(checkpoint_dir) # Pour info de log
-        self.log_prefix = "[OptunaCheckpoint]"
-        logger.info(f"{self.log_prefix} Initialisé. Intervalle de log de checkpoint: {interval_trials} essais. "
-                    f"La persistance réelle est gérée par RDBStorage à: {self.checkpoint_path_info}")
 
-    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        # Avec RDBStorage, chaque trial est persisté. Cette callback peut loguer.
-        if trial.number % self.interval_trials == 0 and trial.number > 0:
-            logger.info(f"{self.log_prefix} Étude '{study.study_name}' (Trial {trial.number}): "
-                        f"Checkpoint implicite via RDBStorage à {self.checkpoint_path_info}.")
-            # Si on voulait forcer un commit explicite (généralement pas nécessaire avec RDB):
-            # if hasattr(study._storage, 'commit'): study._storage.commit()
 
 
 @dataclass

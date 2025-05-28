@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from decimal import Decimal # Utilisé dans les dataclasses
 import math # Utilisé dans les dataclasses
-
+import enum
 # Tentative d'importation des définitions de dataclasses et des interfaces/services
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
