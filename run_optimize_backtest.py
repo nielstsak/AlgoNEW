@@ -184,29 +184,27 @@ def main():
 
     orchestrator_config_save_path = orchestrator_run_log_dir / "run_config_orchestrator.json"
     try:
-        app_config_dict_to_save = dataclasses.asdict(app_config)
+        # Créer un dictionnaire sérialisable à partir d'AppConfig
+        # Exclure les champs qui ne sont pas facilement sérialisables ou non pertinents pour le log de config
+        # (ex: instances de cache, locks, etc.)
+        # Pour l'instant, on tente avec EnhancedJSONEncoder, mais il faudra peut-être une méthode to_dict() dans AppConfig.
+        app_config_dict_to_save = dataclasses.asdict(app_config) # Peut échouer si des champs non sérialisables
+        
+        # Tentative de nettoyage pour la sérialisation
+        # Ceci est une rustine, idéalement AppConfig aurait une méthode to_serializable_dict()
+        if 'data_validator_instance' in app_config_dict_to_save: del app_config_dict_to_save['data_validator_instance']
+        if 'cache_manager_instance' in app_config_dict_to_save: del app_config_dict_to_save['cache_manager_instance']
+        if 'strategy_loader_instance' in app_config_dict_to_save: del app_config_dict_to_save['strategy_loader_instance']
+        if 'error_handler_instance' in app_config_dict_to_save: del app_config_dict_to_save['error_handler_instance']
+        if 'event_dispatcher_instance' in app_config_dict_to_save: del app_config_dict_to_save['event_dispatcher_instance']
+        if 'strategy_factory_instance' in app_config_dict_to_save: del app_config_dict_to_save['strategy_factory_instance']
 
-        # Nettoyage pour la sérialisation pour éviter les erreurs de pickling
-        # des objets non sérialisables comme les RLock dans les instances de service.
-        fields_to_remove = [
-            'data_validator_instance',
-            'cache_manager_instance',
-            'strategy_factory_instance', # AJOUTÉ ICI
-            'strategy_loader_instance',
-            'error_handler_instance',
-            'event_dispatcher_instance'
-        ]
-        for field_name in fields_to_remove:
-            if field_name in app_config_dict_to_save:
-                del app_config_dict_to_save[field_name]
-            # Aussi vérifier si ces champs sont imbriqués (peu probable pour les instances directes)
 
         with open(orchestrator_config_save_path, 'w', encoding='utf-8') as f_cfg_orch:
             json.dump(app_config_dict_to_save, f_cfg_orch, cls=EnhancedJSONEncoder, indent=4)
         logger.info(f"{orchestrator_log_prefix} Configuration AppConfig (partielle) sauvegardée: {orchestrator_config_save_path}")
     except Exception as e_save_cfg_orch:
         logger.error(f"{orchestrator_log_prefix} Échec sauvegarde config orchestrateur: {e_save_cfg_orch}", exc_info=True)
-
 
     wfo_tasks_to_run_args: List[Dict[str, Any]] = []
     if app_config.strategies_config and app_config.strategies_config.strategies:
