@@ -197,6 +197,7 @@ def main():
         if 'strategy_loader_instance' in app_config_dict_to_save: del app_config_dict_to_save['strategy_loader_instance']
         if 'error_handler_instance' in app_config_dict_to_save: del app_config_dict_to_save['error_handler_instance']
         if 'event_dispatcher_instance' in app_config_dict_to_save: del app_config_dict_to_save['event_dispatcher_instance']
+        if 'strategy_factory_instance' in app_config_dict_to_save: del app_config_dict_to_save['strategy_factory_instance']
 
 
         with open(orchestrator_config_save_path, 'w', encoding='utf-8') as f_cfg_orch:
